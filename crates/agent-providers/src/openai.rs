@@ -372,7 +372,7 @@ mod tests {
     #[ignore]
     async fn live_round_trip() {
         let api_key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY to run this test");
-        let provider = OpenAiProvider::new(api_key, "gpt-4o-mini");
+        let provider = OpenAiProvider::new(api_key, "gpt-5.4-mini");
         let messages = vec![Message::user_text("Say hello in exactly three words.")];
         let resp = provider
             .complete(&messages, &[], None)

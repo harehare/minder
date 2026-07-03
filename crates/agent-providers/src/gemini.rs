@@ -384,7 +384,7 @@ mod tests {
     #[ignore]
     async fn live_round_trip() {
         let api_key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY to run this test");
-        let provider = GeminiProvider::new(api_key, "gemini-2.0-flash");
+        let provider = GeminiProvider::new(api_key, "gemini-3.5-flash");
         let messages = vec![Message::user_text("Say hello in exactly three words.")];
         let resp = provider
             .complete(&messages, &[], None)

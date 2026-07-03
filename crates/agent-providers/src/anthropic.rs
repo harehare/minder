@@ -266,7 +266,7 @@ mod tests {
         let raw = r#"{
             "id": "msg_1", "type": "message", "role": "assistant",
             "content": [{"type": "text", "text": "hello there friend"}],
-            "model": "claude-sonnet-4-5-20250929",
+            "model": "claude-sonnet-5",
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 4}
         }"#;
@@ -290,7 +290,7 @@ mod tests {
                 {"type": "text", "text": "Let me check that."},
                 {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"command": "ls"}}
             ],
-            "model": "claude-sonnet-4-5-20250929",
+            "model": "claude-sonnet-5",
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 20, "output_tokens": 8}
         }"#;
@@ -351,7 +351,7 @@ mod tests {
     async fn live_round_trip() {
         let api_key =
             std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY to run this test");
-        let provider = AnthropicProvider::new(api_key, "claude-sonnet-4-5-20250929");
+        let provider = AnthropicProvider::new(api_key, "claude-sonnet-5");
         let messages = vec![Message::user_text("Say hello in exactly three words.")];
         let resp = provider
             .complete(&messages, &[], None)

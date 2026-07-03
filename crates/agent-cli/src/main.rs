@@ -21,18 +21,18 @@ fn select_provider() -> Box<dyn LlmProvider> {
         "anthropic" => {
             let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
             let model = std::env::var("MINDER_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
+                .unwrap_or_else(|_| "claude-sonnet-5".to_string());
             Box::new(AnthropicProvider::new(key, model))
         }
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY");
-            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
             Box::new(OpenAiProvider::new(key, model))
         }
         "gemini" => {
             let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
             let model =
-                std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".to_string());
+                std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
             Box::new(GeminiProvider::new(key, model))
         }
         "ollama" => {
