@@ -1,0 +1,8 @@
+# Example hook script for minder (.agent/hooks/security.mq).
+# Blocks destructive bash commands; every other tool call is allowed unchanged.
+
+def on_tool_call(call):
+  if (call["name"] == "bash" && contains(call["arguments"]["command"], "rm -rf")):
+    {"action": "block", "reason": "destructive bash command blocked by policy"}
+  else:
+    {"action": "allow", "value": call};

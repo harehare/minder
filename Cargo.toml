@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-core",
+    "crates/agent-providers",
+    "crates/agent-tools",
+    "crates/agent-tools-wasm",
+    "crates/agent-hooks",
+    "crates/agent-cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+agent-core = { path = "crates/agent-core" }
+agent-providers = { path = "crates/agent-providers" }
+agent-tools = { path = "crates/agent-tools" }
+agent-tools-wasm = { path = "crates/agent-tools-wasm" }
+agent-hooks = { path = "crates/agent-hooks" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+thiserror = "2"
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+glob = "0.3"
+ignore = "0.4"
+regex = "1"

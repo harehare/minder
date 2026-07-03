@@ -1,0 +1,19 @@
+[package]
+name = "agent-hooks"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+mq-lang = { version = "0.6", default-features = false, features = ["std", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+uuid.workspace = true

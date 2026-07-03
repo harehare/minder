@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "echo_plugin",
+    "panicking_plugin",
+    "slow_loop_plugin",
+    "fs_probe_plugin",
+    "net_probe_plugin",
+]
+
+[profile.release]
+panic = "abort"

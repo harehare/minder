@@ -1,0 +1,11 @@
+[package]
+name = "net_probe_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "net_probe_plugin"
+path = "src/main.rs"
