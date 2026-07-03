@@ -14,7 +14,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "rt", "time"] }
 async-trait.workspace = true
 reqwest.workspace = true
-toml = "0.9"
+toml = "1"
 wasmtime = "46.0.1"
 wasmtime-wasi = "46.0.1"
 

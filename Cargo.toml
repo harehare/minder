@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/agent-core",
     "crates/agent-providers",
@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sy
 tokio-util = "0.7"
 async-trait = "0.1"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 glob = "0.3"
