@@ -5,7 +5,7 @@ pub mod reporter;
 pub mod session;
 pub mod tool;
 
-pub use hooks::{HookDecision, HookPort, ToolResultInfo};
+pub use hooks::{HookDecision, HookPort, RenderDecision, ToolCallDecision, ToolResultInfo};
 pub use message::{
     ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult,
     ToolResultContent, ToolSpec, Usage,

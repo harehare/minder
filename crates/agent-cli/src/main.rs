@@ -98,8 +98,8 @@ async fn build_session() -> AgentSession {
         }
     }
 
-    AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx)
-        .with_reporter(Arc::new(TerminalReporter::new()))
+    let reporter = Arc::new(TerminalReporter::new(hooks.clone()));
+    AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx).with_reporter(reporter)
 }
 
 #[tokio::main]

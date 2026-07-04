@@ -1,0 +1,74 @@
+# Convenience accessors over the `messages`/`call`/`result` shapes already
+# passed into hook functions (see agent-core's Message/ToolCall/ToolResultInfo
+# and their serde JSON shapes), so hook scripts don't need to hand-roll
+# dict/array traversal for common questions like "how many tool calls have
+# failed in a row?". Loaded into the same flat namespace user hook files
+# share (see HookEngine::load), so these are always available bare -- the
+# `agent_` prefix is what avoids colliding with a user's own function names,
+# playing the same role `__hook_arg`'s `__` prefix plays for the hook
+# argument itself.
+
+# Flattens every message's `content` array into one array of content blocks
+# (each `{"type": ..., "value": ...}`).
+def agent_content_blocks(messages):
+  flatten(map(messages, fn(m): m["content"] end))
+end
+
+# All `tool_use` blocks across `messages`, unwrapped to their `value`
+# (`{"id", "name", "arguments"}`, i.e. shaped like a ToolCall).
+def agent_tool_calls(messages):
+  let blocks = agent_content_blocks(messages)
+  | let uses = filter(blocks, fn(b): b["type"] == "tool_use" end)
+  | map(uses, fn(b): b["value"] end)
+end
+
+# All `tool_result` blocks across `messages`, unwrapped to their `value`
+# (`{"tool_call_id", "content", "is_error"}`).
+def agent_tool_results(messages):
+  let blocks = agent_content_blocks(messages)
+  | let results = filter(blocks, fn(b): b["type"] == "tool_result" end)
+  | map(results, fn(b): b["value"] end)
+end
+
+# Every assistant-authored text string across `messages`, in order -- the
+# model's own visible commentary/reasoning trail, as opposed to tool I/O.
+def agent_assistant_texts(messages):
+  let assistant_msgs = filter(messages, fn(m): m["role"] == "assistant" end)
+  | let blocks = flatten(map(assistant_msgs, fn(m): m["content"] end))
+  | let texts = filter(blocks, fn(b): b["type"] == "text" end)
+  | map(texts, fn(b): b["value"] end)
+end
+
+# Distinct tool names called so far, in first-seen order.
+def agent_tool_names(messages):
+  uniq(map(agent_tool_calls(messages), fn(c): c["name"] end))
+end
+
+# Count of tool results with `is_error: true`.
+def agent_error_count(messages):
+  len(filter(agent_tool_results(messages), fn(r): r["is_error"] end))
+end
+
+# Trailing streak of consecutive `is_error: true` tool results, most-recent
+# first -- e.g. a hook can block further retries once this crosses a
+# threshold. 0 if the most recent result (if any) wasn't an error.
+def agent_consecutive_errors(results):
+  var count = 0
+  | var stop = false
+  | let n = len(results)
+  | var i = n - 1
+  | let _ = while (i >= 0 && !stop):
+      if (results[i]["is_error"]):
+        do count += 1 | i -= 1 | count end
+      else:
+        do stop = true | count end
+    end
+  | count
+end
+
+# Tail of any array (messages, tool calls, results, ...): the last `n`
+# items, or all of `items` if it has `n` or fewer.
+def agent_last_n(items, n):
+  let l = len(items)
+  | if (l <= n): items else: slice(items, l - n, l)
+end

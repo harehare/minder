@@ -84,25 +84,28 @@ answer elsewhere stays clean:
 
 - **stdout** — the conversation itself: any assistant text, including commentary the model emits
   on turns where it also calls a tool (previously dropped silently, now shown live).
-- **stderr** — the execution trace: `→ tool_name key=value` before each call, then either a
-  colorized unified diff (for `write_file`/`edit_file`, additions in green, deletions in red) or a
-  `✓`/`✗` one-line result summary.
+- **stderr** — the execution trace: `● tool_name(key=value)` before each call, then either a diff
+  stat line (`+N -N`) followed by a colorized, indented unified diff (for `write_file`/`edit_file`
+  — capped at 40 lines with a `… N more line(s)` trailer so one big rewrite can't flood the
+  terminal) or a `✓`/`✗` one-line result summary.
 
 ```sh
 $ minder "fix the off-by-one in the pagination helper"
-→ grep pattern=page_size
-✓ grep: src/pagination.rs:42:    let end = start + page_size;
-→ edit_file path=src/pagination.rs
---- a/src/pagination.rs
-+++ b/src/pagination.rs
-@@ -40,2 +40,2 @@
-- let end = start + page_size;
-+ let end = start + page_size - 1;
+● grep(pattern=page_size)
+  ✓ src/pagination.rs:42:    let end = start + page_size;
+● edit_file(path=src/pagination.rs)
+  ✓ +1 -1
+  --- a/src/pagination.rs
+  +++ b/src/pagination.rs
+  @@ -40,2 +40,2 @@
+  - let end = start + page_size;
+  + let end = start + page_size - 1;
 Fixed the off-by-one: `end` was one past the last valid index.
 ```
 
 Colors turn off automatically when stderr isn't a terminal (e.g. redirected to a file) or when
-`NO_COLOR` is set.
+`NO_COLOR` is set. Every line here is also overridable per-project from `.agent/hooks/*.mq` — see
+[Customizing the display](#customizing-the-display) under Hooks.
 
 A few real tasks to try:
 
@@ -266,6 +269,88 @@ buggy `on_tool_call` fails **closed** (blocks the action); every other hook poin
 | `before_compact` | `before_compact(messages)` | Before history is truncated under context pressure |
 
 See `hooks/security.mq` for a runnable example (copy it to `.agent/hooks/` in a project to try it).
+
+### The `agent` module
+
+A small set of convenience functions is always loaded before any hook file, bare-callable with no
+`import` needed (an `agent_` prefix keeps them out of your own functions' way — redefine one
+yourself and your version simply shadows it):
+
+| Function | Returns |
+|---|---|
+| `agent_content_blocks(messages)` | Every message's `content` array, flattened into one array of blocks |
+| `agent_tool_calls(messages)` | All `tool_use` blocks so far, unwrapped to `{id, name, arguments}` |
+| `agent_tool_results(messages)` | All `tool_result` blocks so far, unwrapped to `{tool_call_id, content, is_error}` |
+| `agent_assistant_texts(messages)` | Every assistant-authored text string, in order |
+| `agent_tool_names(messages)` | Distinct tool names called so far |
+| `agent_error_count(messages)` | Count of tool results with `is_error: true` |
+| `agent_consecutive_errors(results)` | Trailing streak of `is_error: true` results (feed it `agent_tool_results(messages)`) |
+| `agent_last_n(items, n)` | The last `n` items of any array |
+
+```mq
+# .agent/hooks/circuit_breaker.mq -- stop the turn once 3 tool calls in a row have failed.
+# on_context sees the full history (on_tool_call only sees the one call about to run), so
+# that's where a check like this belongs.
+def on_context(messages):
+  if (agent_consecutive_errors(agent_tool_results(messages)) >= 3):
+    {"action": "block", "reason": "3 consecutive tool failures -- pausing for a human"}
+  else:
+    {"action": "allow", "value": messages};
+```
+
+### Overriding a tool's result
+
+`on_tool_call` can go a step further than allow/block: `{"action": "override", "value": {"content":
+"...", "is_error": false, "metadata": null}}` supplies the tool's result directly. The real tool
+never runs, but the outcome still flows through `on_tool_result` afterward like any other, so
+post-processing hooks stay uniform either way. Useful for mocking a tool in tests, or for
+short-circuiting it once some condition (like `agent_consecutive_errors` above) is met without
+just erroring out:
+
+```mq
+def on_tool_call(call):
+  if (call["name"] == "web_fetch"):
+    {"action": "override", "value": {"content": "(network disabled in this environment)", "is_error": false, "metadata": None}}
+  else:
+    {"action": "allow", "value": call};
+```
+
+### Customizing the display
+
+The [live execution display](#live-execution-display) is driven by two more optional hook
+functions, checked before minder's own built-in formatting — same files, same loading, nothing
+extra to set up. Both fail **open**: a broken or undefined render function just falls back to the
+built-in look, since a display bug should never be able to affect what the agent actually does.
+
+| Function | Called with | Controls |
+|---|---|---|
+| `render_tool_call(call)` | the upcoming `ToolCall` | how the `● name(...)` header line prints |
+| `render_tool_result(arg)` | `{"call": ToolCall, "outcome": ToolExecOutcome}` | how the result/diff line(s) print |
+
+Each returns `{"action": "default"}` (use the built-in formatting), `{"action": "hide"}` (print
+nothing), or `{"action": "text", "value": "...", "style": "..."}` (print this instead — `style` is
+one of `green`/`red`/`yellow`/`cyan`/`dim`/`bold`, or omitted/anything else for no styling):
+
+```mq
+# .agent/hooks/display.mq -- quiet git_status noise, and prefix bash calls with a shell-style `$`
+def render_tool_call(call):
+  if (call["name"] == "git_status"):
+    {"action": "hide"}
+  else:
+    {"action": "default"};
+
+def render_tool_result(arg):
+  if (arg["call"]["name"] == "bash"):
+    {"action": "text", "value": "$ " + arg["call"]["arguments"]["command"], "style": "cyan"}
+  else:
+    {"action": "default"};
+```
+
+Both `render_tool_call` and (via `arg["call"]`) `render_tool_result` only see the one call/outcome
+in front of them, not the conversation — reach for the [`agent` module](#the-agent-module) inside
+`on_context`/`before_compact` (which do see `messages`) if a display decision needs history, and
+have that hook stash whatever's needed back onto the call/result some other way (e.g. blocking
+before it ever reaches the display layer).
 
 ## Tool plugins (WASM)
 

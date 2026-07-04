@@ -19,9 +19,11 @@ pub struct ToolContext {
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolExecOutcome {
     pub content: String,
     pub is_error: bool,
+    #[serde(default)]
     pub metadata: serde_json::Value,
 }
 
