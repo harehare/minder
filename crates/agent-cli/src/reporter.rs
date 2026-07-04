@@ -157,7 +157,7 @@ impl TerminalReporter {
 #[async_trait]
 impl Reporter for TerminalReporter {
     async fn on_assistant_text(&self, text: &str) {
-        println!("{text}");
+        println!("{}", crate::markdown::render(text, self.color));
     }
 
     async fn on_tool_call(&self, call: &ToolCall) {

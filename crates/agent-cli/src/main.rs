@@ -1,4 +1,5 @@
 mod loop_mode;
+mod markdown;
 mod provider_select;
 mod reporter;
 
