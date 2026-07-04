@@ -13,6 +13,8 @@ Multi-provider (Anthropic, OpenAI, Gemini, Ollama), with policy/observability ho
 
 The agent loop itself is a standard ReAct-style tool-calling loop: the LLM's own response (does it emit tool calls or not) drives whether the loop continues, not the hooks. Hooks only answer narrow policy questions at five fixed interception points.
 
+Every tool call, its result, and (for file edits) a colorized diff stream live to the terminal as the loop runs — see [Live execution display](#live-execution-display). `mq-lang` shows up a second time, embedded the same way as the hooks, as the harness's own [autonomous loop mode](#autonomous-loop-mode): `minder loop TODO.md` re-queries a Markdown checklist after every turn and keeps handing the model whatever's still unchecked, then keeps polling for more once the file is clear — no user in the loop, no external `mq` binary required.
+
 > [!IMPORTANT]
 > This project is under active development and has not been thoroughly tested end to end yet. Providers, tools, and hooks work individually in unit tests, but the full agent loop hasn't seen broad real-world verification — expect rough edges.
 
@@ -24,8 +26,10 @@ See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates
 - [Quick start](#quick-start)
 - [Providers](#providers)
 - [Tools](#tools)
+- [Skills](#skills)
 - [Hooks](#hooks)
 - [Tool plugins (WASM)](#tool-plugins-wasm)
+- [Autonomous loop mode](#autonomous-loop-mode)
 - [Project layout](#project-layout)
 - [Development](#development)
 
@@ -52,14 +56,16 @@ The rest of this README uses `minder "..."` for brevity — substitute `cargo ru
 
 ## Quick start
 
-minder takes a single task string as its only argument and runs it to completion, printing the
-final assistant message to stdout. There's no interactive chat mode yet — one process, one task.
+minder takes a single task string as its only argument and runs it to completion. There's no
+interactive chat mode yet — one process, one task.
 
 ```sh
 $ export ANTHROPIC_API_KEY=sk-ant-...
 $ cd path/to/some/project
 $ minder "list the top-level files and summarize what this project does"
 loaded hooks from .agent/            # only printed if .agent/hooks/*.mq exist
+→ ls recursive=false
+✓ ls: Cargo.toml  README.md  crates/  ...
 The project is a Rust workspace with six crates under crates/... (etc.)
 ```
 
@@ -68,6 +74,35 @@ decides whether it needs a tool (`read_file`, `bash`, `grep`, ...), the CLI exec
 current working directory, the result is fed back to the model, and this repeats until the model
 replies without requesting another tool call. Everything the agent touches — files read/written,
 commands run — is scoped to the directory `minder` was launched from.
+
+### Live execution display
+
+Every tool call is streamed to the terminal as it happens instead of only surfacing the final
+answer once the whole loop has finished — useful both for watching what the agent is doing and
+for debugging a stuck turn. The two output streams stay deliberately separate so piping `minder`'s
+answer elsewhere stays clean:
+
+- **stdout** — the conversation itself: any assistant text, including commentary the model emits
+  on turns where it also calls a tool (previously dropped silently, now shown live).
+- **stderr** — the execution trace: `→ tool_name key=value` before each call, then either a
+  colorized unified diff (for `write_file`/`edit_file`, additions in green, deletions in red) or a
+  `✓`/`✗` one-line result summary.
+
+```sh
+$ minder "fix the off-by-one in the pagination helper"
+→ grep pattern=page_size
+✓ grep: src/pagination.rs:42:    let end = start + page_size;
+→ edit_file path=src/pagination.rs
+--- a/src/pagination.rs
++++ b/src/pagination.rs
+@@ -40,2 +40,2 @@
+- let end = start + page_size;
++ let end = start + page_size - 1;
+Fixed the off-by-one: `end` was one past the last valid index.
+```
+
+Colors turn off automatically when stderr isn't a terminal (e.g. redirected to a file) or when
+`NO_COLOR` is set.
 
 A few real tasks to try:
 
@@ -109,6 +144,42 @@ MINDER_PROVIDER=ollama MINDER_MODEL=llama3.2 minder "..."
 OLLAMA_BASE_URL=http://localhost:11434 MINDER_PROVIDER=ollama minder "..."
 ```
 
+### Running with gpt-oss
+
+[gpt-oss](https://openai.com/index/introducing-gpt-oss/) (OpenAI's open-weight model family, `gpt-oss-20b`/`gpt-oss-120b`) runs through the existing `ollama` provider above — no minder code changes needed, since minder talks to Ollama's generic `/api/chat` endpoint and Ollama does the gpt-oss-specific translation.
+
+1. Install Ollama (v0.11.4+; gpt-oss needs recent Ollama for correct tool-calling support): <https://ollama.com/download>, or:
+
+   ```sh
+   # macOS
+   brew install ollama
+   # Linux
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+2. Start the server (skip this if your install already runs it as a background service):
+
+   ```sh
+   ollama serve
+   ```
+3. Pull a gpt-oss model. `20b` needs ~16GB RAM/VRAM; `120b` needs ~65GB+ and is meant for
+   multi-GPU/datacenter-class hardware — start with `20b` unless you know you have the headroom:
+
+   ```sh
+   ollama pull gpt-oss:20b
+   # or, if your hardware can take it:
+   ollama pull gpt-oss:120b
+   ```
+4. Point minder at it:
+
+   ```sh
+   MINDER_PROVIDER=ollama MINDER_MODEL=gpt-oss:20b minder "..."
+
+   # remote/non-default Ollama host:
+   OLLAMA_BASE_URL=http://your-ollama-host:11434 MINDER_PROVIDER=ollama MINDER_MODEL=gpt-oss:20b minder "..."
+   ```
+
+gpt-oss's reasoning effort (low/medium/high) isn't separately configurable through minder today — it runs at Ollama's default for the model. `minder loop` (see below) works the same way with `gpt-oss` as with any other provider, since it drives `AgentSession::run_turn` generically.
+
 ## Tools
 
 Always registered:
@@ -133,8 +204,38 @@ Registered only when configured:
 | Tool | Enabled by |
 |---|---|
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
+| `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
 
 Additional tools can be supplied per-project as WASM plugins — see [Tool plugins (WASM)](#tool-plugins-wasm).
+
+## Skills
+
+```
+.agent/skills/commit-messages/SKILL.md
+```
+
+```markdown
+---
+name: commit-messages
+description: Writes commit messages in this repo's conventional-commit style
+---
+# Commit messages
+
+Use Conventional Commits: `<type>(<scope>): <summary>`, imperative mood...
+```
+
+Each skill is a directory containing a `SKILL.md` with `---`-delimited frontmatter
+(`name`, `description`) followed by the skill's instructions as the file body. minder
+discovers every `.agent/skills/*/SKILL.md` at startup and, if any exist, registers a single
+`skill` tool whose description lists each skill's name and short description — cheap enough to
+keep in context on every turn. The model calls `skill` with a `name` to pull that skill's full
+body into the conversation only when it's actually relevant, rather than paying for every
+skill's full instructions on every turn.
+
+Skill names must be unique across all discovered skills, and startup fails if a `SKILL.md` is
+missing its frontmatter or the `name`/`description` fields. See `skills/commit-messages/SKILL.md`
+in this repo for a runnable example (copy the `skills/` directory to `.agent/skills/` in a
+project to try it).
 
 ## Hooks
 
@@ -201,6 +302,80 @@ granted per-plugin via WASI preopens (no grant, no access); network access is no
 plugins with `network = true` get a single `host_web_fetch` import that reuses the same
 SSRF-guarded path as the built-in `web_fetch` tool. Execution is metered with wasmtime fuel, so a
 runaway plugin traps instead of hanging.
+
+## Autonomous loop mode
+
+```sh
+minder loop TODO.md
+minder loop TODO.md "ship the v2 pagination rewrite"   # optional overall-goal hint
+```
+
+`minder loop <file> ["<goal>"]` drives the same `AgentSession` turn after turn against a Markdown
+checklist, with no user in the loop between iterations, and doesn't stop once the checklist is
+clear — it keeps watching the file for new work indefinitely:
+
+1. Query `<file>` for GFM checklist lines that are still unchecked. This runs entirely inside
+   `mq-lang` — embedded directly (`DefaultEngine` + `file-io` feature), the same embedding the
+   [hooks](#hooks) layer's `HookEngine` uses, just pointed at a file on disk instead of the
+   conversation. minder's own Rust code never touches the filesystem for this: the query's
+   `read_file(path)` does the reading, with `path` bound in as a variable the same way
+   `HookEngine` binds `__hook_arg` — no `mq` subprocess, no external `mq` binary, no `std::fs` call
+   on minder's side at all:
+
+   ```
+   read_file(path) | split(., "\n") | filter(., fn(line): is_regex_match(line, "^\\s*[-*+]\\s+\\[ \\]") end)
+   ```
+
+   (the doubled backslashes are mq's own string-escaping — a literal `\s` inside an mq string
+   literal is written `\\s`, same as JSON)
+
+   This works line-by-line with a regex rather than through markdown's list/checkbox AST
+   (`is_list()`/`attr("checked")`): those selectors only see nodes the *host* already parsed and
+   handed in as input, and mq-lang has no script-level builtin that turns a `read_file`d string
+   into that same node form for a single file. (The one builtin that does, `collection`, parses
+   every markdown file in an entire directory tree — overkill, and slow, for re-checking one file
+   every few seconds.) The query's output is already the literal `- [ ] ...` lines, so there's no
+   extra parsing on minder's side either way.
+2. If nothing comes back, the file is done: `minder loop` logs that it's idle and starts polling
+   `<file>` on an interval, waiting for someone (or something) to add a new checklist item.
+3. Otherwise the remaining items are folded into a prompt ("pick the first unfinished item,
+   implement it, then check it off in `<file>`") and handed to `run_turn`.
+4. Repeat from step 1 — the item the model just finished no longer shows up as unchecked, so the
+   next prompt is naturally derived from the file's current state, not from a stale plan.
+
+```markdown
+<!-- TODO.md -->
+## Backend
+- [x] Set up database schema
+- [ ] Add user authentication endpoint
+- [ ] Write tests for auth endpoint
+```
+
+```sh
+$ minder loop TODO.md
+[loop 1/50] 2 item(s) remaining in TODO.md
+→ write_file path=src/auth.rs
+...
+[loop 2/50] 1 item(s) remaining in TODO.md
+→ edit_file path=tests/auth_test.rs
+...
+[loop] TODO.md has no unchecked items -- polling every 5s for new work (Ctrl-C to stop)
+```
+
+At that point the process just keeps running: add a new `- [ ] ...` line to `TODO.md` (by hand, or
+have something else append to it) and the next poll picks it up automatically, no restart needed.
+Stop it with Ctrl-C when you're done.
+
+Safety limits keep a stuck agent from spinning forever, all overridable via env vars:
+
+| Env var | Default | Guards against |
+|---|---|---|
+| `MINDER_LOOP_MAX_ITERATIONS` | 50 | Runaway spend — a lifetime cap on actual working turns (idle polling doesn't count against it) |
+| `MINDER_LOOP_POLL_INTERVAL_SECS` | 5 | How often to re-check the file while idle |
+| `MINDER_LOOP_QUERY` | `read_file(path) \| split(., "\n") \| filter(., fn(line): is_regex_match(...) end)` (see above) | Lets you point at a differently-structured file (a custom "done" marker, a different bullet convention, ...) |
+
+If the unchecked count doesn't drop for more than two consecutive working iterations in a row, the
+loop stops with an error rather than burning turns on a task the model isn't making progress on.
 
 ## Project layout
 

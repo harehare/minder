@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use crate::hooks::{HookDecision, HookPort, ToolResultInfo};
-use crate::message::{Message, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec};
+use crate::message::{
+    ContentBlock, Message, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
+};
 use crate::provider::{LlmProvider, ProviderError};
+use crate::reporter::{NoopReporter, Reporter};
 use crate::tool::{Tool, ToolContext, ToolExecOutcome, spec};
 
 const COMPACT_THRESHOLD: usize = 60;
@@ -12,6 +15,7 @@ pub struct AgentSession {
     provider: Box<dyn LlmProvider>,
     tools: Vec<Box<dyn Tool>>,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+    reporter: Arc<dyn Reporter>,
     messages: Vec<Message>,
     system_prompt: String,
     tool_ctx: ToolContext,
@@ -40,11 +44,19 @@ impl AgentSession {
             provider,
             tools,
             hooks,
+            reporter: Arc::new(NoopReporter),
             messages: Vec::new(),
             system_prompt: system_prompt.into(),
             tool_ctx,
             started: false,
         }
+    }
+
+    /// Sets the reporter used to observe live progress (assistant text, tool
+    /// calls, tool results) as a turn runs. Defaults to `NoopReporter`.
+    pub fn with_reporter(mut self, reporter: Arc<dyn Reporter>) -> Self {
+        self.reporter = reporter;
+        self
     }
 
     /// Runs one user turn to completion (looping on tool calls as needed)
@@ -68,6 +80,12 @@ impl AgentSession {
                 .await?;
             self.messages.push(response.message.clone());
 
+            for block in &response.message.content {
+                if let ContentBlock::Text(text) = block {
+                    self.reporter.on_assistant_text(text).await;
+                }
+            }
+
             let tool_calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             if tool_calls.is_empty() || response.stop_reason != StopReason::ToolUse {
                 return Ok(response.message);
@@ -75,7 +93,9 @@ impl AgentSession {
 
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
+                self.reporter.on_tool_call(&call).await;
                 let outcome = self.execute_with_hooks(call.clone()).await?;
+                self.reporter.on_tool_result(&call, &outcome).await;
                 results.push(ToolResult {
                     tool_call_id: call.id,
                     content: ToolResultContent::Text(outcome.content),

@@ -1,3 +1,4 @@
+use crate::diff::diff_files;
 use agent_core::{Tool, ToolContext, ToolExecOutcome};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -47,12 +48,24 @@ impl Tool for WriteFileTool {
             ));
         }
 
+        // Best-effort: an unreadable/missing file just means "new file",
+        // diffed against empty content -- never blocks the write itself.
+        let old_content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+
         match tokio::fs::write(&path, &args.content).await {
-            Ok(()) => ToolExecOutcome {
-                content: format!("wrote {} bytes to {}", args.content.len(), path.display()),
-                is_error: false,
-                metadata: serde_json::json!({ "bytes_written": args.content.len() }),
-            },
+            Ok(()) => {
+                let diff = diff_files(&args.path, &old_content, &args.content);
+                ToolExecOutcome {
+                    content: format!("wrote {} bytes to {}", args.content.len(), path.display()),
+                    is_error: false,
+                    metadata: serde_json::json!({
+                        "bytes_written": args.content.len(),
+                        "diff": diff.unified,
+                        "additions": diff.additions,
+                        "deletions": diff.deletions,
+                    }),
+                }
+            }
             Err(e) => error(format!("failed to write {}: {e}", path.display())),
         }
     }

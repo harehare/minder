@@ -1,3 +1,4 @@
+use crate::diff::diff_files;
 use agent_core::{Tool, ToolContext, ToolExecOutcome};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -67,11 +68,19 @@ impl Tool for EditFileTool {
         };
 
         match tokio::fs::write(&path, &new_content).await {
-            Ok(()) => ToolExecOutcome {
-                content: format!("replaced {occurrences} occurrence(s) in {}", path.display()),
-                is_error: false,
-                metadata: serde_json::json!({ "occurrences": occurrences }),
-            },
+            Ok(()) => {
+                let diff = diff_files(&args.path, &content, &new_content);
+                ToolExecOutcome {
+                    content: format!("replaced {occurrences} occurrence(s) in {}", path.display()),
+                    is_error: false,
+                    metadata: serde_json::json!({
+                        "occurrences": occurrences,
+                        "diff": diff.unified,
+                        "additions": diff.additions,
+                        "deletions": diff.deletions,
+                    }),
+                }
+            }
             Err(e) => error(format!("failed to write {}: {e}", path.display())),
         }
     }

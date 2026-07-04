@@ -14,6 +14,9 @@ agent-providers.workspace = true
 agent-tools.workspace = true
 agent-tools-wasm.workspace = true
 agent-hooks.workspace = true
+async-trait.workspace = true
+mq-lang = { version = "0.6", default-features = false, features = ["std", "sync", "file-io"] }
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true

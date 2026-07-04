@@ -1,21 +1,25 @@
 mod bash;
+mod diff;
 mod edit_file;
 mod git;
 mod glob_tool;
 mod grep;
 mod ls;
 mod read_file;
+mod skill;
 mod web_fetch;
 mod web_search;
 mod write_file;
 
 pub use bash::BashTool;
+pub use diff::{FileDiff, diff_files};
 pub use edit_file::EditFileTool;
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool};
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read_file::ReadFileTool;
+pub use skill::{Skill, SkillLoadError, SkillTool, discover_skills};
 pub use web_fetch::{FetchResult, WebFetchTool, fetch};
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
