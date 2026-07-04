@@ -127,9 +127,9 @@ is active.
 
 | `MINDER_PROVIDER` | Required env | Default model | Notes |
 |---|---|---|---|
-| `anthropic` (default) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5-20250929` | |
-| `openai` | `OPENAI_API_KEY` | `gpt-4o-mini` | |
-| `gemini` | `GEMINI_API_KEY` | `gemini-2.0-flash` | |
+| `anthropic` (default) | `ANTHROPIC_API_KEY` | `claude-sonnet-5` | |
+| `openai` | `OPENAI_API_KEY` | `gpt-5.4-mini` | |
+| `gemini` | `GEMINI_API_KEY` | `gemini-3.5-flash` | |
 | `ollama` | none | `llama3.2` | needs a local `ollama serve`; override the endpoint with `OLLAMA_BASE_URL` |
 
 ```sh
@@ -137,7 +137,7 @@ is active.
 ANTHROPIC_API_KEY=... minder "run the tests and summarize failures"
 
 # OpenAI
-MINDER_PROVIDER=openai OPENAI_API_KEY=... MINDER_MODEL=gpt-4o minder "..."
+MINDER_PROVIDER=openai OPENAI_API_KEY=... MINDER_MODEL=gpt-5.4 minder "..."
 
 # Gemini
 MINDER_PROVIDER=gemini GEMINI_API_KEY=... minder "..."
