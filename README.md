@@ -7,18 +7,23 @@
 
 </div>
 
-Multi-provider (Anthropic, OpenAI, Gemini, Ollama), with policy/observability hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language instead of a general-purpose scripting language.
+Multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness with policy/observability
+hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language rather than a
+general-purpose scripting language — `mq-lang` has no builtin for file writes, network requests, or
+process execution, so hooks can observe, block, or transform agent behavior without being able to
+cause side effects themselves.
 
-`mq-lang` has no builtin for file writes, network requests, or process execution, so hook scripts under `.agent/hooks/*.mq` can observe, block, or transform what the agent does without being able to do anything unsafe themselves — the host mediates all real side effects.
-
-The agent loop itself is a standard ReAct-style tool-calling loop: the LLM's own response (does it emit tool calls or not) drives whether the loop continues, not the hooks. Hooks only answer narrow policy questions at five fixed interception points.
-
-Every tool call, its result, and (for file edits) a colorized diff stream live to the terminal as the loop runs — see [Live execution display](#live-execution-display). `mq-lang` shows up a second time, embedded the same way as the hooks, as the harness's own [autonomous loop mode](#autonomous-loop-mode): `minder loop TODO.md` re-queries a Markdown checklist after every turn and keeps handing the model whatever's still unchecked, then keeps polling for more once the file is clear — no user in the loop, no external `mq` binary required.
+The agent loop is a standard ReAct-style tool-calling loop; hooks only answer narrow policy
+questions at five fixed interception points and never drive the loop itself. Every tool call and
+result streams live to the terminal — see [Live execution display](#live-execution-display).
+`mq-lang` also powers the harness's [autonomous loop mode](#autonomous-loop-mode): `minder loop
+TODO.md` re-queries a Markdown checklist after each turn and keeps working through unchecked items,
+with no user in the loop and no external `mq` binary required.
 
 > [!IMPORTANT]
 > This project is under active development and has not been thoroughly tested end to end yet. Providers, tools, and hooks work individually in unit tests, but the full agent loop hasn't seen broad real-world verification — expect rough edges.
 
-See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates/agent-tools-wasm`, `crates/agent-hooks`, `crates/agent-cli`.
+See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates/agent-tools-wasm`, `crates/agent-tools-mcp`, `crates/agent-hooks`, `crates/agent-cli`.
 
 ## Contents
 
@@ -29,6 +34,7 @@ See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates
 - [Skills](#skills)
 - [Hooks](#hooks)
 - [Tool plugins (WASM)](#tool-plugins-wasm)
+- [MCP servers (optional)](#mcp-servers-optional)
 - [Autonomous loop mode](#autonomous-loop-mode)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -69,18 +75,16 @@ loaded hooks from .agent/            # only printed if .agent/hooks/*.mq exist
 The project is a Rust workspace with six crates under crates/... (etc.)
 ```
 
-Behind the scenes each turn runs a standard tool-calling loop: the model reads your prompt,
-decides whether it needs a tool (`read_file`, `bash`, `grep`, ...), the CLI executes it in your
-current working directory, the result is fed back to the model, and this repeats until the model
-replies without requesting another tool call. Everything the agent touches — files read/written,
-commands run — is scoped to the directory `minder` was launched from.
+Each turn: the model reads the prompt, optionally calls a tool (`read_file`, `bash`, `grep`, ...),
+the CLI runs it in the current working directory, and the result feeds back — repeating until the
+model replies without requesting another tool call. Everything the agent touches — files
+read/written, commands run — is scoped to the directory `minder` was launched from.
 
 ### Live execution display
 
-Every tool call is streamed to the terminal as it happens instead of only surfacing the final
-answer once the whole loop has finished — useful both for watching what the agent is doing and
-for debugging a stuck turn. The two output streams stay deliberately separate so piping `minder`'s
-answer elsewhere stays clean:
+Every tool call streams to the terminal as it happens, not just the final answer — useful for
+watching the agent work and for debugging a stuck turn. Output is split across two streams so
+piping `minder`'s answer elsewhere stays clean:
 
 - **stdout** — the conversation itself: any assistant text, including commentary the model emits
   on turns where it also calls a tool (previously dropped silently, now shown live).
@@ -149,9 +153,13 @@ OLLAMA_BASE_URL=http://localhost:11434 MINDER_PROVIDER=ollama minder "..."
 
 ### Running with gpt-oss
 
-[gpt-oss](https://openai.com/index/introducing-gpt-oss/) (OpenAI's open-weight model family, `gpt-oss-20b`/`gpt-oss-120b`) runs through the existing `ollama` provider above — no minder code changes needed, since minder talks to Ollama's generic `/api/chat` endpoint and Ollama does the gpt-oss-specific translation.
+[gpt-oss](https://openai.com/index/introducing-gpt-oss/) (OpenAI's open-weight models,
+`gpt-oss-20b`/`gpt-oss-120b`) runs through the existing `ollama` provider — no minder changes
+needed, since Ollama handles the gpt-oss-specific translation over its generic `/api/chat`
+endpoint.
 
-1. Install Ollama (v0.11.4+; gpt-oss needs recent Ollama for correct tool-calling support): <https://ollama.com/download>, or:
+1. Install Ollama v0.11.4+ (needed for correct gpt-oss tool-calling support):
+   <https://ollama.com/download>, or:
 
    ```sh
    # macOS
@@ -164,8 +172,8 @@ OLLAMA_BASE_URL=http://localhost:11434 MINDER_PROVIDER=ollama minder "..."
    ```sh
    ollama serve
    ```
-3. Pull a gpt-oss model. `20b` needs ~16GB RAM/VRAM; `120b` needs ~65GB+ and is meant for
-   multi-GPU/datacenter-class hardware — start with `20b` unless you know you have the headroom:
+3. Pull a gpt-oss model (`20b` needs ~16GB RAM/VRAM; `120b` needs ~65GB+, multi-GPU/datacenter-class
+   hardware) — start with `20b` unless you know you have the headroom:
 
    ```sh
    ollama pull gpt-oss:20b
@@ -181,7 +189,9 @@ OLLAMA_BASE_URL=http://localhost:11434 MINDER_PROVIDER=ollama minder "..."
    OLLAMA_BASE_URL=http://your-ollama-host:11434 MINDER_PROVIDER=ollama MINDER_MODEL=gpt-oss:20b minder "..."
    ```
 
-gpt-oss's reasoning effort (low/medium/high) isn't separately configurable through minder today — it runs at Ollama's default for the model. `minder loop` (see below) works the same way with `gpt-oss` as with any other provider, since it drives `AgentSession::run_turn` generically.
+gpt-oss's reasoning effort (low/medium/high) isn't configurable through minder today — it runs at
+Ollama's default for the model. `minder loop` (see below) works the same way with `gpt-oss` as
+with any other provider, since it drives `AgentSession::run_turn` generically.
 
 ## Tools
 
@@ -209,7 +219,8 @@ Registered only when configured:
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
 | `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
 
-Additional tools can be supplied per-project as WASM plugins — see [Tool plugins (WASM)](#tool-plugins-wasm).
+Additional tools can be supplied per-project as WASM plugins — see [Tool plugins (WASM)](#tool-plugins-wasm)
+— or from MCP servers, behind an opt-in feature — see [MCP servers (optional)](#mcp-servers-optional).
 
 ## Skills
 
@@ -227,18 +238,15 @@ description: Writes commit messages in this repo's conventional-commit style
 Use Conventional Commits: `<type>(<scope>): <summary>`, imperative mood...
 ```
 
-Each skill is a directory containing a `SKILL.md` with `---`-delimited frontmatter
-(`name`, `description`) followed by the skill's instructions as the file body. minder
-discovers every `.agent/skills/*/SKILL.md` at startup and, if any exist, registers a single
-`skill` tool whose description lists each skill's name and short description — cheap enough to
-keep in context on every turn. The model calls `skill` with a `name` to pull that skill's full
-body into the conversation only when it's actually relevant, rather than paying for every
-skill's full instructions on every turn.
+Each skill is a directory with a `SKILL.md`: `---`-delimited frontmatter (`name`, `description`)
+followed by instructions as the body. minder discovers every `.agent/skills/*/SKILL.md` at startup
+and registers a single `skill` tool listing each skill's name/description — cheap to keep in
+context every turn. The model calls `skill` with a `name` to pull that skill's full body into the
+conversation only when it's actually relevant.
 
-Skill names must be unique across all discovered skills, and startup fails if a `SKILL.md` is
-missing its frontmatter or the `name`/`description` fields. See `skills/commit-messages/SKILL.md`
-in this repo for a runnable example (copy the `skills/` directory to `.agent/skills/` in a
-project to try it).
+Skill names must be unique, and startup fails if a `SKILL.md` is missing frontmatter or the
+`name`/`description` fields. See `skills/commit-messages/SKILL.md` for a runnable example (copy
+`skills/` to `.agent/skills/` in a project to try it).
 
 ## Hooks
 
@@ -254,8 +262,8 @@ def on_tool_call(call):
     {"action": "allow", "value": call};
 ```
 
-Every hook returns `{"action": "allow", "value": ...}` or `{"action": "block", "reason": "..."}` (the
-gate-only hook `before_compact` returns `{"action": "allow"}` with no `value`). Hooks are
+Every hook returns `{"action": "allow", "value": ...}` or `{"action": "block", "reason": "..."}`
+(the gate-only hook `before_compact` returns `{"action": "allow"}` with no `value`). Hooks are
 optional — if a hook function isn't defined, the corresponding interception point is a no-op. A
 buggy `on_tool_call` fails **closed** (blocks the action); every other hook point fails **open**
 (the buggy transform is skipped).
@@ -300,9 +308,9 @@ def on_context(messages):
 
 ### Overriding a tool's result
 
-`on_tool_call` can go a step further than allow/block: `{"action": "override", "value": {"content":
-"...", "is_error": false, "metadata": null}}` supplies the tool's result directly. The real tool
-never runs, but the outcome still flows through `on_tool_result` afterward like any other, so
+`on_tool_call` can also `override`: `{"action": "override", "value": {"content": "...",
+"is_error": false, "metadata": null}}` supplies the tool's result directly. The real tool never
+runs, but the result still flows through `on_tool_result` afterward like any other, so
 post-processing hooks stay uniform either way. Useful for mocking a tool in tests, or for
 short-circuiting it once some condition (like `agent_consecutive_errors` above) is met without
 just erroring out:
@@ -319,7 +327,7 @@ def on_tool_call(call):
 
 The [live execution display](#live-execution-display) is driven by two more optional hook
 functions, checked before minder's own built-in formatting — same files, same loading, nothing
-extra to set up. Both fail **open**: a broken or undefined render function just falls back to the
+extra to set up. Both fail **open**: a broken or undefined render function falls back to the
 built-in look, since a display bug should never be able to affect what the agent actually does.
 
 | Function | Called with | Controls |
@@ -347,9 +355,9 @@ def render_tool_result(arg):
 ```
 
 Both `render_tool_call` and (via `arg["call"]`) `render_tool_result` only see the one call/outcome
-in front of them, not the conversation — reach for the [`agent` module](#the-agent-module) inside
-`on_context`/`before_compact` (which do see `messages`) if a display decision needs history, and
-have that hook stash whatever's needed back onto the call/result some other way (e.g. blocking
+in front of them, not the conversation — if a display decision needs history, reach for the
+[`agent` module](#the-agent-module) inside `on_context`/`before_compact` (which do see `messages`)
+and have that hook stash whatever's needed back onto the call/result some other way (e.g. blocking
 before it ever reaches the display layer).
 
 ## Tool plugins (WASM)
@@ -361,8 +369,8 @@ Tools can also be provided by sandboxed WASI plugins, discovered from `.agent/to
 .agent/tools/weather.toml
 ```
 
-Every `.wasm` requires a sidecar `.toml` manifest of the same name declaring its capabilities — a
-plugin with no manifest fails to load, it does not silently run with zero capabilities:
+Every `.wasm` needs a sidecar `.toml` manifest of the same name declaring its capabilities — a
+plugin with no manifest fails to load rather than silently running with zero capabilities:
 
 ```toml
 network = false          # grants the one host-mediated fetch primitive (see below)
@@ -381,12 +389,46 @@ fuel = 5_000_000
 Plugins are plain `wasm32-wasip1` modules (no component model) exporting `minder_tool_name`,
 `minder_tool_description`, `minder_tool_parameters_schema`, `minder_tool_execute`, plus
 `minder_alloc`/`minder_dealloc` for passing JSON across linear memory — see
-`crates/agent-tools-wasm/tests/fixtures/echo_plugin` for a minimal example and
-`crates/agent-tools-wasm/tests/fixtures/regenerate.sh` for the build command. Filesystem access is
-granted per-plugin via WASI preopens (no grant, no access); network access is not a raw socket —
-plugins with `network = true` get a single `host_web_fetch` import that reuses the same
-SSRF-guarded path as the built-in `web_fetch` tool. Execution is metered with wasmtime fuel, so a
+`crates/agent-tools-wasm/tests/fixtures/echo_plugin` for a minimal example (`regenerate.sh`
+alongside it has the build command). Filesystem access is granted per-plugin via WASI preopens
+(none by default); network isn't a raw socket — `network = true` grants a single `host_web_fetch`
+import reusing the built-in `web_fetch`'s SSRF guard. Execution is metered with wasmtime fuel, so a
 runaway plugin traps instead of hanging.
+
+## MCP servers (optional)
+
+MCP is a client/server protocol built around subprocesses and long-lived JSON-RPC sessions, which
+doesn't fit the WASI sandbox above (no arbitrary process execution by design), so it's wired in on
+the host side instead, behind an opt-in `mcp` Cargo feature so the `rmcp` dependency and its
+subprocess-spawning code aren't part of the binary unless you ask for them:
+
+```sh
+cargo install --path crates/agent-cli --features mcp
+```
+
+With the feature enabled, minder discovers `.agent/mcp.toml`, launches each configured server as a
+child process over the stdio transport, and registers every tool it advertises as an
+`agent_core::Tool` named `mcp__<server>__<tool>`:
+
+```toml
+# .agent/mcp.toml
+[[server]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+
+[[server]]
+name = "github"
+command = "docker"
+args = ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "..." }
+```
+
+Built without `--features mcp`, minder ignores `.agent/mcp.toml` entirely (the `mcp` tool /
+`agent-tools-mcp` crate is compiled out, not just disabled at runtime). A configured server that
+fails to start, initialize, or list its tools is a hard error at startup, same as a broken wasm
+plugin or hook file. Remote tool calls are opaque to `on_tool_call`/`on_tool_result` hooks in the
+same way built-in and wasm tool calls are — nothing MCP-specific bypasses the hook layer.
 
 ## Autonomous loop mode
 
@@ -396,37 +438,25 @@ minder loop TODO.md "ship the v2 pagination rewrite"   # optional overall-goal h
 ```
 
 `minder loop <file> ["<goal>"]` drives the same `AgentSession` turn after turn against a Markdown
-checklist, with no user in the loop between iterations, and doesn't stop once the checklist is
-clear — it keeps watching the file for new work indefinitely:
+checklist, with no user in the loop, and keeps watching the file for new work once it's clear:
 
-1. Query `<file>` for GFM checklist lines that are still unchecked. This runs entirely inside
-   `mq-lang` — embedded directly (`DefaultEngine` + `file-io` feature), the same embedding the
-   [hooks](#hooks) layer's `HookEngine` uses, just pointed at a file on disk instead of the
-   conversation. minder's own Rust code never touches the filesystem for this: the query's
-   `read_file(path)` does the reading, with `path` bound in as a variable the same way
-   `HookEngine` binds `__hook_arg` — no `mq` subprocess, no external `mq` binary, no `std::fs` call
-   on minder's side at all:
+1. Query `<file>` for GFM checklist lines that are still unchecked, entirely inside `mq-lang` —
+   embedded the same way as the [hooks](#hooks) engine, just pointed at a file on disk instead of
+   the conversation:
 
    ```
    read_file(path) | split(., "\n") | filter(., fn(line): is_regex_match(line, "^\\s*[-*+]\\s+\\[ \\]") end)
    ```
 
-   (the doubled backslashes are mq's own string-escaping — a literal `\s` inside an mq string
-   literal is written `\\s`, same as JSON)
-
-   This works line-by-line with a regex rather than through markdown's list/checkbox AST
-   (`is_list()`/`attr("checked")`): those selectors only see nodes the *host* already parsed and
-   handed in as input, and mq-lang has no script-level builtin that turns a `read_file`d string
-   into that same node form for a single file. (The one builtin that does, `collection`, parses
-   every markdown file in an entire directory tree — overkill, and slow, for re-checking one file
-   every few seconds.) The query's output is already the literal `- [ ] ...` lines, so there's no
-   extra parsing on minder's side either way.
-2. If nothing comes back, the file is done: `minder loop` logs that it's idle and starts polling
-   `<file>` on an interval, waiting for someone (or something) to add a new checklist item.
+   This matches lines with a regex rather than walking markdown's list/checkbox AST, since
+   mq-lang's only builtin that parses markdown into that AST (`collection`) works over an entire
+   directory tree — overkill for re-checking one file every few seconds.
+2. If nothing comes back, the file is done: minder logs that it's idle and polls `<file>` on an
+   interval for new items.
 3. Otherwise the remaining items are folded into a prompt ("pick the first unfinished item,
    implement it, then check it off in `<file>`") and handed to `run_turn`.
-4. Repeat from step 1 — the item the model just finished no longer shows up as unchecked, so the
-   next prompt is naturally derived from the file's current state, not from a stale plan.
+4. Repeat — the item just finished no longer shows up as unchecked, so the next prompt derives
+   naturally from the file's current state, not a stale plan.
 
 ```markdown
 <!-- TODO.md -->
@@ -459,8 +489,8 @@ Safety limits keep a stuck agent from spinning forever, all overridable via env 
 | `MINDER_LOOP_POLL_INTERVAL_SECS` | 5 | How often to re-check the file while idle |
 | `MINDER_LOOP_QUERY` | `read_file(path) \| split(., "\n") \| filter(., fn(line): is_regex_match(...) end)` (see above) | Lets you point at a differently-structured file (a custom "done" marker, a different bullet convention, ...) |
 
-If the unchecked count doesn't drop for more than two consecutive working iterations in a row, the
-loop stops with an error rather than burning turns on a task the model isn't making progress on.
+If the unchecked count doesn't drop for two consecutive working iterations, the loop stops with an
+error rather than burning turns on a task the model isn't making progress on.
 
 ## Project layout
 
@@ -470,6 +500,7 @@ loop stops with an error rather than burning turns on a task the model isn't mak
 | `agent-providers` | Anthropic/OpenAI/Gemini/Ollama client implementations |
 | `agent-tools` | Built-in tools (file, shell, git, web) |
 | `agent-tools-wasm` | WASI plugin loader and sandboxed host runtime |
+| `agent-tools-mcp` | MCP client — spawns configured servers, exposes their tools (opt-in `mcp` feature on `agent-cli`) |
 | `agent-hooks` | `mq`-based hook engine (`.agent/hooks/*.mq`) |
 | `agent-cli` | The `minder` binary — wires providers/tools/hooks together |
 
@@ -493,3 +524,4 @@ cargo test -p agent-providers -- --ignored ollama  # needs `ollama serve` runnin
 ## License
 
 MIT
+</content>

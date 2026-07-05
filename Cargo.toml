@@ -5,6 +5,7 @@ members = [
     "crates/agent-providers",
     "crates/agent-tools",
     "crates/agent-tools-wasm",
+    "crates/agent-tools-mcp",
     "crates/agent-hooks",
     "crates/agent-cli",
 ]
@@ -19,6 +20,7 @@ agent-core = { path = "crates/agent-core" }
 agent-providers = { path = "crates/agent-providers" }
 agent-tools = { path = "crates/agent-tools" }
 agent-tools-wasm = { path = "crates/agent-tools-wasm" }
+agent-tools-mcp = { path = "crates/agent-tools-mcp" }
 agent-hooks = { path = "crates/agent-hooks" }
 
 serde = { version = "1", features = ["derive"] }

@@ -99,6 +99,23 @@ async fn build_session() -> AgentSession {
         }
     }
 
+    #[cfg(feature = "mcp")]
+    match agent_tools_mcp::load_mcp_tools(&working_dir.join(".agent")).await {
+        Ok(mut mcp_tools) => {
+            if !mcp_tools.is_empty() {
+                eprintln!(
+                    "loaded {} mcp tool(s) from .agent/mcp.toml",
+                    mcp_tools.len()
+                );
+            }
+            tools.append(&mut mcp_tools);
+        }
+        Err(e) => {
+            eprintln!("failed to load mcp servers: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let reporter = Arc::new(TerminalReporter::new(hooks.clone()));
     AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx).with_reporter(reporter)
 }
