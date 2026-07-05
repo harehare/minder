@@ -11,7 +11,7 @@ use minder_hooks::HookEngine;
 use minder_tools::{
     AgentTool, BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool,
     LsTool, ReadFileTool, SkillTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
-    WorktreeRemoveTool, WriteFileTool, discover_skills, discover_subagents,
+    WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
 };
 
 use provider_select::select_provider;
@@ -116,17 +116,18 @@ async fn build_session() -> AgentSession {
 
     let reporter = Arc::new(TerminalReporter::new(hooks.clone()));
 
+    // Builtins first; user-defined agents override by name.
+    let mut subagents = builtin_subagents();
     match discover_subagents(&working_dir.join(".agent")) {
-        Ok(subagents) => {
-            if !subagents.is_empty() {
-                eprintln!("loaded {} subagent(s) from .agent/agents/", subagents.len());
-                tools.push(Arc::new(AgentTool::new(
-                    subagents,
-                    provider.clone(),
-                    tools.clone(),
-                    hooks.clone(),
-                    reporter.clone(),
-                )));
+        Ok(discovered) => {
+            if !discovered.is_empty() {
+                eprintln!("loaded {} subagent(s) from .agent/agents/", discovered.len());
+            }
+            for subagent in discovered {
+                match subagents.iter_mut().find(|s| s.name == subagent.name) {
+                    Some(existing) => *existing = subagent,
+                    None => subagents.push(subagent),
+                }
             }
         }
         Err(e) => {
@@ -134,6 +135,13 @@ async fn build_session() -> AgentSession {
             std::process::exit(1);
         }
     }
+    tools.push(Arc::new(AgentTool::new(
+        subagents,
+        provider.clone(),
+        tools.clone(),
+        hooks.clone(),
+        reporter.clone(),
+    )));
 
     AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx).with_reporter(reporter)
 }

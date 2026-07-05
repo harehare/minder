@@ -4,18 +4,14 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A project subagent: a named, isolated `AgentSession` the main loop can
-/// delegate a task to via `AgentTool`. Defined the same way as a `Skill` --
-/// a directory with a `---`-delimited frontmatter file -- so the two
-/// concepts read the same way in a project's `.agent/` tree.
+/// A named, isolated `AgentSession` the main loop can delegate a task to via
+/// `AgentTool`. Defined like a `Skill`: a directory with a frontmatter file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subagent {
     pub name: String,
     pub description: String,
-    /// Restricts which of the parent's tools this subagent may call, by
-    /// name. `None` means it inherits every tool the parent has (other than
-    /// `agent` itself -- see `AgentTool::execute`, which always excludes it
-    /// so a subagent can never spawn a further subagent).
+    /// Allow-list of tool names, by name. `None` means every parent tool
+    /// except `agent` itself (see `AgentTool::new`).
     pub tools: Option<Vec<String>>,
     pub system_prompt: String,
 }
@@ -34,6 +30,25 @@ pub enum SubagentLoadError {
         first: PathBuf,
         second: PathBuf,
     },
+}
+
+/// Subagents available with zero project config, so `agent` always works.
+/// A project can override any of these via `.agent/agents/<name>/AGENT.md`
+/// with a matching name.
+pub fn builtin_subagents() -> Vec<Subagent> {
+    vec![Subagent {
+        name: "general-purpose".to_string(),
+        description: "General-purpose agent for open-ended research, multi-step tasks, or any \
+                       self-contained piece of work you'd rather hand off than do inline. Has \
+                       access to every tool the parent has."
+            .to_string(),
+        tools: None,
+        system_prompt: "You are a focused subagent completing a single delegated task. Use the \
+                         available tools to accomplish it directly, then reply with a concise, \
+                         complete answer -- your caller only ever sees this final reply, none of \
+                         your intermediate tool calls."
+            .to_string(),
+    }]
 }
 
 /// Discovers subagents from `agent_dir/agents/*/AGENT.md`, one directory per
@@ -120,22 +135,15 @@ fn parse_subagent(path: &Path, raw: &str) -> Result<Subagent, SubagentLoadError>
     })
 }
 
-/// Exposes discovered subagents to the model as a single `agent` tool,
-/// mirroring `SkillTool`'s shape: the tool description lists every
-/// subagent's name/description (cheap, always in context), and calling it
-/// with a `name` and `task` runs that subagent's own `AgentSession` to
-/// completion in-process, returning its final answer as this tool's result.
-///
-/// The provider and base tool list are shared (`Arc`) with the parent
-/// session rather than rebuilt per call -- reconstructing an HTTP client or
-/// respawning MCP subprocesses for every delegated task would be wasteful,
-/// and providers/tools are already required to be `Send + Sync` with no
-/// per-call mutable state.
+/// Exposes discovered subagents as a single `agent` tool, mirroring
+/// `SkillTool`: calling it with `{name, task}` runs that subagent's own
+/// `AgentSession` to completion in-process and returns its final answer.
+/// Provider and base tools are shared (`Arc`) with the parent rather than
+/// rebuilt per call.
 pub struct AgentTool {
     subagents: Vec<Subagent>,
     provider: Arc<dyn LlmProvider>,
-    /// The parent's tool list, minus `agent` itself so a subagent can never
-    /// spawn a further subagent.
+    /// The parent's tools minus `agent` itself, so subagents can't recurse.
     base_tools: Vec<Arc<dyn Tool>>,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     reporter: Arc<dyn Reporter>,
@@ -296,6 +304,14 @@ mod tests {
     }
 
     #[test]
+    fn builtin_subagents_includes_general_purpose_with_no_tool_restriction() {
+        let builtins = builtin_subagents();
+        let general_purpose = builtins.iter().find(|s| s.name == "general-purpose");
+        assert!(general_purpose.is_some());
+        assert_eq!(general_purpose.unwrap().tools, None);
+    }
+
+    #[test]
     fn discovers_and_parses_a_subagent() {
         let agent_dir = scratch_dir();
         write_agent(
@@ -448,16 +464,11 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_cannot_call_the_agent_tool_itself() {
-        // Scripts the child session's own provider to immediately try
-        // calling a tool named "agent" -- proves `AgentTool::new` actually
-        // strips `agent` out of the base tool list handed to subagents,
-        // not just that this particular scripted run happens not to need it.
+        // Child session's provider immediately tries calling "agent".
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider(StdMutex::new(
             vec![tool_use_response("call_1", "agent")].into(),
         )));
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Named "agent" on purpose: this is what `AgentTool::new` must filter
-        // out of `base_tools` before handing them to a child session.
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecursionProbeTool(call_count.clone()))];
 
         let tool = AgentTool::new(

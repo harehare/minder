@@ -231,6 +231,7 @@ Always registered:
 | `worktree_list` | Lists every worktree linked to the repo (`git worktree list`) |
 | `worktree_remove` | Removes a worktree and its directory (`git worktree remove`), leaving its branch intact |
 | `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees) |
+| `agent` | Delegates a task to a named subagent — always available via a built-in `general-purpose` subagent, no project config required; see [Subagents](#subagents) |
 
 Registered only when configured:
 
@@ -238,7 +239,6 @@ Registered only when configured:
 |---|---|
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
 | `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
-| `agent` | one or more `.agent/agents/*/AGENT.md` files present — see [Subagents](#subagents) |
 
 Worktree tools let the agent check out a second branch into its own directory without disturbing
 the current one — e.g. running `main`'s test suite for comparison while mid-edit on a feature
@@ -294,10 +294,13 @@ Review the diff you're handed for correctness bugs only...
 
 Each subagent is a directory with an `AGENT.md`: the same `---`-delimited frontmatter shape as a
 [skill](#skills) (`name`, `description`), plus an optional `tools` field (comma-separated tool
-names) and a body that becomes that subagent's system prompt. minder discovers every
-`.agent/agents/*/AGENT.md` at startup and, if any exist, registers a single `agent` tool listing
-each subagent's name/description — the model calls it with `{name, task}` to delegate a
-self-contained piece of work.
+names) and a body that becomes that subagent's system prompt. minder always registers a single
+`agent` tool listing every available subagent's name/description — the model calls it with
+`{name, task}` to delegate a self-contained piece of work. Unlike `skill`, this isn't gated behind
+any project config: a built-in `general-purpose` subagent (full tool access, no `AGENT.md`
+required) is always in the list, the same role a fresh standalone `minder` process would play. A
+project can override `general-purpose` or add more by defining `.agent/agents/<name>/AGENT.md`
+with a matching `name`.
 
 Delegating runs a brand-new `AgentSession` in-process, to completion, with its own history (it
 starts with no memory of the parent conversation, so `task` needs to carry enough context to act
@@ -312,6 +315,12 @@ comma-separated names in `tools` (unknown names are silently dropped, not an err
 frontmatter list stay stale-safe as tools are renamed). Either way, the `agent` tool itself is
 always excluded from a subagent's own tool list, so a subagent can delegate work but can never
 spawn a further subagent — one level of delegation, no unbounded recursion.
+
+If the model requests more than one `agent` call in the same turn, they run concurrently rather
+than one after another — each delegation starts with no shared history with any other call in the
+same batch, so unlike e.g. two `write_file` calls that might touch the same path, there's nothing
+for them to race on. Every other tool call still runs strictly sequentially, in the order the model
+requested it.
 
 Subagent names must be unique, and startup fails if an `AGENT.md` is missing frontmatter or the
 `name`/`description` fields, same as skills. See `agents/code-reviewer/AGENT.md` for a runnable

@@ -6,10 +6,7 @@ use crate::git::{error, run_git, timeout};
 
 // ---- worktree_add ----
 
-/// Creates a new git worktree, optionally checking out an existing branch or
-/// creating a new one -- lets the agent work on a second branch in a
-/// separate directory without disturbing the current checkout, e.g. to run
-/// tests against `main` while mid-edit on a feature branch.
+/// Creates a new git worktree, optionally on a new or existing branch.
 pub struct WorktreeAddTool;
 
 #[derive(Deserialize)]
@@ -82,9 +79,7 @@ impl Tool for WorktreeAddTool {
 
 // ---- worktree_list ----
 
-/// Lists every worktree linked to the current repo -- the main checkout plus
-/// any created via `worktree_add`, each with its path, current HEAD, and
-/// checked-out branch.
+/// Lists every worktree linked to the current repo.
 pub struct WorktreeListTool;
 
 #[async_trait]
@@ -109,8 +104,7 @@ impl Tool for WorktreeListTool {
 
 // ---- worktree_remove ----
 
-/// Removes a worktree created by `worktree_add`, deleting its working
-/// directory. Does not delete the branch it had checked out.
+/// Removes a worktree and its directory. Leaves its branch intact.
 pub struct WorktreeRemoveTool;
 
 #[derive(Deserialize)]
@@ -164,7 +158,11 @@ mod tests {
     use super::*;
 
     async fn ctx_with_git_repo() -> ToolContext {
-        let dir = std::env::temp_dir().join(format!("minder-worktree-test-{}", uuid::Uuid::new_v4()));
+        // Nested under a unique parent so "../wtN" paths in these tests
+        // don't collide across test runs.
+        let dir = std::env::temp_dir()
+            .join(format!("minder-worktree-test-{}", uuid::Uuid::new_v4()))
+            .join("repo");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let ctx = ToolContext {
             working_dir: dir,

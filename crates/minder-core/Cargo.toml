@@ -17,6 +17,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

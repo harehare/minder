@@ -22,7 +22,7 @@ pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read_file::ReadFileTool;
 pub use skill::{Skill, SkillLoadError, SkillTool, discover_skills};
-pub use subagent::{AgentTool, Subagent, SubagentLoadError, discover_subagents};
+pub use subagent::{AgentTool, Subagent, SubagentLoadError, builtin_subagents, discover_subagents};
 pub use web_fetch::{FetchResult, WebFetchTool, fetch};
 pub use web_search::WebSearchTool;
 pub use worktree::{WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool};

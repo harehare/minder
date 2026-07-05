@@ -9,6 +9,10 @@ use crate::tool::{Tool, ToolContext, ToolExecOutcome, spec};
 const COMPACT_THRESHOLD: usize = 60;
 const KEEP_RECENT: usize = 40;
 
+/// Calls to this tool run concurrently with each other (subagent
+/// delegations share no state); every other tool stays sequential.
+const CONCURRENT_TOOL_NAME: &str = "agent";
+
 pub struct AgentSession {
     provider: Arc<dyn LlmProvider>,
     tools: Vec<Arc<dyn Tool>>,
@@ -89,17 +93,54 @@ impl AgentSession {
                 return Ok(response.message);
             }
 
-            let mut results = Vec::with_capacity(tool_calls.len());
-            for call in tool_calls {
-                self.reporter.on_tool_call(&call).await;
+            let mut results: Vec<Option<ToolResult>> = vec![None; tool_calls.len()];
+            let mut concurrent_indices = Vec::new();
+
+            for (i, call) in tool_calls.iter().enumerate() {
+                if call.name == CONCURRENT_TOOL_NAME {
+                    concurrent_indices.push(i);
+                    continue;
+                }
+                self.reporter.on_tool_call(call).await;
                 let outcome = self.execute_with_hooks(call.clone()).await?;
-                self.reporter.on_tool_result(&call, &outcome).await;
-                results.push(ToolResult {
-                    tool_call_id: call.id,
+                self.reporter.on_tool_result(call, &outcome).await;
+                results[i] = Some(ToolResult {
+                    tool_call_id: call.id.clone(),
                     content: ToolResultContent::Text(outcome.content),
                     is_error: outcome.is_error,
                 });
             }
+
+            if !concurrent_indices.is_empty() {
+                for &i in &concurrent_indices {
+                    self.reporter.on_tool_call(&tool_calls[i]).await;
+                }
+                // Shared reborrow so these futures can run concurrently.
+                let session = &*self;
+                let futures = concurrent_indices.iter().map(|&i| {
+                    let call = tool_calls[i].clone();
+                    async move {
+                        let outcome = session.execute_with_hooks(call.clone()).await?;
+                        session.reporter.on_tool_result(&call, &outcome).await;
+                        Ok::<(usize, ToolResult), AgentError>((
+                            i,
+                            ToolResult {
+                                tool_call_id: call.id,
+                                content: ToolResultContent::Text(outcome.content),
+                                is_error: outcome.is_error,
+                            },
+                        ))
+                    }
+                });
+                for (i, result) in futures_util::future::try_join_all(futures).await? {
+                    results[i] = Some(result);
+                }
+            }
+
+            let results: Vec<ToolResult> = results
+                .into_iter()
+                .map(|r| r.expect("every tool_calls index is filled by one of the two loops above"))
+                .collect();
             self.messages.push(Message::tool_results(results));
         }
     }
@@ -142,7 +183,7 @@ impl AgentSession {
         Ok(())
     }
 
-    async fn execute_with_hooks(&mut self, call: ToolCall) -> Result<ToolExecOutcome, AgentError> {
+    async fn execute_with_hooks(&self, call: ToolCall) -> Result<ToolExecOutcome, AgentError> {
         let decision = if let Some(hooks) = &self.hooks {
             hooks.lock().await.on_tool_call(&call).await
         } else {
@@ -311,6 +352,79 @@ mod tests {
         }
         // user input, assistant tool_use, tool results, assistant final text
         assert_eq!(session.messages.len(), 4);
+    }
+
+    /// Tracks the peak number of overlapping `execute` calls.
+    struct ConcurrencyProbeTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcurrencyProbeTool {
+        fn name(&self) -> &str {
+            "agent"
+        }
+        fn description(&self) -> &str {
+            "probes concurrency"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _arguments: serde_json::Value, _ctx: &ToolContext) -> ToolExecOutcome {
+            use std::sync::atomic::Ordering;
+            let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(current, Ordering::SeqCst);
+            tokio::task::yield_now().await; // let the other call get polled too
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolExecOutcome {
+                content: "done".to_string(),
+                is_error: false,
+                metadata: serde_json::Value::Null,
+            }
+        }
+    }
+
+    fn two_agent_tool_calls_response() -> ProviderResponse {
+        ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "agent".to_string(),
+                        arguments: serde_json::json!({}),
+                    }),
+                    ContentBlock::ToolUse(ToolCall {
+                        id: "call_2".to_string(),
+                        name: "agent".to_string(),
+                        arguments: serde_json::json!({}),
+                    }),
+                ],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_agent_tool_calls_in_one_turn_run_concurrently() {
+        let provider = ScriptedProvider::new(vec![two_agent_tool_calls_response(), text_response("both done")]);
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = ConcurrencyProbeTool {
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: peak.clone(),
+        };
+        let mut session = AgentSession::new(Arc::new(provider), vec![Arc::new(tool)], None, "test", test_ctx());
+
+        session.run_turn("delegate two things at once").await.unwrap();
+
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both `agent` calls in the same turn should have been in flight at once"
+        );
     }
 
     #[tokio::test]
