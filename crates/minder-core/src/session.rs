@@ -10,8 +10,8 @@ const COMPACT_THRESHOLD: usize = 60;
 const KEEP_RECENT: usize = 40;
 
 pub struct AgentSession {
-    provider: Box<dyn LlmProvider>,
-    tools: Vec<Box<dyn Tool>>,
+    provider: Arc<dyn LlmProvider>,
+    tools: Vec<Arc<dyn Tool>>,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     reporter: Arc<dyn Reporter>,
     messages: Vec<Message>,
@@ -32,8 +32,8 @@ pub enum AgentError {
 
 impl AgentSession {
     pub fn new(
-        provider: Box<dyn LlmProvider>,
-        tools: Vec<Box<dyn Tool>>,
+        provider: Arc<dyn LlmProvider>,
+        tools: Vec<Arc<dyn Tool>>,
         hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
         system_prompt: impl Into<String>,
         tool_ctx: ToolContext,
@@ -296,8 +296,8 @@ mod tests {
             text_response("the tool said: hi from tool"),
         ]);
         let mut session = AgentSession::new(
-            Box::new(provider),
-            vec![Box::new(EchoTool)],
+            Arc::new(provider),
+            vec![Arc::new(EchoTool)],
             None,
             "you are a test agent",
             test_ctx(),
@@ -316,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn loop_terminates_immediately_with_no_tool_calls() {
         let provider = ScriptedProvider::new(vec![text_response("no tools needed")]);
-        let mut session = AgentSession::new(Box::new(provider), vec![], None, "you are a test agent", test_ctx());
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "you are a test agent", test_ctx());
 
         let final_message = session.run_turn("hello").await.unwrap();
         match &final_message.content[0] {
@@ -333,7 +333,7 @@ mod tests {
             "does_not_exist",
             serde_json::json!({}),
         )]);
-        let mut session = AgentSession::new(Box::new(provider), vec![], None, "you are a test agent", test_ctx());
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "you are a test agent", test_ctx());
 
         let err = session.run_turn("do something").await.unwrap_err();
         assert!(matches!(err, AgentError::UnknownTool(name) if name == "does_not_exist"));
@@ -400,8 +400,8 @@ mod tests {
         ]);
         let hooks: Box<dyn HookPort> = Box::new(OverrideHooks);
         let mut session = AgentSession::new(
-            Box::new(provider),
-            vec![Box::new(CountingTool(call_count.clone()))],
+            Arc::new(provider),
+            vec![Arc::new(CountingTool(call_count.clone()))],
             Some(Arc::new(tokio::sync::Mutex::new(hooks))),
             "you are a test agent",
             test_ctx(),

@@ -110,8 +110,8 @@ async fn hook_script_blocks_destructive_command_through_the_real_agent_loop() {
     };
 
     let mut session = AgentSession::new(
-        Box::new(provider),
-        vec![Box::new(FakeBashTool)],
+        Arc::new(provider),
+        vec![Arc::new(FakeBashTool)],
         Some(Arc::new(tokio::sync::Mutex::new(hooks))),
         "you are a test agent",
         tool_ctx,
@@ -151,8 +151,8 @@ async fn hook_script_allows_safe_command_through_the_real_agent_loop() {
     };
 
     let mut session = AgentSession::new(
-        Box::new(provider),
-        vec![Box::new(FakeBashTool)],
+        Arc::new(provider),
+        vec![Arc::new(FakeBashTool)],
         Some(Arc::new(tokio::sync::Mutex::new(hooks))),
         "you are a test agent",
         tool_ctx,

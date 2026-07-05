@@ -10,7 +10,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// smuggle in shell metacharacters the way a generic `bash "git ..."` call
 /// could -- a commit message like `"; rm -rf /tmp"` is just a literal argv
 /// entry here.
-async fn run_git(args: &[&str], ctx: &ToolContext, timeout: Duration) -> ToolExecOutcome {
+pub(crate) async fn run_git(args: &[&str], ctx: &ToolContext, timeout: Duration) -> ToolExecOutcome {
     let child = match tokio::process::Command::new("git")
         .args(args)
         .current_dir(&ctx.working_dir)
@@ -48,7 +48,7 @@ async fn run_git(args: &[&str], ctx: &ToolContext, timeout: Duration) -> ToolExe
     }
 }
 
-fn error(message: String) -> ToolExecOutcome {
+pub(crate) fn error(message: String) -> ToolExecOutcome {
     ToolExecOutcome {
         content: message,
         is_error: true,
@@ -56,7 +56,7 @@ fn error(message: String) -> ToolExecOutcome {
     }
 }
 
-fn timeout() -> Duration {
+pub(crate) fn timeout() -> Duration {
     Duration::from_secs(DEFAULT_TIMEOUT_SECS)
 }
 

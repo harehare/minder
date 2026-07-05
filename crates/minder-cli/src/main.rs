@@ -9,8 +9,9 @@ use std::sync::Arc;
 use minder_core::{AgentSession, HookPort, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
-    BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool, LsTool,
-    ReadFileTool, SkillTool, WebFetchTool, WebSearchTool, WriteFileTool, discover_skills,
+    AgentTool, BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool,
+    LsTool, ReadFileTool, SkillTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
+    WorktreeRemoveTool, WriteFileTool, discover_skills, discover_subagents,
 };
 
 use provider_select::select_provider;
@@ -50,31 +51,34 @@ async fn build_session() -> AgentSession {
         }
     };
 
-    let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
-        Box::new(BashTool),
-        Box::new(GlobTool),
-        Box::new(GrepTool),
-        Box::new(LsTool),
-        Box::new(GitDiffTool),
-        Box::new(GitLogTool),
-        Box::new(GitStatusTool),
-        Box::new(GitCommitTool),
-        Box::new(WebFetchTool::new()),
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ReadFileTool),
+        Arc::new(WriteFileTool),
+        Arc::new(EditFileTool),
+        Arc::new(BashTool),
+        Arc::new(GlobTool),
+        Arc::new(GrepTool),
+        Arc::new(LsTool),
+        Arc::new(GitDiffTool),
+        Arc::new(GitLogTool),
+        Arc::new(GitStatusTool),
+        Arc::new(GitCommitTool),
+        Arc::new(WorktreeAddTool),
+        Arc::new(WorktreeListTool),
+        Arc::new(WorktreeRemoveTool),
+        Arc::new(WebFetchTool::new()),
     ];
     // Omitted entirely (not registered with a doomed-to-fail key) when unset,
     // so the LLM never sees a tool in its list that it can't actually use.
     if let Ok(key) = std::env::var("TAVILY_API_KEY") {
-        tools.push(Box::new(WebSearchTool::new(key)));
+        tools.push(Arc::new(WebSearchTool::new(key)));
     }
 
     match discover_skills(&working_dir.join(".agent")) {
         Ok(skills) => {
             if !skills.is_empty() {
                 eprintln!("loaded {} skill(s) from .agent/skills/", skills.len());
-                tools.push(Box::new(SkillTool::new(skills)));
+                tools.push(Arc::new(SkillTool::new(skills)));
             }
         }
         Err(e) => {
@@ -84,11 +88,11 @@ async fn build_session() -> AgentSession {
     }
 
     match minder_tools_wasm::load_plugins(&working_dir.join(".agent")).await {
-        Ok(mut plugins) => {
+        Ok(plugins) => {
             if !plugins.is_empty() {
                 eprintln!("loaded {} wasm plugin tool(s) from .agent/tools/", plugins.len());
             }
-            tools.append(&mut plugins);
+            tools.extend(plugins.into_iter().map(Arc::from));
         }
         Err(e) => {
             eprintln!("failed to load wasm plugins: {e}");
@@ -98,11 +102,11 @@ async fn build_session() -> AgentSession {
 
     #[cfg(feature = "mcp")]
     match minder_tools_mcp::load_mcp_tools(&working_dir.join(".agent")).await {
-        Ok(mut mcp_tools) => {
+        Ok(mcp_tools) => {
             if !mcp_tools.is_empty() {
                 eprintln!("loaded {} mcp tool(s) from .agent/mcp.toml", mcp_tools.len());
             }
-            tools.append(&mut mcp_tools);
+            tools.extend(mcp_tools.into_iter().map(Arc::from));
         }
         Err(e) => {
             eprintln!("failed to load mcp servers: {e}");
@@ -111,6 +115,26 @@ async fn build_session() -> AgentSession {
     }
 
     let reporter = Arc::new(TerminalReporter::new(hooks.clone()));
+
+    match discover_subagents(&working_dir.join(".agent")) {
+        Ok(subagents) => {
+            if !subagents.is_empty() {
+                eprintln!("loaded {} subagent(s) from .agent/agents/", subagents.len());
+                tools.push(Arc::new(AgentTool::new(
+                    subagents,
+                    provider.clone(),
+                    tools.clone(),
+                    hooks.clone(),
+                    reporter.clone(),
+                )));
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to load subagents: {e}");
+            std::process::exit(1);
+        }
+    }
+
     AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx).with_reporter(reporter)
 }
 

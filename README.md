@@ -38,6 +38,7 @@ See `crates/minder-core`, `crates/minder-providers`, `crates/minder-tools`, `cra
 - [Providers](#providers)
 - [Tools](#tools)
 - [Skills](#skills)
+- [Subagents](#subagents)
 - [Hooks](#hooks)
 - [Tool plugins (WASM)](#tool-plugins-wasm)
 - [MCP servers (optional)](#mcp-servers-optional)
@@ -226,6 +227,9 @@ Always registered:
 | `git_log` | Shows commit history |
 | `git_status` | Shows `git status` |
 | `git_commit` | Creates a commit |
+| `worktree_add` | Creates a new git worktree (`git worktree add`), optionally on a new or existing branch |
+| `worktree_list` | Lists every worktree linked to the repo (`git worktree list`) |
+| `worktree_remove` | Removes a worktree and its directory (`git worktree remove`), leaving its branch intact |
 | `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees) |
 
 Registered only when configured:
@@ -234,6 +238,13 @@ Registered only when configured:
 |---|---|
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
 | `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
+| `agent` | one or more `.agent/agents/*/AGENT.md` files present — see [Subagents](#subagents) |
+
+Worktree tools let the agent check out a second branch into its own directory without disturbing
+the current one — e.g. running `main`'s test suite for comparison while mid-edit on a feature
+branch, or fanning a review out into a [subagent](#subagents) that works in isolation. minder
+itself doesn't switch its own working directory between worktrees; point a fresh `minder` process
+(or a `worktree_add`-created path passed to `bash`) at the new directory to actually work inside it.
 
 Additional tools can be supplied per-project as WASM plugins — see [Tool plugins (WASM)](#tool-plugins-wasm)
 — or from MCP servers, behind an opt-in feature — see [MCP servers (optional)](#mcp-servers-optional).
@@ -263,6 +274,48 @@ conversation only when it's actually relevant.
 Skill names must be unique, and startup fails if a `SKILL.md` is missing frontmatter or the
 `name`/`description` fields. See `skills/commit-messages/SKILL.md` for a runnable example (copy
 `skills/` to `.agent/skills/` in a project to try it).
+
+## Subagents
+
+```
+.agent/agents/code-reviewer/AGENT.md
+```
+
+```markdown
+---
+name: code-reviewer
+description: Reviews a diff for correctness bugs, not style
+tools: read_file, grep, glob, git_diff, git_log
+---
+# Code reviewer
+
+Review the diff you're handed for correctness bugs only...
+```
+
+Each subagent is a directory with an `AGENT.md`: the same `---`-delimited frontmatter shape as a
+[skill](#skills) (`name`, `description`), plus an optional `tools` field (comma-separated tool
+names) and a body that becomes that subagent's system prompt. minder discovers every
+`.agent/agents/*/AGENT.md` at startup and, if any exist, registers a single `agent` tool listing
+each subagent's name/description — the model calls it with `{name, task}` to delegate a
+self-contained piece of work.
+
+Delegating runs a brand-new `AgentSession` in-process, to completion, with its own history (it
+starts with no memory of the parent conversation, so `task` needs to carry enough context to act
+on) and its own system prompt (the subagent's `AGENT.md` body, not minder's default). What it
+shares with the parent rather than rebuilding: the LLM provider/client (no second API handshake),
+the project's [hooks](#hooks) (the same policy layer applies inside a subagent's tool calls), and
+the live [execution display](#live-execution-display) (a subagent's tool calls stream to the
+terminal exactly like the parent's).
+
+A subagent's tool list is either every tool the parent has (`tools` omitted) or restricted to the
+comma-separated names in `tools` (unknown names are silently dropped, not an error — lets a
+frontmatter list stay stale-safe as tools are renamed). Either way, the `agent` tool itself is
+always excluded from a subagent's own tool list, so a subagent can delegate work but can never
+spawn a further subagent — one level of delegation, no unbounded recursion.
+
+Subagent names must be unique, and startup fails if an `AGENT.md` is missing frontmatter or the
+`name`/`description` fields, same as skills. See `agents/code-reviewer/AGENT.md` for a runnable
+example (copy `agents/` to `.agent/agents/` in a project to try it).
 
 ## Hooks
 

@@ -43,6 +43,20 @@ impl Message {
             _ => None,
         })
     }
+
+    /// Concatenates every `Text` content block in order -- used to reduce a
+    /// final assistant message down to plain text (e.g. a subagent's result
+    /// flowing back into its caller's tool result).
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
