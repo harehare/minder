@@ -1,0 +1,30 @@
+[package]
+name = "minder-tools-wasm"
+description = "WASI plugin loader and sandboxed host runtime for minder tool plugins"
+categories = ["development-tools", "wasm"]
+keywords = ["agent", "wasm", "coding-agent"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+minder-core.workspace = true
+minder-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "rt", "time"] }
+async-trait.workspace = true
+reqwest.workspace = true
+toml = "1"
+wasmtime = "46.0.1"
+wasmtime-wasi = "46.0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+uuid.workspace = true

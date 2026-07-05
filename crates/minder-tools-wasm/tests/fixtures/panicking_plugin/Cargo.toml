@@ -1,0 +1,8 @@
+[package]
+name = "panicking_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "panicking_plugin"
+path = "src/main.rs"

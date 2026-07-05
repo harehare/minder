@@ -1,0 +1,35 @@
+[package]
+name = "minder-cli"
+description = "Multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness CLI with mq-based policy/observability hooks"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["agent", "llm", "cli", "coding-agent"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "minder"
+path = "src/main.rs"
+
+[features]
+mcp = ["dep:minder-tools-mcp"]
+
+[dependencies]
+minder-core.workspace = true
+minder-providers.workspace = true
+minder-tools.workspace = true
+minder-tools-wasm.workspace = true
+minder-tools-mcp = { workspace = true, optional = true }
+minder-hooks.workspace = true
+async-trait.workspace = true
+mq-lang = { version = "0.6", default-features = false, features = ["std", "sync", "file-io"] }
+mq-markdown.workspace = true
+two-face.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true

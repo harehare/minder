@@ -5,6 +5,12 @@
 
 **A coding-agent harness in Rust.**
 
+[![CI](https://github.com/harehare/minder/actions/workflows/ci.yml/badge.svg)](https://github.com/harehare/minder/actions/workflows/ci.yml)
+[![Security audit](https://github.com/harehare/minder/actions/workflows/audit.yml/badge.svg)](https://github.com/harehare/minder/actions/workflows/audit.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+[Website](https://harehare.github.io/minder/)
+
 </div>
 
 Multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness with policy/observability
@@ -23,7 +29,7 @@ with no user in the loop and no external `mq` binary required.
 > [!IMPORTANT]
 > This project is under active development and has not been thoroughly tested end to end yet. Providers, tools, and hooks work individually in unit tests, but the full agent loop hasn't seen broad real-world verification — expect rough edges.
 
-See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates/agent-tools-wasm`, `crates/agent-tools-mcp`, `crates/agent-hooks`, `crates/agent-cli`.
+See `crates/minder-core`, `crates/minder-providers`, `crates/minder-tools`, `crates/minder-tools-wasm`, `crates/minder-tools-mcp`, `crates/minder-hooks`, `crates/minder-cli`.
 
 ## Contents
 
@@ -44,20 +50,30 @@ See `crates/agent-core`, `crates/agent-providers`, `crates/agent-tools`, `crates
 Requires a recent stable Rust toolchain (`rustup` recommended).
 
 ```sh
+cargo install minder-cli
+minder "..."
+```
+
+Or build from a clone:
+
+```sh
 git clone https://github.com/harehare/minder.git
 cd minder
 cargo build --workspace --release
 ```
 
-Run the CLI in place with `cargo run -p agent-cli --`, or install the `minder` binary onto your
+Run the CLI in place with `cargo run -p minder-cli --`, or install the `minder` binary onto your
 `PATH`:
 
 ```sh
-cargo install --path crates/agent-cli
+cargo install --path crates/minder-cli
 minder "..."
 ```
 
-The rest of this README uses `minder "..."` for brevity — substitute `cargo run -p agent-cli --
+Prebuilt binaries for Linux/macOS/Windows are also attached to each [GitHub
+Release](https://github.com/harehare/minder/releases).
+
+The rest of this README uses `minder "..."` for brevity — substitute `cargo run -p minder-cli --
 "..."` if you'd rather not install the binary.
 
 ## Quick start
@@ -116,7 +132,7 @@ A few real tasks to try:
 ```sh
 minder "run the tests and summarize any failures"
 minder "find all TODO comments under src/ and turn them into a checklist"
-minder "explain what crates/agent-hooks/src/lib.rs does"
+minder "explain what crates/minder-hooks/src/lib.rs does"
 minder "check git status and stage+commit the pending changes with a sensible message"
 ```
 
@@ -389,7 +405,7 @@ fuel = 5_000_000
 Plugins are plain `wasm32-wasip1` modules (no component model) exporting `minder_tool_name`,
 `minder_tool_description`, `minder_tool_parameters_schema`, `minder_tool_execute`, plus
 `minder_alloc`/`minder_dealloc` for passing JSON across linear memory — see
-`crates/agent-tools-wasm/tests/fixtures/echo_plugin` for a minimal example (`regenerate.sh`
+`crates/minder-tools-wasm/tests/fixtures/echo_plugin` for a minimal example (`regenerate.sh`
 alongside it has the build command). Filesystem access is granted per-plugin via WASI preopens
 (none by default); network isn't a raw socket — `network = true` grants a single `host_web_fetch`
 import reusing the built-in `web_fetch`'s SSRF guard. Execution is metered with wasmtime fuel, so a
@@ -403,7 +419,7 @@ the host side instead, behind an opt-in `mcp` Cargo feature so the `rmcp` depend
 subprocess-spawning code aren't part of the binary unless you ask for them:
 
 ```sh
-cargo install --path crates/agent-cli --features mcp
+cargo install --path crates/minder-cli --features mcp
 ```
 
 With the feature enabled, minder discovers `.agent/mcp.toml`, launches each configured server as a
@@ -425,7 +441,7 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "..." }
 ```
 
 Built without `--features mcp`, minder ignores `.agent/mcp.toml` entirely (the `mcp` tool /
-`agent-tools-mcp` crate is compiled out, not just disabled at runtime). A configured server that
+`minder-tools-mcp` crate is compiled out, not just disabled at runtime). A configured server that
 fails to start, initialize, or list its tools is a hard error at startup, same as a broken wasm
 plugin or hook file. Remote tool calls are opaque to `on_tool_call`/`on_tool_result` hooks in the
 same way built-in and wasm tool calls are — nothing MCP-specific bypasses the hook layer.
@@ -496,30 +512,51 @@ error rather than burning turns on a task the model isn't making progress on.
 
 | Crate | Responsibility |
 |---|---|
-| `agent-core` | Session/turn loop, tool-calling protocol, hook port trait |
-| `agent-providers` | Anthropic/OpenAI/Gemini/Ollama client implementations |
-| `agent-tools` | Built-in tools (file, shell, git, web) |
-| `agent-tools-wasm` | WASI plugin loader and sandboxed host runtime |
-| `agent-tools-mcp` | MCP client — spawns configured servers, exposes their tools (opt-in `mcp` feature on `agent-cli`) |
-| `agent-hooks` | `mq`-based hook engine (`.agent/hooks/*.mq`) |
-| `agent-cli` | The `minder` binary — wires providers/tools/hooks together |
+| `minder-core` | Session/turn loop, tool-calling protocol, hook port trait |
+| `minder-providers` | Anthropic/OpenAI/Gemini/Ollama client implementations |
+| `minder-tools` | Built-in tools (file, shell, git, web) |
+| `minder-tools-wasm` | WASI plugin loader and sandboxed host runtime |
+| `minder-tools-mcp` | MCP client — spawns configured servers, exposes their tools (opt-in `mcp` feature on `minder-cli`) |
+| `minder-hooks` | `mq`-based hook engine (`.agent/hooks/*.mq`) |
+| `minder-cli` | The `minder` binary — wires providers/tools/hooks together |
 
 ## Development
 
+Requires [`just`](https://github.com/casey/just). The same recipes run in CI ([`ci.yml`](.github/workflows/ci.yml)):
+
 ```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace
+just test-all   # fmt --check, clippy -D warnings, doc tests, nextest
+just fmt         # cargo fmt --all -- --check
+just lint        # cargo clippy --all-targets --all-features --workspace -- -D clippy::all
+just test        # cargo nextest run --workspace --all-features
+just deps        # cargo machete (unused dependencies)
+just audit       # cargo deny check (licenses/bans/sources/advisories)
 ```
 
 Each provider's live round-trip test needs real credentials and is `#[ignore]`d by default:
 
 ```sh
-ANTHROPIC_API_KEY=... cargo test -p agent-providers -- --ignored anthropic
-OPENAI_API_KEY=... cargo test -p agent-providers -- --ignored openai
-GEMINI_API_KEY=... cargo test -p agent-providers -- --ignored gemini
-cargo test -p agent-providers -- --ignored ollama  # needs `ollama serve` running locally
+ANTHROPIC_API_KEY=... cargo test -p minder-providers -- --ignored anthropic
+OPENAI_API_KEY=... cargo test -p minder-providers -- --ignored openai
+GEMINI_API_KEY=... cargo test -p minder-providers -- --ignored gemini
+cargo test -p minder-providers -- --ignored ollama  # needs `ollama serve` running locally
 ```
+
+### CI and releases
+
+Every push/PR to `main` runs tests (Linux; the full Linux/macOS/Windows matrix is available via
+`workflow_dispatch`), `rustfmt`, `clippy`, and `cargo-deny`. Separate scheduled/PR-triggered
+workflows cover `cargo audit`, CodeQL, spell-checking (`typos`), unused-dependency detection
+(`cargo-machete`), and Actions-workflow security linting (`zizmor`).
+
+Pushing a `vX.Y.Z` tag builds the `minder` binary for Linux (gnu/musl, x86_64/aarch64), macOS
+(aarch64), and Windows (x86_64) and attaches them — with checksums — to a draft GitHub Release
+(review and publish it manually). See [`release.yml`](.github/workflows/release.yml).
+
+All crates publish to crates.io under the `minder-*` prefix (`cargo install minder-cli`), and a
+`vX.Y.Z` tag push also runs [`cargo-publish.yml`](.github/workflows/cargo-publish.yml) (needs a
+`CARGO_REGISTRY_TOKEN` secret). Prefer a GitHub Release binary if you don't want to build from
+source (see [Install](#install)).
 
 ## License
 

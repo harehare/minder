@@ -1,0 +1,23 @@
+[package]
+name = "minder-core"
+description = "Session/turn loop, tool-calling protocol, and hook port trait for the minder coding-agent harness"
+categories = ["development-tools"]
+keywords = ["agent", "llm", "coding-agent"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

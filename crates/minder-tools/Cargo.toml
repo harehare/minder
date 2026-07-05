@@ -1,0 +1,31 @@
+[package]
+name = "minder-tools"
+description = "Built-in tools (file, shell, git, web) for the minder coding-agent harness"
+categories = ["development-tools"]
+keywords = ["agent", "llm", "coding-agent"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+minder-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["fs", "process", "time", "rt"] }
+tokio-util.workspace = true
+glob.workspace = true
+ignore.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid.workspace = true
+wiremock = "0.6"

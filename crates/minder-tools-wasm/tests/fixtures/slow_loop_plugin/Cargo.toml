@@ -1,0 +1,8 @@
+[package]
+name = "slow_loop_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "slow_loop_plugin"
+path = "src/main.rs"

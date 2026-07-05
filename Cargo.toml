@@ -1,27 +1,31 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/agent-core",
-    "crates/agent-providers",
-    "crates/agent-tools",
-    "crates/agent-tools-wasm",
-    "crates/agent-tools-mcp",
-    "crates/agent-hooks",
-    "crates/agent-cli",
+    "crates/minder-core",
+    "crates/minder-providers",
+    "crates/minder-tools",
+    "crates/minder-tools-wasm",
+    "crates/minder-tools-mcp",
+    "crates/minder-hooks",
+    "crates/minder-cli",
 ]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
+authors = ["Takahiro Sato <harehare1110@gmail.com>"]
+repository = "https://github.com/harehare/minder"
+homepage = "https://github.com/harehare/minder"
+readme = "README.md"
 
 [workspace.dependencies]
-agent-core = { path = "crates/agent-core" }
-agent-providers = { path = "crates/agent-providers" }
-agent-tools = { path = "crates/agent-tools" }
-agent-tools-wasm = { path = "crates/agent-tools-wasm" }
-agent-tools-mcp = { path = "crates/agent-tools-mcp" }
-agent-hooks = { path = "crates/agent-hooks" }
+minder-core = { path = "crates/minder-core", version = "0.1.0" }
+minder-providers = { path = "crates/minder-providers", version = "0.1.0" }
+minder-tools = { path = "crates/minder-tools", version = "0.1.0" }
+minder-tools-wasm = { path = "crates/minder-tools-wasm", version = "0.1.0" }
+minder-tools-mcp = { path = "crates/minder-tools-mcp", version = "0.1.0" }
+minder-hooks = { path = "crates/minder-hooks", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
