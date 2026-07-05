@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="minderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2B5773" />
+      <stop offset="100%" style="stop-color:#61AFEF" />
+    </linearGradient>
+  </defs>
+  <!-- shield: the host boundary that mediates every side effect -->
+  <path d="M50 6 L86 20 V48 C86 72 70 88 50 96 C30 88 14 72 14 48 V20 Z"
+        fill="none" stroke="url(#minderGradient)" stroke-width="6" stroke-linejoin="round" />
+  <!-- gate/checkpoint notch on the shield's left edge (on_tool_call interception) -->
+  <line x1="14" y1="46" x2="24" y2="46" stroke="url(#minderGradient)" stroke-width="6" stroke-linecap="round" />
+  <line x1="76" y1="46" x2="86" y2="46" stroke="url(#minderGradient)" stroke-width="6" stroke-linecap="round" />
+  <!-- M mark -->
+  <path d="M34 66 L34 34 L50 54 L66 34 L66 66"
+        fill="none" stroke="url(#minderGradient)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
