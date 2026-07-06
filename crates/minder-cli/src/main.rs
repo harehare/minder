@@ -5,7 +5,7 @@ mod provider_select;
 mod reporter;
 mod session_store;
 
-use std::io::Write as _;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,20 +16,23 @@ use minder_tools::{
     LsTool, ReadFileTool, SkillTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
     WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
 };
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use file_reporter::{CompositeReporter, FileReporter};
 use provider_select::select_provider;
-use reporter::TerminalReporter;
+use reporter::{BOLD, DIM, RESET, TerminalReporter};
 use session_store::SessionRecord;
 
 const SYSTEM_PROMPT: &str =
     "You are a careful coding assistant. Use the available tools to inspect and run code before answering.";
 
 const USAGE: &str = "usage:\n  \
+    minder                           start an interactive session ('exit'/'quit' or Ctrl-D to leave)\n  \
     minder \"<task>\"                  run a single task to completion (session saved for --continue)\n  \
     minder --continue|-c [\"<task>\"]  resume the most recent session in this project\n  \
     minder --resume|-r <id> [\"<task>\"] resume a specific session by id (or unambiguous prefix)\n  \
-    minder chat                     start an interactive session (empty input or Ctrl-D to exit)\n  \
+    minder chat                     same as running with no arguments\n  \
     minder loop <file.md> [\"<task>\"] work through the file's unchecked checklist items, then \
     keep polling it for new ones (mq-lang embedded, see README) -- runs until stopped (Ctrl-C) \
     or a safety limit is hit\n  \
@@ -201,7 +204,7 @@ fn parse_args(args: &[String]) -> Command {
             None => Command::Usage,
         },
         Some(task) => Command::OneShot { task: task.to_string() },
-        None => Command::Usage,
+        None => Command::Chat,
     }
 }
 
@@ -294,27 +297,86 @@ async fn run_resume(id: Option<String>, task: Option<String>) {
     }
 }
 
-/// Reads tasks from stdin in a loop, feeding each into the same session so
-/// context carries over between them; saves after every turn so Ctrl-C or a
-/// crash mid-conversation loses at most the in-flight turn. Exits on EOF
-/// (Ctrl-D), or an "exit"/"quit" line.
-async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRecord) {
-    eprintln!("entering interactive session -- 'exit'/'quit' or Ctrl-D to leave");
-    loop {
-        eprint!("> ");
-        let _ = std::io::stderr().flush();
-
-        let mut line = String::new();
-        let read = std::io::stdin().read_line(&mut line).unwrap_or(0);
-        if read == 0 {
-            break;
+/// Short "it's alive" banner shown once when a REPL starts, so launching
+/// `minder` feels intentional rather than dropping silently to a bare `> `.
+/// Colored only when stderr is a tty and `NO_COLOR` isn't set, matching
+/// `TerminalReporter`'s own rule.
+fn print_banner(session: &AgentSession, record: &SessionRecord) {
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
         }
+    };
+
+    let version = env!("CARGO_PKG_VERSION");
+    let status = if record.messages.is_empty() {
+        "new session".to_string()
+    } else {
+        format!("resumed, {} prior message(s)", record.messages.len())
+    };
+
+    eprintln!();
+    eprintln!(
+        "{} {}",
+        paint(BOLD, &format!("minder v{version}")),
+        paint(DIM, &format!("({} · {status})", session.provider_id()))
+    );
+    eprintln!("{}", paint(DIM, &working_dir().display().to_string()));
+    eprintln!(
+        "{}",
+        paint(DIM, "'exit'/'quit' or Ctrl-D to leave, Ctrl-C to cancel input")
+    );
+    eprintln!();
+}
+
+/// Reads tasks from a line editor in a loop, feeding each into the same
+/// session so context carries over between them; saves after every turn so
+/// Ctrl-C or a crash mid-conversation loses at most the in-flight turn.
+///
+/// Uses `rustyline` rather than a raw `stdin().read_line()` so editing (and
+/// especially IME-driven Japanese input) redraws correctly: rustyline tracks
+/// display width itself instead of assuming the terminal's canonical line
+/// discipline gets multi-byte/wide characters right, which is what caused
+/// visible cursor drift when composing non-ASCII input. History persists
+/// per-project across sessions (see `session_store::history_path`) so an
+/// up-arrow recalls prior turns too.
+///
+/// Exits on EOF (Ctrl-D), or an "exit"/"quit" line. Ctrl-C cancels the
+/// in-progress input line and re-prompts rather than killing the process.
+async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRecord) {
+    print_banner(session, record);
+
+    let history = session_store::history_path(dir).ok();
+    let mut editor = DefaultEditor::new().expect("failed to initialize line editor");
+    if let Some(path) = &history {
+        let _ = editor.load_history(path);
+    }
+
+    loop {
+        let line = match editor.readline("> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("error: {e}");
+                break;
+            }
+        };
+
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if line == "exit" || line == "quit" {
             break;
+        }
+
+        let _ = editor.add_history_entry(line);
+        if let Some(path) = &history {
+            let _ = editor.save_history(path);
         }
 
         if let Err(e) = session.run_turn(line).await {

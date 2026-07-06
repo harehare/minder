@@ -329,6 +329,12 @@ impl AgentSession {
         &self.system_prompt
     }
 
+    /// The active provider's id (e.g. `"anthropic"`), for display purposes
+    /// (banner, status lines) -- not used for any routing decision.
+    pub fn provider_id(&self) -> &'static str {
+        self.provider.id()
+    }
+
     /// Loads a saved transcript and marks the session started, so
     /// `before_agent_start` won't re-run. Used to resume a prior session.
     pub fn restore(&mut self, system_prompt: String, messages: Vec<Message>) {

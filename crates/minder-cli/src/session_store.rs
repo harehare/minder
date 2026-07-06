@@ -91,6 +91,18 @@ fn summarize(messages: &[Message]) -> String {
     summary.replace('\n', " ")
 }
 
+/// Creates `sessions_dir` (and its `.gitignore`, so nothing under it is
+/// accidentally committed) if it doesn't already exist.
+fn ensure_sessions_dir(working_dir: &Path) -> io::Result<PathBuf> {
+    let dir = sessions_dir(working_dir);
+    fs::create_dir_all(&dir)?;
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        fs::write(&gitignore, "*\n!.gitignore\n")?;
+    }
+    Ok(dir)
+}
+
 /// Saves (creating or overwriting) a session, refreshing `updated_at` and
 /// `summary`. Drops a `.gitignore` next to the transcripts on first use so
 /// they aren't accidentally committed.
@@ -98,15 +110,16 @@ pub fn save(working_dir: &Path, record: &mut SessionRecord) -> io::Result<()> {
     record.updated_at = unix_now();
     record.summary = summarize(&record.messages);
 
-    let dir = sessions_dir(working_dir);
-    fs::create_dir_all(&dir)?;
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        fs::write(&gitignore, "*\n!.gitignore\n")?;
-    }
-
+    ensure_sessions_dir(working_dir)?;
     let json = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     fs::write(path_for(working_dir, &record.id), json)
+}
+
+/// Path to the interactive REPL's persisted line-editing history (arrow-key
+/// recall across chat sessions). Kept alongside session transcripts -- same
+/// directory, same `.gitignore` -- since both are per-project local state.
+pub fn history_path(working_dir: &Path) -> io::Result<PathBuf> {
+    Ok(ensure_sessions_dir(working_dir)?.join("chat.history"))
 }
 
 fn read_record(path: &Path) -> io::Result<SessionRecord> {
