@@ -10,6 +10,10 @@ use crate::tool::ToolExecOutcome;
 /// behaves exactly as before (see `NoopReporter`).
 #[async_trait::async_trait]
 pub trait Reporter: Send + Sync {
+    /// Fired just before the provider is asked to complete a turn.
+    async fn on_turn_start(&self) {}
+    /// Fired as soon as the provider responds, before other events fire.
+    async fn on_turn_end(&self) {}
     /// Assistant text seen on any turn, including turns that also request a
     /// tool call (previously dropped silently -- see `AgentSession::run_turn`).
     async fn on_assistant_text(&self, _text: &str) {}

@@ -2,8 +2,10 @@ mod loop_mode;
 mod markdown;
 mod provider_select;
 mod reporter;
+mod session_store;
 
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use minder_core::{AgentSession, HookPort, Tool, ToolContext};
@@ -16,15 +18,20 @@ use minder_tools::{
 
 use provider_select::select_provider;
 use reporter::TerminalReporter;
+use session_store::SessionRecord;
 
 const SYSTEM_PROMPT: &str =
     "You are a careful coding assistant. Use the available tools to inspect and run code before answering.";
 
 const USAGE: &str = "usage:\n  \
-    minder \"<task>\"                 run a single task to completion\n  \
+    minder \"<task>\"                  run a single task to completion (session saved for --continue)\n  \
+    minder --continue|-c [\"<task>\"]  resume the most recent session in this project\n  \
+    minder --resume|-r <id> [\"<task>\"] resume a specific session by id (or unambiguous prefix)\n  \
+    minder chat                     start an interactive session (empty input or Ctrl-D to exit)\n  \
     minder loop <file.md> [\"<task>\"] work through the file's unchecked checklist items, then \
     keep polling it for new ones (mq-lang embedded, see README) -- runs until stopped (Ctrl-C) \
-    or a safety limit is hit";
+    or a safety limit is hit\n  \
+    (with no <task>, --continue/--resume drop into an interactive session too)";
 
 /// Builds the tool/hook/skill/plugin-wired session shared by both the
 /// one-shot and `loop` entry points -- only the prompt(s) fed into
@@ -38,13 +45,16 @@ async fn build_session() -> AgentSession {
         cancel: tokio_util::sync::CancellationToken::new(),
     };
 
-    let hooks = match HookEngine::load(&working_dir.join(".agent")) {
-        Ok(Some(engine)) => {
-            eprintln!("loaded hooks from .agent/");
+    let agent_dir = working_dir.join(".agent");
+    let has_project_hooks = agent_dir.join("hooks").is_dir() || agent_dir.join("hooks.mq").is_file();
+    let hooks = match HookEngine::load(&agent_dir) {
+        Ok(engine) => {
+            if has_project_hooks {
+                eprintln!("loaded hooks from .agent/");
+            }
             let boxed: Box<dyn HookPort> = Box::new(engine);
             Some(Arc::new(tokio::sync::Mutex::new(boxed)))
         }
-        Ok(None) => None,
         Err(e) => {
             eprintln!("failed to load hooks: {e}");
             std::process::exit(1);
@@ -146,44 +156,160 @@ async fn build_session() -> AgentSession {
     AgentSession::new(provider, tools, hooks, SYSTEM_PROMPT, tool_ctx).with_reporter(reporter)
 }
 
+enum Command {
+    OneShot { task: String },
+    Continue { task: Option<String> },
+    Resume { id: String, task: Option<String> },
+    Chat,
+    Loop { file: PathBuf, task_hint: Option<String> },
+    Usage,
+}
+
+fn parse_args(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("loop") => match args.get(1) {
+            Some(file) => Command::Loop {
+                file: PathBuf::from(file),
+                task_hint: args.get(2).cloned(),
+            },
+            None => Command::Usage,
+        },
+        Some("chat") => Command::Chat,
+        Some("--continue") | Some("-c") => Command::Continue { task: args.get(1).cloned() },
+        Some("--resume") | Some("-r") => match args.get(1) {
+            Some(id) => Command::Resume {
+                id: id.clone(),
+                task: args.get(2).cloned(),
+            },
+            None => Command::Usage,
+        },
+        Some(task) => Command::OneShot { task: task.to_string() },
+        None => Command::Usage,
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    match args.get(1).map(String::as_str) {
-        Some("loop") => run_loop_mode(&args[2..]).await,
-        Some(task) => run_one_shot(task).await,
-        None => {
+    match parse_args(&args) {
+        Command::OneShot { task } => run_one_shot(&task).await,
+        Command::Continue { task } => run_resume(None, task).await,
+        Command::Resume { id, task } => run_resume(Some(id), task).await,
+        Command::Chat => run_chat().await,
+        Command::Loop { file, task_hint } => run_loop_mode(&file, task_hint.as_deref()).await,
+        Command::Usage => {
             eprintln!("{USAGE}");
             std::process::exit(1);
         }
     }
 }
 
+fn working_dir() -> PathBuf {
+    std::env::current_dir().expect("cwd")
+}
+
+/// Refreshes a session record from the live session's transcript and saves
+/// it, so the process can be resumed later via `--continue`/`--resume`.
+/// Best-effort: a save failure is a warning, never fatal to the turn itself.
+fn persist(dir: &Path, record: &mut SessionRecord, session: &AgentSession) {
+    record.system_prompt = session.system_prompt().to_string();
+    record.messages = session.messages().to_vec();
+    if let Err(e) = session_store::save(dir, record) {
+        eprintln!("warning: failed to save session: {e}");
+    }
+}
+
 async fn run_one_shot(task: &str) {
+    let dir = working_dir();
     let mut session = build_session().await;
-    if let Err(e) = session.run_turn(task).await {
+    let mut record = SessionRecord::new();
+
+    let result = session.run_turn(task).await;
+    persist(&dir, &mut record, &session);
+
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run_loop_mode(args: &[String]) {
-    let Some(file) = args.first() else {
-        eprintln!("{USAGE}");
-        std::process::exit(1);
+async fn run_chat() {
+    let dir = working_dir();
+    let mut session = build_session().await;
+    let mut record = SessionRecord::new();
+    run_repl(&mut session, &dir, &mut record).await;
+}
+
+/// Resumes a saved session (latest if `id` is `None`) and either runs one
+/// more task, or drops into an interactive session when no task is given.
+async fn run_resume(id: Option<String>, task: Option<String>) {
+    let dir = working_dir();
+    let loaded = match &id {
+        Some(id) => session_store::load_by_id(&dir, id),
+        None => session_store::load_latest(&dir),
     };
-    let task_hint = args.get(1).map(String::as_str);
+    let mut record = match loaded {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            eprintln!("no session found to resume in this project");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to load session: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut session = build_session().await;
-    if let Err(e) = loop_mode::run(
-        &mut session,
-        Path::new(file),
-        task_hint,
-        loop_mode::LoopOptions::default(),
-    )
-    .await
-    {
+    session.restore(record.system_prompt.clone(), record.messages.clone());
+
+    match task {
+        Some(task) => {
+            let result = session.run_turn(&task).await;
+            persist(&dir, &mut record, &session);
+            if let Err(e) = result {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        None => run_repl(&mut session, &dir, &mut record).await,
+    }
+}
+
+/// Reads tasks from stdin in a loop, feeding each into the same session so
+/// context carries over between them; saves after every turn so Ctrl-C or a
+/// crash mid-conversation loses at most the in-flight turn. Exits on EOF
+/// (Ctrl-D), or an "exit"/"quit" line.
+async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRecord) {
+    eprintln!("entering interactive session -- 'exit'/'quit' or Ctrl-D to leave");
+    loop {
+        eprint!("> ");
+        let _ = std::io::stderr().flush();
+
+        let mut line = String::new();
+        let read = std::io::stdin().read_line(&mut line).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "exit" || line == "quit" {
+            break;
+        }
+
+        if let Err(e) = session.run_turn(line).await {
+            eprintln!("error: {e}");
+        }
+        persist(dir, record, session);
+    }
+}
+
+async fn run_loop_mode(file: &Path, task_hint: Option<&str>) {
+    let mut session = build_session().await;
+    if let Err(e) = loop_mode::run(&mut session, file, task_hint, loop_mode::LoopOptions::default()).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

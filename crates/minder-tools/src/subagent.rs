@@ -464,9 +464,11 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_cannot_call_the_agent_tool_itself() {
-        // Child session's provider immediately tries calling "agent".
+        // Child session's provider tries calling "agent"; the unknown-tool
+        // result now comes back to the model as a normal (error) tool result
+        // instead of aborting the turn, so it gets a chance to recover.
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider(StdMutex::new(
-            vec![tool_use_response("call_1", "agent")].into(),
+            vec![tool_use_response("call_1", "agent"), text_response("gave up on 'agent'")].into(),
         )));
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecursionProbeTool(call_count.clone()))];
@@ -488,7 +490,8 @@ mod tests {
             .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
             .await;
 
-        assert!(outcome.is_error, "expected an unknown-tool error, got: {outcome:?}");
+        assert!(!outcome.is_error, "expected the subagent to recover, got: {outcome:?}");
+        assert_eq!(outcome.content, "gave up on 'agent'");
         assert_eq!(
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             0,

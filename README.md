@@ -79,8 +79,7 @@ The rest of this README uses `minder "..."` for brevity — substitute `cargo ru
 
 ## Quick start
 
-minder takes a single task string as its only argument and runs it to completion. There's no
-interactive chat mode yet — one process, one task.
+minder takes a single task string as its only argument and runs it to completion.
 
 ```sh
 $ export ANTHROPIC_API_KEY=sk-ant-...
@@ -90,6 +89,16 @@ loaded hooks from .agent/            # only printed if .agent/hooks/*.mq exist
 → ls recursive=false
 ✓ ls: Cargo.toml  README.md  crates/  ...
 The project is a Rust workspace with six crates under crates/... (etc.)
+```
+
+Every run's transcript is saved under `.agent/sessions/` (gitignored automatically) so you can
+pick the conversation back up later instead of starting over:
+
+```sh
+minder chat                          # interactive session: type tasks, one process, shared context
+minder --continue "and now add tests" # resume the most recent session in this project, run one more task
+minder --continue                     # resume the most recent session interactively
+minder --resume <id> "..."            # resume a specific session by id (or an unambiguous prefix)
 ```
 
 Each turn: the model reads the prompt, optionally calls a tool (`read_file`, `bash`, `grep`, ...),
@@ -128,6 +137,10 @@ Colors turn off automatically when stderr isn't a terminal (e.g. redirected to a
 `NO_COLOR` is set. Every line here is also overridable per-project from `.agent/hooks/*.mq` — see
 [Customizing the display](#customizing-the-display) under Hooks.
 
+When stderr is a terminal, a spinner also runs while the model is thinking or a tool call is
+still executing (`⠋ Thinking (2.3s)`, `⠋ Running bash (0.8s)`), so a long step never looks stalled;
+it's replaced by the normal `✓`/`✗` line as soon as that step finishes.
+
 A few real tasks to try:
 
 ```sh
@@ -137,9 +150,12 @@ minder "explain what crates/minder-hooks/src/lib.rs does"
 minder "check git status and stage+commit the pending changes with a sensible message"
 ```
 
-Because `bash` and `write_file`/`edit_file` are unrestricted by default, drop a hook (see
-[Hooks](#hooks)) into `.agent/hooks/` for any project where you want a policy layer between the
-model and your filesystem/shell before pointing it at real work.
+A baseline policy is always active, even with no `.agent/hooks/` at all: it blocks `bash rm -rf`,
+and reading/searching paths under `.env`, `node_modules`, or `.git`. `write_file`/`edit_file` and
+everything else stay unrestricted by default — drop a hook (see [Hooks](#hooks)) into
+`.agent/hooks/` for any project where you want more policy between the model and your
+filesystem/shell before pointing it at real work. A project's own `on_tool_call` fully replaces the
+baseline (call `default_on_tool_call(call)` from yours to keep it and layer more checks on top).
 
 ## Providers
 
@@ -382,6 +398,24 @@ def on_context(messages):
     {"action": "block", "reason": "3 consecutive tool failures -- pausing for a human"}
   else:
     {"action": "allow", "value": messages};
+```
+
+### Default policy
+
+`default_policy.mq` loads right after the `agent` module, before any project hook file, and
+defines a baseline `on_tool_call`: it blocks `bash` commands containing `rm -rf`, and any
+`read_file`/`grep`/`glob`/`ls` call whose `path`/`pattern` touches `.env`, `node_modules`, or
+`.git`. This is active in every project, with zero `.agent/` setup.
+
+Defining your own `on_tool_call` fully replaces it (same shadowing rule as the `agent` module) --
+call `default_on_tool_call(call)` from yours to keep the baseline checks and layer your own on top:
+
+```mq
+def on_tool_call(call):
+  if (call["name"] == "web_fetch"):
+    {"action": "block", "reason": "no network in this project"}
+  else:
+    default_on_tool_call(call); # still blocks rm -rf, .env, node_modules, .git
 ```
 
 ### Overriding a tool's result

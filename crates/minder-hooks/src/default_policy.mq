@@ -1,0 +1,33 @@
+# Baseline safety net, active even with no project hooks. Loaded before any
+# user hook file, so redefining `on_tool_call` fully replaces it -- call
+# `default_on_tool_call(call)` from your own version to keep these checks too.
+
+def default_arg(call, key): call["arguments"][key];
+
+def default_arg_contains(call, key, needle):
+  let v = default_arg(call, key)
+  | is_string(v) && contains(v, needle);
+
+def default_any_arg_contains(call, needle):
+  default_arg_contains(call, "path", needle) || default_arg_contains(call, "pattern", needle) || default_arg_contains(call, "command", needle);
+
+def default_arg_has_path_segment(call, key, segment):
+  let v = default_arg(call, key)
+  | is_string(v) && contains(split(v, "/"), segment);
+
+def default_any_arg_has_path_segment(call, segment):
+  default_arg_has_path_segment(call, "path", segment) || default_arg_has_path_segment(call, "pattern", segment);
+
+def default_on_tool_call(call):
+  if (call["name"] == "bash" && default_arg_contains(call, "command", "rm -rf")):
+    {"action": "block", "reason": "destructive command blocked by default policy (rm -rf)"}
+  elif (default_any_arg_contains(call, ".env")):
+    {"action": "block", "reason": ".env is excluded by default policy"}
+  elif (default_any_arg_contains(call, "node_modules")):
+    {"action": "block", "reason": "node_modules is excluded by default policy"}
+  elif (default_any_arg_has_path_segment(call, ".git")):
+    {"action": "block", "reason": ".git is excluded by default policy"}
+  else:
+    {"action": "allow", "value": call};
+
+def on_tool_call(call): default_on_tool_call(call);

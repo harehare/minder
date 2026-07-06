@@ -1,8 +1,11 @@
-use std::io::IsTerminal;
+use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use minder_core::{HookPort, RenderDecision, Reporter, ToolCall, ToolExecOutcome};
+use tokio::sync::Mutex;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -15,11 +18,28 @@ const CYAN: &str = "\x1b[36m";
 const RESULT_PREVIEW_CHARS: usize = 300;
 const MAX_DIFF_LINES: usize = 40;
 
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(90);
+const TURN_LABEL_KEY: &str = "__turn__";
+
+/// Active spinner labels keyed by an id (tool call id, or a fixed key for
+/// "waiting on the model") -- shared between the ticker task and whichever
+/// reporter method starts/stops a label, and also used as a lock to
+/// serialize real output against spinner redraws.
+struct SpinnerState {
+    labels: HashMap<String, (String, Instant)>,
+    frame: usize,
+}
+
 /// Prints live progress to the terminal as a turn runs: assistant text goes
 /// to stdout (it's the actual conversation), tool calls/results/diffs go to
 /// stderr (execution trace), matching the existing convention of `eprintln!`
 /// for setup/diagnostic lines in `main.rs`. Colors itself off automatically
 /// when stderr isn't a tty or `NO_COLOR` is set.
+///
+/// When stderr is a tty, a spinner also runs on stderr while waiting on the
+/// model or a tool call, so a long-running step never looks stalled -- see
+/// `start_spinner`/`stop_spinner`/`with_terminal_lock`.
 ///
 /// Before falling back to its own formatting, each event is offered to
 /// `hooks` (the *same* `HookPort` handle `AgentSession` uses for policy --
@@ -28,13 +48,50 @@ const MAX_DIFF_LINES: usize = 40;
 /// without minder-side code changes.
 pub struct TerminalReporter {
     color: bool,
+    interactive: bool,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+    spinner: Arc<Mutex<SpinnerState>>,
 }
 
 impl TerminalReporter {
     pub fn new(hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>) -> Self {
         let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        Self { color, hooks }
+        let interactive = std::io::stderr().is_terminal();
+        let spinner = Arc::new(Mutex::new(SpinnerState {
+            labels: HashMap::new(),
+            frame: 0,
+        }));
+
+        if interactive {
+            let spinner = spinner.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SPINNER_INTERVAL).await;
+                    let mut state = spinner.lock().await;
+                    if state.labels.is_empty() {
+                        continue;
+                    }
+                    state.frame = (state.frame + 1) % SPINNER_FRAMES.len();
+                    let frame = SPINNER_FRAMES[state.frame];
+                    let elapsed = state.labels.values().map(|(_, t)| t.elapsed()).max().unwrap_or_default();
+                    let mut names: Vec<&str> = state.labels.values().map(|(l, _)| l.as_str()).collect();
+                    names.sort_unstable();
+                    eprint!(
+                        "\r\x1b[2K{DIM}{frame} {} ({:.1}s){RESET}",
+                        names.join(", "),
+                        elapsed.as_secs_f32()
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+            });
+        }
+
+        Self {
+            color,
+            interactive,
+            hooks,
+            spinner,
+        }
     }
 
     fn paint(&self, code: &str, text: &str) -> String {
@@ -109,67 +166,125 @@ impl TerminalReporter {
         hooks.lock().await.render_tool_result(call, outcome).await
     }
 
-    fn print_default_call(&self, call: &ToolCall) {
+    fn format_default_call(&self, call: &ToolCall) -> String {
         let summary = summarize_args(&call.arguments);
         let header = if summary.is_empty() {
             call.name.clone()
         } else {
             format!("{}({summary})", call.name)
         };
-        eprintln!("{}", self.paint(BOLD, &format!("● {header}")));
+        self.paint(BOLD, &format!("● {header}"))
     }
 
-    fn print_default_result(&self, outcome: &ToolExecOutcome) {
+    fn format_default_result(&self, outcome: &ToolExecOutcome, elapsed: Option<Duration>) -> String {
         let mark = if outcome.is_error {
             self.paint(RED, "✗")
         } else {
             self.paint(GREEN, "✓")
         };
+        let suffix = elapsed
+            .filter(|d| d.as_secs_f32() >= 1.0)
+            .map(|d| format!(" {}", self.paint(DIM, &format!("({:.1}s)", d.as_secs_f32()))))
+            .unwrap_or_default();
 
         if let Some(diff) = outcome.metadata.get("diff").and_then(|v| v.as_str())
             && !diff.is_empty()
         {
             let additions = outcome.metadata.get("additions").and_then(|v| v.as_u64());
             let deletions = outcome.metadata.get("deletions").and_then(|v| v.as_u64());
-            eprintln!(
-                "  {mark} {} {}",
+            format!(
+                "  {mark} {} {}{suffix}\n{}",
                 self.paint(GREEN, &format!("+{}", additions.unwrap_or(0))),
                 self.paint(RED, &format!("-{}", deletions.unwrap_or(0))),
-            );
-            eprintln!("{}", self.render_diff(diff));
+                self.render_diff(diff),
+            )
+        } else {
+            format!(
+                "  {mark} {}{suffix}",
+                self.paint(DIM, &truncate(&outcome.content, RESULT_PREVIEW_CHARS))
+            )
+        }
+    }
+
+    /// Registers a live spinner label; no-op when stderr isn't a tty.
+    async fn start_spinner(&self, key: &str, label: String) {
+        if !self.interactive {
             return;
         }
+        self.spinner.lock().await.labels.insert(key.to_string(), (label, Instant::now()));
+    }
 
-        eprintln!(
-            "  {mark} {}",
-            self.paint(DIM, &truncate(&outcome.content, RESULT_PREVIEW_CHARS))
-        );
+    /// Clears a spinner label, returning how long it was active.
+    async fn stop_spinner(&self, key: &str) -> Option<Duration> {
+        if !self.interactive {
+            return None;
+        }
+        let mut state = self.spinner.lock().await;
+        let elapsed = state.labels.remove(key).map(|(_, started)| started.elapsed());
+        if state.labels.is_empty() {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+        elapsed
+    }
+
+    /// Prints a line while holding the spinner lock, so the ticker task
+    /// can't redraw mid-print and the spinner's current line gets cleared
+    /// first (stdout and stderr share one terminal row when both are ttys).
+    async fn print_guarded(&self, f: impl FnOnce()) {
+        if self.interactive {
+            let _guard = self.spinner.lock().await;
+            eprint!("\r\x1b[2K");
+            f();
+        } else {
+            f();
+        }
     }
 }
 
 #[async_trait]
 impl Reporter for TerminalReporter {
+    async fn on_turn_start(&self) {
+        self.start_spinner(TURN_LABEL_KEY, "Thinking".to_string()).await;
+    }
+
+    async fn on_turn_end(&self) {
+        self.stop_spinner(TURN_LABEL_KEY).await;
+    }
+
     async fn on_assistant_text(&self, text: &str) {
-        println!("{}", crate::markdown::render(text, self.color));
+        let rendered = crate::markdown::render(text, self.color);
+        self.print_guarded(|| println!("{rendered}")).await;
     }
 
     async fn on_tool_call(&self, call: &ToolCall) {
         match self.render_call_decision(call).await {
             RenderDecision::Hide => {}
             RenderDecision::Text { value, style } => {
-                eprintln!("{}", self.painted_by_name(style.as_deref(), &value));
+                let line = self.painted_by_name(style.as_deref(), &value);
+                self.print_guarded(|| eprintln!("{line}")).await;
             }
-            RenderDecision::Default => self.print_default_call(call),
+            RenderDecision::Default => {
+                let line = self.format_default_call(call);
+                self.print_guarded(|| eprintln!("{line}")).await;
+            }
         }
+        let label = format!("Running {}", call.name);
+        self.start_spinner(&call.id, label).await;
     }
 
     async fn on_tool_result(&self, call: &ToolCall, outcome: &ToolExecOutcome) {
+        let elapsed = self.stop_spinner(&call.id).await;
         match self.render_result_decision(call, outcome).await {
             RenderDecision::Hide => {}
             RenderDecision::Text { value, style } => {
-                eprintln!("{}", self.painted_by_name(style.as_deref(), &value));
+                let line = self.painted_by_name(style.as_deref(), &value);
+                self.print_guarded(|| eprintln!("{line}")).await;
             }
-            RenderDecision::Default => self.print_default_result(outcome),
+            RenderDecision::Default => {
+                let line = self.format_default_result(outcome, elapsed);
+                self.print_guarded(|| eprintln!("{line}")).await;
+            }
         }
     }
 }
@@ -221,10 +336,18 @@ mod tests {
     }
 
     fn no_color_reporter(hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>) -> TerminalReporter {
-        // color is decided once in `new()` from the tty/NO_COLOR check, which
-        // is meaningless (and flaky) under `cargo test` -- tests only care
-        // about the plain-text `value`, so force it off directly.
-        TerminalReporter { color: false, hooks }
+        // color/interactive are decided once in `new()` from the tty check,
+        // which is meaningless (and flaky) under `cargo test` -- tests only
+        // care about the plain-text `value`, so force both off directly.
+        TerminalReporter {
+            color: false,
+            interactive: false,
+            hooks,
+            spinner: Arc::new(Mutex::new(SpinnerState {
+                labels: HashMap::new(),
+                frame: 0,
+            })),
+        }
     }
 
     struct StubHooks {
@@ -332,5 +455,27 @@ mod tests {
         let rendered = reporter.render_diff(&long_diff);
         assert!(rendered.contains("more line(s)"));
         assert_eq!(rendered.lines().count(), MAX_DIFF_LINES + 1);
+    }
+
+    #[tokio::test]
+    async fn spinner_is_a_noop_when_not_interactive() {
+        let reporter = no_color_reporter(None);
+        reporter.start_spinner("k", "Running".to_string()).await;
+        assert!(reporter.spinner.lock().await.labels.is_empty());
+        assert!(reporter.stop_spinner("k").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn elapsed_under_a_second_is_not_shown_in_result_line() {
+        let reporter = no_color_reporter(None);
+        let line = reporter.format_default_result(&outcome(), Some(Duration::from_millis(200)));
+        assert!(!line.contains('('), "unexpected elapsed suffix in: {line}");
+    }
+
+    #[test]
+    fn elapsed_over_a_second_is_shown_in_result_line() {
+        let reporter = no_color_reporter(None);
+        let line = reporter.format_default_result(&outcome(), Some(Duration::from_secs(3)));
+        assert!(line.contains("(3.0s)"), "missing elapsed suffix in: {line}");
     }
 }

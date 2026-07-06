@@ -92,7 +92,7 @@ async fn hook_script_blocks_destructive_command_through_the_real_agent_loop() {
     std::fs::create_dir_all(&hooks_dir).unwrap();
     std::fs::write(hooks_dir.join("security.mq"), SECURITY_HOOK).unwrap();
 
-    let hook_engine = HookEngine::load(&agent_dir).unwrap().expect("hooks should load");
+    let hook_engine = HookEngine::load(&agent_dir).unwrap();
     let hooks: Box<dyn HookPort> = Box::new(hook_engine);
 
     let provider = ScriptedProvider(StdMutex::new(
@@ -133,7 +133,7 @@ async fn hook_script_allows_safe_command_through_the_real_agent_loop() {
     std::fs::create_dir_all(&hooks_dir).unwrap();
     std::fs::write(hooks_dir.join("security.mq"), SECURITY_HOOK).unwrap();
 
-    let hook_engine = HookEngine::load(&agent_dir).unwrap().expect("hooks should load");
+    let hook_engine = HookEngine::load(&agent_dir).unwrap();
     let hooks: Box<dyn HookPort> = Box::new(hook_engine);
 
     let provider = ScriptedProvider(StdMutex::new(
@@ -161,6 +161,45 @@ async fn hook_script_allows_safe_command_through_the_real_agent_loop() {
     let final_message = session.run_turn("list files").await.unwrap();
     match &final_message.content[0] {
         ContentBlock::Text(t) => assert_eq!(t, "Here are the files."),
+        other => panic!("expected final Text response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn default_policy_blocks_destructive_command_with_no_project_hooks_at_all() {
+    // no .agent/hooks written at all -- the bundled default policy alone
+    // must still block this, through the real AgentSession loop.
+    let agent_dir = std::env::temp_dir().join(format!("minder-session-integration-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&agent_dir).unwrap();
+
+    let hook_engine = HookEngine::load(&agent_dir).unwrap();
+    let hooks: Box<dyn HookPort> = Box::new(hook_engine);
+
+    let provider = ScriptedProvider(StdMutex::new(
+        vec![
+            tool_use_response("call_1", "rm -rf /important/data"),
+            text_response("I wasn't able to run that command."),
+        ]
+        .into(),
+    ));
+
+    let tool_ctx = ToolContext {
+        working_dir: std::env::temp_dir(),
+        session_id: "test".to_string(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+
+    let mut session = AgentSession::new(
+        Arc::new(provider),
+        vec![Arc::new(FakeBashTool)],
+        Some(Arc::new(tokio::sync::Mutex::new(hooks))),
+        "you are a test agent",
+        tool_ctx,
+    );
+
+    let final_message = session.run_turn("delete everything").await.unwrap();
+    match &final_message.content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, "I wasn't able to run that command."),
         other => panic!("expected final Text response, got {other:?}"),
     }
 }

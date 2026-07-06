@@ -9,6 +9,13 @@ use crate::tool::{Tool, ToolContext, ToolExecOutcome, spec};
 const COMPACT_THRESHOLD: usize = 60;
 const KEEP_RECENT: usize = 40;
 
+/// Proactive compaction trigger based on the last response's real token usage,
+/// not just message count (a few big tool results can blow the window early).
+const TOKEN_COMPACT_THRESHOLD: u32 = 100_000;
+
+/// Harder fallback used once the provider itself rejects a request as too big.
+const EMERGENCY_KEEP_RECENT: usize = 20;
+
 /// Calls to this tool run concurrently with each other (subagent
 /// delegations share no state); every other tool stays sequential.
 const CONCURRENT_TOOL_NAME: &str = "agent";
@@ -22,6 +29,8 @@ pub struct AgentSession {
     system_prompt: String,
     tool_ctx: ToolContext,
     started: bool,
+    /// Input tokens from the last response; drives proactive compaction.
+    last_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,8 +39,6 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("blocked by hook: {0}")]
     HookBlocked(String),
-    #[error("unknown tool: {0}")]
-    UnknownTool(String),
 }
 
 impl AgentSession {
@@ -51,6 +58,7 @@ impl AgentSession {
             system_prompt: system_prompt.into(),
             tool_ctx,
             started: false,
+            last_input_tokens: None,
         }
     }
 
@@ -76,10 +84,27 @@ impl AgentSession {
 
             let outgoing = self.run_context_hook().await?;
             let tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| spec(t.as_ref())).collect();
-            let response = self
+            self.reporter.on_turn_start().await;
+            let mut result = self
                 .provider
                 .complete(&outgoing, &tool_specs, Some(&self.system_prompt))
-                .await?;
+                .await;
+
+            // Provider rejected the request as too large: compact harder and retry once.
+            if let Err(err) = &result
+                && is_context_length_error(err)
+                && self.messages.len() > EMERGENCY_KEEP_RECENT
+            {
+                self.force_compact().await?;
+                let retry_outgoing = self.run_context_hook().await?;
+                result = self
+                    .provider
+                    .complete(&retry_outgoing, &tool_specs, Some(&self.system_prompt))
+                    .await;
+            }
+            self.reporter.on_turn_end().await;
+            let response = result?;
+            self.last_input_tokens = Some(response.usage.input_tokens);
             self.messages.push(response.message.clone());
 
             for block in &response.message.content {
@@ -166,21 +191,42 @@ impl AgentSession {
     }
 
     async fn maybe_compact(&mut self) -> Result<(), AgentError> {
-        if self.messages.len() <= COMPACT_THRESHOLD {
+        let over_message_count = self.messages.len() > COMPACT_THRESHOLD;
+        let over_token_budget = self.last_input_tokens.is_some_and(|t| t > TOKEN_COMPACT_THRESHOLD);
+        if !over_message_count && !over_token_budget {
             return Ok(());
         }
-        if let Some(hooks) = &self.hooks {
-            match hooks.lock().await.before_compact(&self.messages).await {
-                HookDecision::Block(reason) => return Err(AgentError::HookBlocked(reason)),
-                HookDecision::Allow(()) => {}
-            }
-        }
-        // Truncation-based compaction: keep only the most recent messages.
-        // Real summarization is a v2 concern (see plan's Compaction hook
-        // semantics open question).
-        let drop_count = self.messages.len() - KEEP_RECENT;
-        self.messages.drain(0..drop_count);
+        self.run_before_compact_hook().await?;
+        self.truncate_to(KEEP_RECENT);
         Ok(())
+    }
+
+    /// Emergency compaction after the provider itself rejects a request as too large.
+    async fn force_compact(&mut self) -> Result<(), AgentError> {
+        self.run_before_compact_hook().await?;
+        self.truncate_to(EMERGENCY_KEEP_RECENT);
+        Ok(())
+    }
+
+    async fn run_before_compact_hook(&self) -> Result<(), AgentError> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(());
+        };
+        match hooks.lock().await.before_compact(&self.messages).await {
+            HookDecision::Block(reason) => Err(AgentError::HookBlocked(reason)),
+            HookDecision::Allow(()) => Ok(()),
+        }
+    }
+
+    // Truncation-based compaction: keep only the most recent `keep` messages.
+    // Real summarization is a v2 concern (see plan's Compaction hook
+    // semantics open question).
+    fn truncate_to(&mut self, keep: usize) {
+        if self.messages.len() <= keep {
+            return;
+        }
+        let drop_count = self.messages.len() - keep;
+        self.messages.drain(0..drop_count);
     }
 
     async fn execute_with_hooks(&self, call: ToolCall) -> Result<ToolExecOutcome, AgentError> {
@@ -192,7 +238,7 @@ impl AgentSession {
 
         match decision {
             ToolCallDecision::Allow(effective_call) => {
-                let outcome = self.execute_tool(&effective_call).await?;
+                let outcome = self.execute_tool(&effective_call).await;
                 self.run_tool_result_hook(&effective_call.name, outcome).await
             }
             ToolCallDecision::Block(reason) => Ok(ToolExecOutcome {
@@ -207,13 +253,16 @@ impl AgentSession {
         }
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Result<ToolExecOutcome, AgentError> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|t| t.name() == call.name)
-            .ok_or_else(|| AgentError::UnknownTool(call.name.clone()))?;
-        Ok(tool.execute(call.arguments.clone(), &self.tool_ctx).await)
+    /// Unknown tool name -> error result with a suggestion, not a hard failure.
+    async fn execute_tool(&self, call: &ToolCall) -> ToolExecOutcome {
+        match self.tools.iter().find(|t| t.name() == call.name) {
+            Some(tool) => tool.execute(call.arguments.clone(), &self.tool_ctx).await,
+            None => ToolExecOutcome {
+                content: unknown_tool_message(&call.name, &self.tools),
+                is_error: true,
+                metadata: serde_json::Value::Null,
+            },
+        }
     }
 
     async fn run_tool_result_hook(
@@ -238,6 +287,78 @@ impl AgentSession {
             }),
         }
     }
+
+    /// Transcript so far, for a caller to persist across process restarts.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// System prompt after any `before_agent_start` hook transform.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    /// Loads a saved transcript and marks the session started, so
+    /// `before_agent_start` won't re-run. Used to resume a prior session.
+    pub fn restore(&mut self, system_prompt: String, messages: Vec<Message>) {
+        self.system_prompt = system_prompt;
+        self.messages = messages;
+        self.started = true;
+    }
+}
+
+/// Suggests the closest registered tool name (Levenshtein distance) for a typo'd call.
+fn unknown_tool_message(name: &str, tools: &[Arc<dyn Tool>]) -> String {
+    let available: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let suggestion = available
+        .iter()
+        .min_by_key(|candidate| levenshtein(name, candidate))
+        .filter(|candidate| levenshtein(name, candidate) <= (name.len().max(3) / 2));
+
+    match suggestion {
+        Some(candidate) => {
+            format!("Unknown tool '{name}'. Did you mean '{candidate}'? Available tools: {}", available.join(", "))
+        }
+        None => format!("Unknown tool '{name}'. Available tools: {}", available.join(", ")),
+    }
+}
+
+/// Edit distance between two short strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// True if a provider error looks like "request too large for context window".
+fn is_context_length_error(err: &ProviderError) -> bool {
+    let ProviderError::Api { status, body } = err else {
+        return false;
+    };
+    if *status == 413 {
+        return true;
+    }
+    const NEEDLES: [&str; 6] = [
+        "context length",
+        "context_length",
+        "context window",
+        "too many tokens",
+        "maximum context",
+        "prompt is too long",
+    ];
+    let body = body.to_lowercase();
+    NEEDLES.iter().any(|needle| body.contains(needle))
 }
 
 #[cfg(test)]
@@ -311,6 +432,10 @@ mod tests {
     }
 
     fn text_response(text: &str) -> ProviderResponse {
+        text_response_with_usage(text, 0)
+    }
+
+    fn text_response_with_usage(text: &str, input_tokens: u32) -> ProviderResponse {
         ProviderResponse {
             message: Message {
                 role: Role::Assistant,
@@ -318,7 +443,10 @@ mod tests {
                 metadata: serde_json::Value::Null,
             },
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage: Usage {
+                input_tokens,
+                output_tokens: 0,
+            },
         }
     }
 
@@ -441,16 +569,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_call_is_an_error() {
-        let provider = ScriptedProvider::new(vec![tool_use_response(
-            "call_1",
-            "does_not_exist",
-            serde_json::json!({}),
-        )]);
-        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "you are a test agent", test_ctx());
+    async fn unknown_tool_call_is_reported_back_instead_of_aborting_the_turn() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_response("call_1", "grpe", serde_json::json!({})),
+            text_response("retried with the right tool"),
+        ]);
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(EchoTool)], // named "echo", close enough to "grpe" to never match
+            None,
+            "you are a test agent",
+            test_ctx(),
+        );
 
-        let err = session.run_turn("do something").await.unwrap_err();
-        assert!(matches!(err, AgentError::UnknownTool(name) if name == "does_not_exist"));
+        let final_message = session.run_turn("do something").await.unwrap();
+        match &final_message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "retried with the right tool"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+
+        let tool_result_msg = &session.messages[2];
+        match &tool_result_msg.content[0] {
+            ContentBlock::ToolResult(r) => {
+                assert!(r.is_error);
+                match &r.content {
+                    ToolResultContent::Text(t) => assert!(t.contains("Unknown tool 'grpe'"), "got: {t}"),
+                    other => panic!("expected Text, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn levenshtein_finds_close_names_but_not_distant_ones() {
+        assert_eq!(levenshtein("grep", "grep"), 0);
+        assert_eq!(levenshtein("grpe", "grep"), 2);
+        assert!(levenshtein("bash", "web_fetch") > 3);
+    }
+
+    #[test]
+    fn unknown_tool_message_suggests_the_closest_registered_name() {
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
+        assert!(unknown_tool_message("ecko", &tools).contains("Did you mean 'echo'?"));
+        assert!(!unknown_tool_message("completely_unrelated_xyz", &tools).contains("Did you mean"));
+    }
+
+    #[tokio::test]
+    async fn restore_replaces_history_and_skips_before_agent_start_again() {
+        let provider = ScriptedProvider::new(vec![text_response("continuing")]);
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "original prompt", test_ctx());
+
+        session.restore("restored prompt".to_string(), vec![Message::user_text("earlier turn")]);
+        assert_eq!(session.system_prompt(), "restored prompt");
+        assert_eq!(session.messages().len(), 1);
+
+        session.run_turn("follow up").await.unwrap();
+        assert_eq!(session.messages().len(), 3);
+    }
+
+    struct FlakyThenOkProvider {
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyThenOkProvider {
+        fn id(&self) -> &'static str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Err(ProviderError::Api {
+                    status: 400,
+                    body: "maximum context length exceeded".to_string(),
+                })
+            } else {
+                Ok(text_response("recovered"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_length_error_triggers_compaction_and_retry() {
+        let provider = FlakyThenOkProvider { calls: StdMutex::new(0) };
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
+        let seed: Vec<Message> = (0..25).map(|i| Message::user_text(format!("msg {i}"))).collect();
+        session.restore("test".to_string(), seed);
+
+        let final_message = session.run_turn("trigger").await.unwrap();
+        match &final_message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "recovered"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // 25 seeded + 1 user = 26, compacted to EMERGENCY_KEEP_RECENT (20), + 1 assistant reply.
+        assert_eq!(session.messages().len(), EMERGENCY_KEEP_RECENT + 1);
+    }
+
+    #[tokio::test]
+    async fn high_token_usage_triggers_proactive_compaction_under_message_threshold() {
+        let provider = ScriptedProvider::new(vec![
+            text_response_with_usage("first", TOKEN_COMPACT_THRESHOLD + 1),
+            text_response("second"),
+        ]);
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
+        session.run_turn("prime usage").await.unwrap();
+
+        let seed: Vec<Message> = (0..44).map(|i| Message::user_text(format!("msg {i}"))).collect();
+        session.restore("test".to_string(), seed);
+
+        session.run_turn("go").await.unwrap();
+        // 44 seeded + 1 user = 45, under COMPACT_THRESHOLD (60), but the primed
+        // usage was over TOKEN_COMPACT_THRESHOLD so it compacts anyway.
+        assert_eq!(session.messages().len(), KEEP_RECENT + 1);
     }
 
     /// Counts real invocations so a test can assert an `Override`d call

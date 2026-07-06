@@ -33,6 +33,12 @@ pub struct HookEngine {
 /// shadows it (loaded after, in the same flat namespace).
 const AGENT_MODULE_SOURCE: &str = include_str!("agent.mq");
 
+/// Baseline `on_tool_call` policy (blocks `rm -rf`, `.env`, `node_modules`,
+/// `.git`) -- see `default_policy.mq`. Loaded before any project hook file,
+/// so a user's own `on_tool_call` shadows it; they can call
+/// `default_on_tool_call` from theirs to keep these checks too.
+const DEFAULT_POLICY_SOURCE: &str = include_str!("default_policy.mq");
+
 /// Contract for hooks that transform a value: `{"action": "allow", "value": T}`
 /// or `{"action": "block", "reason": "..."}`.
 #[derive(Deserialize)]
@@ -98,11 +104,12 @@ struct RenderResultArg<'a> {
 }
 
 impl HookEngine {
-    /// Loads hook scripts from `agent_dir` (typically `.agent`): either
-    /// `agent_dir/hooks/*.mq` (one shared namespace across files) or the
-    /// single-file fallback `agent_dir/hooks.mq`. Returns `Ok(None)` if
-    /// neither exists -- hooks are fully optional.
-    pub fn load(agent_dir: &Path) -> Result<Option<Self>, HookLoadError> {
+    /// Builds the engine: `agent.mq` helpers and the default policy always
+    /// load first, then project hooks from `agent_dir/hooks/*.mq` (one
+    /// shared namespace) or the single-file fallback `agent_dir/hooks.mq`,
+    /// if present -- their `def`s shadow same-named defaults. Always
+    /// succeeds (baseline policy applies even with no project hooks at all).
+    pub fn load(agent_dir: &Path) -> Result<Self, HookLoadError> {
         let hooks_dir = agent_dir.join("hooks");
         let single_file = agent_dir.join("hooks.mq");
 
@@ -121,12 +128,8 @@ impl HookEngine {
         } else if single_file.is_file() {
             (agent_dir.to_path_buf(), vec!["hooks".to_string()])
         } else {
-            return Ok(None);
+            (agent_dir.to_path_buf(), Vec::new())
         };
-
-        if module_names.is_empty() {
-            return Ok(None);
-        }
         module_names.sort(); // deterministic load order
 
         let mut engine = mq_lang::DefaultEngine::default();
@@ -141,6 +144,9 @@ impl HookEngine {
         engine
             .eval(AGENT_MODULE_SOURCE, mq_lang::null_input().into_iter())
             .map_err(|e| HookLoadError::Mq("agent".to_string(), e))?;
+        engine
+            .eval(DEFAULT_POLICY_SOURCE, mq_lang::null_input().into_iter())
+            .map_err(|e| HookLoadError::Mq("default_policy".to_string(), e))?;
 
         for name in &module_names {
             // unqualified load: every file's top-level defs land in one
@@ -151,10 +157,10 @@ impl HookEngine {
                 .map_err(|e| HookLoadError::Mq(name.clone(), e))?;
         }
 
-        Ok(Some(Self {
+        Ok(Self {
             engine,
             compiled: HashMap::new(),
-        }))
+        })
     }
 
     fn compile_call(&mut self, fn_name: &str) -> Result<(), String> {
@@ -454,11 +460,66 @@ def on_tool_call(call):
     {"action": "allow", "value": call};
 "#;
 
-    #[test]
-    fn load_returns_none_when_no_hooks_present() {
+    #[tokio::test]
+    async fn default_policy_applies_with_no_project_hooks_present() {
         let agent_dir = temp_agent_dir();
         std::fs::create_dir_all(&agent_dir).unwrap();
-        assert!(HookEngine::load(&agent_dir).unwrap().is_none());
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
+
+        let decision = engine.on_tool_call(&bash_call("1", "rm -rf /tmp/foo")).await;
+        assert!(matches!(decision, ToolCallDecision::Block(_)));
+    }
+
+    fn read_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": path }),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_policy_blocks_dotenv_and_noisy_paths() {
+        let agent_dir = temp_agent_dir();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
+
+        for path in [".env", "packages/app/.env.local", "node_modules/foo/index.js", ".git/config"] {
+            let decision = engine.on_tool_call(&read_call("1", path)).await;
+            assert!(matches!(decision, ToolCallDecision::Block(_)), "expected block for {path}");
+        }
+
+        let decision = engine.on_tool_call(&read_call("2", "src/main.rs")).await;
+        assert!(matches!(decision, ToolCallDecision::Allow(_)));
+    }
+
+    #[tokio::test]
+    async fn user_hook_can_compose_with_the_default_policy() {
+        let agent_dir = temp_agent_dir();
+        write_hook(
+            &agent_dir,
+            "extra.mq",
+            r#"
+def on_tool_call(call):
+  if (call["name"] == "web_fetch"):
+    {"action": "block", "reason": "no network in this project"}
+  else:
+    default_on_tool_call(call);
+"#,
+        );
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
+
+        let extra_decision = engine
+            .on_tool_call(&ToolCall {
+                id: "1".to_string(),
+                name: "web_fetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+            })
+            .await;
+        assert!(matches!(extra_decision, ToolCallDecision::Block(_)));
+
+        let default_decision = engine.on_tool_call(&bash_call("2", "rm -rf /tmp/foo")).await;
+        assert!(matches!(default_decision, ToolCallDecision::Block(_)));
     }
 
     #[test]
@@ -466,14 +527,14 @@ def on_tool_call(call):
         let agent_dir = temp_agent_dir();
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("hooks.mq"), SECURITY_HOOK).unwrap();
-        assert!(HookEngine::load(&agent_dir).unwrap().is_some());
+        assert!(HookEngine::load(&agent_dir).is_ok());
     }
 
     #[tokio::test]
     async fn on_tool_call_blocks_destructive_command() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "security.mq", SECURITY_HOOK);
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let decision = engine.on_tool_call(&bash_call("1", "rm -rf /tmp/foo")).await;
         match decision {
@@ -486,7 +547,7 @@ def on_tool_call(call):
     async fn on_tool_call_allows_safe_command() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "security.mq", SECURITY_HOOK);
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let call = bash_call("2", "ls -la");
         let decision = engine.on_tool_call(&call).await;
@@ -510,7 +571,7 @@ def on_tool_call(call):
     {"action": "allow", "value": call};
 "#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let call = ToolCall {
             id: "1".to_string(),
@@ -530,7 +591,7 @@ def on_tool_call(call):
     async fn undefined_hook_is_a_no_op() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "security.mq", SECURITY_HOOK); // only defines on_tool_call
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let result = minder_core::ToolResultInfo {
             tool_name: "bash".to_string(),
@@ -549,7 +610,7 @@ def on_tool_call(call):
         let agent_dir = temp_agent_dir();
         // references an undefined variable -- a genuine script bug, not "undefined hook"
         write_hook(&agent_dir, "buggy.mq", "def on_tool_call(call): does_not_exist(call);");
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let decision = engine.on_tool_call(&bash_call("3", "ls")).await;
         assert!(
@@ -566,7 +627,7 @@ def on_tool_call(call):
             "buggy.mq",
             "def on_tool_result(result): does_not_exist(result);",
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let result = minder_core::ToolResultInfo {
             tool_name: "bash".to_string(),
@@ -584,7 +645,7 @@ def on_tool_call(call):
     async fn before_compact_gate_allows_by_default() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "security.mq", SECURITY_HOOK); // doesn't define before_compact
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let messages = vec![Message::user_text("hi")];
         assert!(matches!(
@@ -601,7 +662,7 @@ def on_tool_call(call):
             "compact.mq",
             r#"def before_compact(messages): {"action": "block", "reason": "not now"};"#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let messages = vec![Message::user_text("hi")];
         match engine.before_compact(&messages).await {
@@ -618,7 +679,7 @@ def on_tool_call(call):
             "context.mq",
             r#"def on_context(messages): {"action": "allow", "value": []};"#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let messages = vec![Message::user_text("secret stuff")];
         match engine.on_context(&messages).await {
@@ -635,7 +696,7 @@ def on_tool_call(call):
             "prompt.mq",
             r#"def before_agent_start(prompt): {"action": "allow", "value": prompt + " Be extra careful."};"#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         match engine.before_agent_start("You are an agent.").await {
             HookDecision::Allow(prompt) => {
@@ -671,7 +732,7 @@ def before_compact(messages):
     {"action": "allow"};
 "#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let messages = vec![
             tool_result_message("1", "ok", false),
@@ -699,7 +760,7 @@ def on_context(messages):
     {"action": "allow", "value": messages};
 "#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let messages = vec![
             Message::user_text("do something"),
@@ -728,7 +789,7 @@ def agent_tool_names(messages): "shadowed";
 def before_agent_start(prompt): {"action": "allow", "value": prompt + " " + agent_tool_names([])};
 "#,
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         match engine.before_agent_start("base").await {
             HookDecision::Allow(prompt) => assert_eq!(prompt, "base shadowed"),
@@ -758,7 +819,7 @@ def render_tool_result(arg):
     async fn render_tool_call_undefined_falls_back_to_default() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "security.mq", SECURITY_HOOK); // doesn't define render_tool_call
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let decision = engine.render_tool_call(&bash_call("1", "ls")).await;
         assert!(matches!(decision, RenderDecision::Default));
@@ -768,7 +829,7 @@ def render_tool_result(arg):
     async fn render_tool_call_can_customize_text_and_style() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "render.mq", RENDER_HOOK);
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         match engine.render_tool_call(&bash_call("1", "ls -la")).await {
             RenderDecision::Text { value, style } => {
@@ -783,7 +844,7 @@ def render_tool_result(arg):
     async fn render_tool_call_can_hide() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "render.mq", RENDER_HOOK);
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let call = ToolCall {
             id: "2".to_string(),
@@ -797,7 +858,7 @@ def render_tool_result(arg):
     async fn render_tool_result_receives_both_call_and_outcome() {
         let agent_dir = temp_agent_dir();
         write_hook(&agent_dir, "render.mq", RENDER_HOOK);
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let call = bash_call("3", "false");
         let outcome = ToolExecOutcome {
@@ -822,7 +883,7 @@ def render_tool_result(arg):
             "buggy.mq",
             "def render_tool_call(call): does_not_exist(call);",
         );
-        let mut engine = HookEngine::load(&agent_dir).unwrap().unwrap();
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
 
         let decision = engine.render_tool_call(&bash_call("4", "ls")).await;
         assert!(
