@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::hooks::{HookDecision, HookPort, ToolCallDecision, ToolResultInfo};
-use crate::message::{ContentBlock, Message, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec};
+use crate::message::{
+    ContentBlock, Message, ProviderResponse, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
+};
 use crate::provider::{LlmProvider, ProviderError};
 use crate::reporter::{NoopReporter, Reporter};
 use crate::tool::{Tool, ToolContext, ToolExecOutcome, spec};
@@ -15,6 +18,12 @@ const TOKEN_COMPACT_THRESHOLD: u32 = 100_000;
 
 /// Harder fallback used once the provider itself rejects a request as too big.
 const EMERGENCY_KEEP_RECENT: usize = 20;
+
+/// How many times a transient provider error (rate limit, 5xx, transport) is
+/// retried before giving up -- unattended runs shouldn't die on one blip.
+const MAX_TRANSIENT_RETRIES: usize = 5;
+const BASE_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Calls to this tool run concurrently with each other (subagent
 /// delegations share no state); every other tool stays sequential.
@@ -85,10 +94,7 @@ impl AgentSession {
             let outgoing = self.run_context_hook().await?;
             let tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| spec(t.as_ref())).collect();
             self.reporter.on_turn_start().await;
-            let mut result = self
-                .provider
-                .complete(&outgoing, &tool_specs, Some(&self.system_prompt))
-                .await;
+            let mut result = self.complete_with_retries(&outgoing, &tool_specs).await;
 
             // Provider rejected the request as too large: compact harder and retry once.
             if let Err(err) = &result
@@ -97,10 +103,7 @@ impl AgentSession {
             {
                 self.force_compact().await?;
                 let retry_outgoing = self.run_context_hook().await?;
-                result = self
-                    .provider
-                    .complete(&retry_outgoing, &tool_specs, Some(&self.system_prompt))
-                    .await;
+                result = self.complete_with_retries(&retry_outgoing, &tool_specs).await;
             }
             self.reporter.on_turn_end().await;
             let response = result?;
@@ -167,6 +170,34 @@ impl AgentSession {
                 .map(|r| r.expect("every tool_calls index is filled by one of the two loops above"))
                 .collect();
             self.messages.push(Message::tool_results(results));
+        }
+    }
+
+    /// Calls the provider, retrying transient failures (rate limit, 5xx,
+    /// transport) with backoff instead of surfacing them immediately --
+    /// an unattended run shouldn't die on one blip.
+    async fn complete_with_retries(
+        &self,
+        messages: &[Message],
+        tool_specs: &[ToolSpec],
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut attempt = 0usize;
+        loop {
+            let result = self
+                .provider
+                .complete(messages, tool_specs, Some(&self.system_prompt))
+                .await;
+            match &result {
+                Err(err) if is_transient_error(err) && attempt < MAX_TRANSIENT_RETRIES => {
+                    let delay = backoff_delay(attempt, err);
+                    self.reporter
+                        .on_retry(attempt + 1, MAX_TRANSIENT_RETRIES, delay, &err.to_string())
+                        .await;
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                _ => return result,
+            }
         }
     }
 
@@ -317,7 +348,10 @@ fn unknown_tool_message(name: &str, tools: &[Arc<dyn Tool>]) -> String {
 
     match suggestion {
         Some(candidate) => {
-            format!("Unknown tool '{name}'. Did you mean '{candidate}'? Available tools: {}", available.join(", "))
+            format!(
+                "Unknown tool '{name}'. Did you mean '{candidate}'? Available tools: {}",
+                available.join(", ")
+            )
         }
         None => format!("Unknown tool '{name}'. Available tools: {}", available.join(", ")),
     }
@@ -359,6 +393,33 @@ fn is_context_length_error(err: &ProviderError) -> bool {
     ];
     let body = body.to_lowercase();
     NEEDLES.iter().any(|needle| body.contains(needle))
+}
+
+/// True for provider errors worth retrying: rate limits, 5xx, and transport
+/// (network) failures. Anything else (bad request, malformed response) is a
+/// permanent failure that retrying can't fix.
+fn is_transient_error(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::RateLimited { .. } | ProviderError::Transport(_) => true,
+        ProviderError::Api { status, .. } => *status >= 500,
+        ProviderError::Deserialize(_) => false,
+    }
+}
+
+/// Exponential backoff (base 2s, capped at 60s), except a rate limit with an
+/// explicit `retry_after_secs` is honored as-is.
+fn backoff_delay(attempt: usize, err: &ProviderError) -> Duration {
+    if let ProviderError::RateLimited {
+        retry_after_secs: Some(secs),
+    } = err
+    {
+        return Duration::from_secs(*secs);
+    }
+    let secs = BASE_BACKOFF
+        .as_secs()
+        .saturating_mul(1u64 << attempt.min(5))
+        .min(MAX_BACKOFF.as_secs());
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -658,7 +719,9 @@ mod tests {
 
     #[tokio::test]
     async fn context_length_error_triggers_compaction_and_retry() {
-        let provider = FlakyThenOkProvider { calls: StdMutex::new(0) };
+        let provider = FlakyThenOkProvider {
+            calls: StdMutex::new(0),
+        };
         let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
         let seed: Vec<Message> = (0..25).map(|i| Message::user_text(format!("msg {i}"))).collect();
         session.restore("test".to_string(), seed);
@@ -670,6 +733,91 @@ mod tests {
         }
         // 25 seeded + 1 user = 26, compacted to EMERGENCY_KEEP_RECENT (20), + 1 assistant reply.
         assert_eq!(session.messages().len(), EMERGENCY_KEEP_RECENT + 1);
+    }
+
+    #[test]
+    fn transient_errors_are_classified_correctly() {
+        assert!(is_transient_error(&ProviderError::RateLimited {
+            retry_after_secs: None
+        }));
+        assert!(is_transient_error(&ProviderError::Transport("boom".to_string())));
+        assert!(is_transient_error(&ProviderError::Api {
+            status: 503,
+            body: String::new()
+        }));
+        assert!(!is_transient_error(&ProviderError::Api {
+            status: 400,
+            body: "bad request".to_string()
+        }));
+        assert!(!is_transient_error(&ProviderError::Deserialize("oops".to_string())));
+    }
+
+    #[test]
+    fn backoff_honors_retry_after_and_otherwise_grows_exponentially_up_to_a_cap() {
+        let rate_limited = ProviderError::RateLimited {
+            retry_after_secs: Some(7),
+        };
+        assert_eq!(backoff_delay(0, &rate_limited), Duration::from_secs(7));
+
+        let transport = ProviderError::Transport("x".to_string());
+        assert_eq!(backoff_delay(0, &transport), Duration::from_secs(2));
+        assert_eq!(backoff_delay(1, &transport), Duration::from_secs(4));
+        assert_eq!(backoff_delay(10, &transport), Duration::from_secs(60));
+    }
+
+    struct TransientThenOkProvider {
+        calls: StdMutex<usize>,
+        fail_times: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TransientThenOkProvider {
+        fn id(&self) -> &'static str {
+            "transient"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls <= self.fail_times {
+                Err(ProviderError::RateLimited {
+                    retry_after_secs: Some(1),
+                })
+            } else {
+                Ok(text_response("recovered"))
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_errors_are_retried_until_success() {
+        let provider = TransientThenOkProvider {
+            calls: StdMutex::new(0),
+            fail_times: 3,
+        };
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
+
+        let final_message = session.run_turn("go").await.unwrap();
+        match &final_message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "recovered"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausting_transient_retries_surfaces_the_error() {
+        let provider = TransientThenOkProvider {
+            calls: StdMutex::new(0),
+            fail_times: MAX_TRANSIENT_RETRIES + 1,
+        };
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
+
+        let err = session.run_turn("go").await.unwrap_err();
+        assert!(matches!(err, AgentError::Provider(ProviderError::RateLimited { .. })));
     }
 
     #[tokio::test]

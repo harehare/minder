@@ -1,3 +1,4 @@
+mod file_reporter;
 mod loop_mode;
 mod markdown;
 mod provider_select;
@@ -8,7 +9,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use minder_core::{AgentSession, HookPort, Tool, ToolContext};
+use minder_core::{AgentSession, HookPort, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
     AgentTool, BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool,
@@ -16,6 +17,7 @@ use minder_tools::{
     WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
 };
 
+use file_reporter::{CompositeReporter, FileReporter};
 use provider_select::select_provider;
 use reporter::TerminalReporter;
 use session_store::SessionRecord;
@@ -124,7 +126,20 @@ async fn build_session() -> AgentSession {
         }
     }
 
-    let reporter = Arc::new(TerminalReporter::new(hooks.clone()));
+    let terminal_reporter: Arc<dyn Reporter> = Arc::new(TerminalReporter::new(hooks.clone()));
+    let reporter: Arc<dyn Reporter> = match std::env::var("MINDER_LOG_FILE") {
+        Ok(path) => match FileReporter::new(Path::new(&path)) {
+            Ok(file_reporter) => {
+                eprintln!("logging to {path}");
+                Arc::new(CompositeReporter::new(vec![terminal_reporter, Arc::new(file_reporter)]))
+            }
+            Err(e) => {
+                eprintln!("failed to open log file {path}: {e}");
+                terminal_reporter
+            }
+        },
+        Err(_) => terminal_reporter,
+    };
 
     // Builtins first; user-defined agents override by name.
     let mut subagents = builtin_subagents();
@@ -175,7 +190,9 @@ fn parse_args(args: &[String]) -> Command {
             None => Command::Usage,
         },
         Some("chat") => Command::Chat,
-        Some("--continue") | Some("-c") => Command::Continue { task: args.get(1).cloned() },
+        Some("--continue") | Some("-c") => Command::Continue {
+            task: args.get(1).cloned(),
+        },
         Some("--resume") | Some("-r") => match args.get(1) {
             Some(id) => Command::Resume {
                 id: id.clone(),
@@ -307,9 +324,45 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
     }
 }
 
+/// `minder loop <file>` is keyed by `file`'s canonical path (not a random
+/// id) so re-running the same command after a crash, Ctrl-C, or a container
+/// restart resumes the same conversation automatically -- see
+/// `session_store::key_for_path`.
 async fn run_loop_mode(file: &Path, task_hint: Option<&str>) {
+    let dir = working_dir();
     let mut session = build_session().await;
-    if let Err(e) = loop_mode::run(&mut session, file, task_hint, loop_mode::LoopOptions::default()).await {
+
+    let key = session_store::key_for_path(file);
+    let mut record = match session_store::load_by_id(&dir, &key) {
+        Ok(Some(record)) => {
+            session.restore(record.system_prompt.clone(), record.messages.clone());
+            eprintln!(
+                "resuming loop session for {} ({} prior message(s))",
+                file.display(),
+                record.messages.len()
+            );
+            record
+        }
+        Ok(None) => SessionRecord::with_id(key),
+        Err(e) => {
+            eprintln!("warning: failed to load prior loop session: {e}");
+            SessionRecord::with_id(key)
+        }
+    };
+
+    let result = loop_mode::run(
+        &mut session,
+        file,
+        task_hint,
+        loop_mode::LoopOptions::default(),
+        |session| {
+            persist(&dir, &mut record, session);
+        },
+    )
+    .await;
+    persist(&dir, &mut record, &session);
+
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

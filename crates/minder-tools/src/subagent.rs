@@ -468,7 +468,11 @@ mod tests {
         // result now comes back to the model as a normal (error) tool result
         // instead of aborting the turn, so it gets a chance to recover.
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider(StdMutex::new(
-            vec![tool_use_response("call_1", "agent"), text_response("gave up on 'agent'")].into(),
+            vec![
+                tool_use_response("call_1", "agent"),
+                text_response("gave up on 'agent'"),
+            ]
+            .into(),
         )));
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecursionProbeTool(call_count.clone()))];

@@ -73,7 +73,12 @@ impl TerminalReporter {
                     }
                     state.frame = (state.frame + 1) % SPINNER_FRAMES.len();
                     let frame = SPINNER_FRAMES[state.frame];
-                    let elapsed = state.labels.values().map(|(_, t)| t.elapsed()).max().unwrap_or_default();
+                    let elapsed = state
+                        .labels
+                        .values()
+                        .map(|(_, t)| t.elapsed())
+                        .max()
+                        .unwrap_or_default();
                     let mut names: Vec<&str> = state.labels.values().map(|(l, _)| l.as_str()).collect();
                     names.sort_unstable();
                     eprint!(
@@ -211,7 +216,11 @@ impl TerminalReporter {
         if !self.interactive {
             return;
         }
-        self.spinner.lock().await.labels.insert(key.to_string(), (label, Instant::now()));
+        self.spinner
+            .lock()
+            .await
+            .labels
+            .insert(key.to_string(), (label, Instant::now()));
     }
 
     /// Clears a spinner label, returning how long it was active.
@@ -287,6 +296,17 @@ impl Reporter for TerminalReporter {
             }
         }
     }
+
+    async fn on_retry(&self, attempt: usize, max_attempts: usize, delay: Duration, reason: &str) {
+        let line = self.paint(
+            YELLOW,
+            &format!(
+                "retrying in {:.0}s (attempt {attempt}/{max_attempts}): {reason}",
+                delay.as_secs_f32()
+            ),
+        );
+        self.print_guarded(|| eprintln!("{line}")).await;
+    }
 }
 
 /// Picks out the argument most useful for a one-line "what is this tool call
@@ -302,7 +322,7 @@ fn summarize_args(args: &serde_json::Value) -> String {
     truncate(&args.to_string(), 100)
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     let mut truncated: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars {
         truncated.push_str("...");

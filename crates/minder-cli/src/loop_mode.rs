@@ -107,11 +107,16 @@ fn build_prompt(path: &Path, task_hint: Option<&str>, remaining: &[String]) -> S
 /// decreasing for too many consecutive working iterations), or hitting
 /// `max_iterations` worth of actual (non-idle) turns -- polling while idle
 /// doesn't count against that budget.
+///
+/// `on_turn` fires after every completed turn (not just at the end), so a
+/// caller can persist the session incrementally -- a Ctrl-C or crash mid-loop
+/// then loses at most the in-flight turn, not the whole run's history.
 pub async fn run(
     session: &mut AgentSession,
     path: &Path,
     task_hint: Option<&str>,
     opts: LoopOptions,
+    mut on_turn: impl FnMut(&AgentSession),
 ) -> Result<(), LoopError> {
     let mut previous_count: Option<usize> = None;
     let mut consecutive_stalls = 0;
@@ -161,6 +166,7 @@ pub async fn run(
 
         let prompt = build_prompt(path, task_hint, &remaining);
         session.run_turn(&prompt).await?;
+        on_turn(session);
     }
 }
 
@@ -217,5 +223,126 @@ mod tests {
         assert!(prompt.contains("- [ ] a"));
         assert!(prompt.contains("TODO.md"));
         assert!(prompt.contains("- [x]"));
+    }
+
+    use minder_core::{
+        ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, Tool, ToolCall,
+        ToolContext, ToolExecOutcome, ToolSpec, Usage,
+    };
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Scripted provider: one tool_use call that "finishes" the checklist
+    /// item, then a plain text reply -- exactly one working `run_turn`.
+    struct OneShotFinishProvider(StdMutex<std::collections::VecDeque<ProviderResponse>>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OneShotFinishProvider {
+        fn id(&self) -> &'static str {
+            "scripted"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Ok(self.0.lock().unwrap().pop_front().expect("script exhausted"))
+        }
+    }
+
+    fn tool_use_response(path: &Path) -> ProviderResponse {
+        ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse(ToolCall {
+                    id: "1".to_string(),
+                    name: "finish".to_string(),
+                    arguments: serde_json::json!({"path": path.to_string_lossy()}),
+                })],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    }
+
+    fn text_response(text: &str) -> ProviderResponse {
+        ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text(text.to_string())],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    /// Rewrites the checklist file to all-checked, simulating what a real
+    /// `edit_file` tool call would do once the model finishes the item.
+    struct FinishTool;
+
+    #[async_trait::async_trait]
+    impl Tool for FinishTool {
+        fn name(&self) -> &str {
+            "finish"
+        }
+        fn description(&self) -> &str {
+            "test-only: checks off every item in the given checklist file"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        async fn execute(&self, arguments: serde_json::Value, _ctx: &ToolContext) -> ToolExecOutcome {
+            let path = arguments["path"].as_str().unwrap();
+            std::fs::write(path, "- [x] task one\n").unwrap();
+            ToolExecOutcome {
+                content: "checked off".to_string(),
+                is_error: false,
+                metadata: serde_json::Value::Null,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_turn_fires_once_per_completed_turn_then_the_loop_idles() {
+        let path = temp_md("- [ ] task one\n");
+        let provider = OneShotFinishProvider(StdMutex::new(
+            vec![tool_use_response(&path), text_response("done")].into(),
+        ));
+        let tool_ctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "test".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let mut session = minder_core::AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(FinishTool)],
+            None,
+            "you are a test agent",
+            tool_ctx,
+        );
+
+        let turn_count = Arc::new(StdMutex::new(0usize));
+        let opts = LoopOptions {
+            max_iterations: 5,
+            query: DEFAULT_QUERY.to_string(),
+            poll_interval: Duration::from_millis(10),
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_millis(500), {
+            let turn_count = turn_count.clone();
+            run(&mut session, &path, None, opts, move |_session| {
+                *turn_count.lock().unwrap() += 1;
+            })
+        })
+        .await;
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            outcome.is_err(),
+            "expected the idle-poll branch to still be running at the timeout"
+        );
+        assert_eq!(*turn_count.lock().unwrap(), 1);
     }
 }

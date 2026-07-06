@@ -484,9 +484,17 @@ def on_tool_call(call):
         std::fs::create_dir_all(&agent_dir).unwrap();
         let mut engine = HookEngine::load(&agent_dir).unwrap();
 
-        for path in [".env", "packages/app/.env.local", "node_modules/foo/index.js", ".git/config"] {
+        for path in [
+            ".env",
+            "packages/app/.env.local",
+            "node_modules/foo/index.js",
+            ".git/config",
+        ] {
             let decision = engine.on_tool_call(&read_call("1", path)).await;
-            assert!(matches!(decision, ToolCallDecision::Block(_)), "expected block for {path}");
+            assert!(
+                matches!(decision, ToolCallDecision::Block(_)),
+                "expected block for {path}"
+            );
         }
 
         let decision = engine.on_tool_call(&read_call("2", "src/main.rs")).await;

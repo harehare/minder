@@ -604,6 +604,24 @@ Safety limits keep a stuck agent from spinning forever, all overridable via env 
 If the unchecked count doesn't drop for two consecutive working iterations, the loop stops with an
 error rather than burning turns on a task the model isn't making progress on.
 
+### Resilience for unattended runs
+
+Since a loop is meant to run with nobody watching, minder guards against the ways an unattended
+process actually dies:
+
+- **Transient provider errors don't end the run.** Rate limits, 5xx responses, and network blips
+  are retried with backoff (honoring the provider's `Retry-After` when it sends one) before ever
+  reaching your prompt or the checklist logic — a multi-hour loop survives the kind of hiccup that
+  used to kill the whole process on turn one.
+- **The session survives a restart.** `minder loop <file>` keys its session by `<file>`'s canonical
+  path and saves after every turn (see [Quick start](#quick-start)), so re-running the exact same
+  command after a crash, a Ctrl-C, or a container restart resumes the conversation instead of
+  starting over — at most the in-flight turn is lost.
+- **A durable log, even off-terminal.** Set `MINDER_LOG_FILE=path/to/log` to also append every
+  turn/tool-call/tool-result/retry as a plain-text line to that file, independent of the terminal —
+  useful for a loop launched under `nohup`, `tmux`, or systemd, where stderr isn't being watched
+  live.
+
 ## Project layout
 
 | Crate | Responsibility |

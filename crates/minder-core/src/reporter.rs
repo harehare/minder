@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::message::ToolCall;
 use crate::tool::ToolExecOutcome;
 
@@ -21,6 +23,8 @@ pub trait Reporter: Send + Sync {
     async fn on_tool_call(&self, _call: &ToolCall) {}
     /// Fired just after a tool call finishes (post-hook-transform).
     async fn on_tool_result(&self, _call: &ToolCall, _outcome: &ToolExecOutcome) {}
+    /// Fired before sleeping to retry a transient provider error.
+    async fn on_retry(&self, _attempt: usize, _max_attempts: usize, _delay: Duration, _reason: &str) {}
 }
 
 /// Default reporter: observes nothing, prints nothing.

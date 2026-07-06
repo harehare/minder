@@ -25,9 +25,16 @@ impl SessionRecord {
     /// `system_prompt`/`messages` start empty and are filled in by the
     /// first `save` call, once the session has actually run.
     pub fn new() -> Self {
+        Self::with_id(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Like `new`, but with a caller-chosen id -- e.g. `minder loop`'s
+    /// deterministic id (see `key_for_path`) so re-running the same
+    /// checklist always resumes the same session file.
+    pub fn with_id(id: String) -> Self {
         let now = unix_now();
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             created_at: now,
             updated_at: now,
             system_prompt: String::new(),
@@ -37,8 +44,30 @@ impl SessionRecord {
     }
 }
 
+/// A stable, filesystem-safe session id derived from a file's canonical
+/// path -- lets `minder loop <file>` resume the same session across
+/// process restarts without the caller having to track a session id.
+pub fn key_for_path(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let sanitized: String = canonical
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("loop-{sanitized}")
+}
+
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn sessions_dir(working_dir: &Path) -> PathBuf {
@@ -109,7 +138,11 @@ pub fn load_by_id(working_dir: &Path, id: &str) -> io::Result<Option<SessionReco
 
     let mut matches: Vec<PathBuf> = json_files(working_dir)?
         .into_iter()
-        .filter(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with(id)))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with(id))
+        })
         .collect();
     match matches.len() {
         0 => Ok(None),
@@ -193,5 +226,32 @@ mod tests {
     fn load_by_id_returns_none_when_missing() {
         let dir = scratch_dir();
         assert!(load_by_id(&dir, "does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn key_for_path_is_stable_and_distinguishes_different_paths() {
+        let dir = scratch_dir();
+        let a = dir.join("TODO.md");
+        let b = dir.join("OTHER.md");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+
+        assert_eq!(key_for_path(&a), key_for_path(&a));
+        assert_ne!(key_for_path(&a), key_for_path(&b));
+    }
+
+    #[test]
+    fn loop_session_round_trips_by_its_deterministic_key() {
+        let dir = scratch_dir();
+        let checklist = dir.join("TODO.md");
+        std::fs::write(&checklist, "- [ ] a\n").unwrap();
+
+        let key = key_for_path(&checklist);
+        let mut record = SessionRecord::with_id(key.clone());
+        record.messages = vec![Message::user_text("work on it")];
+        save(&dir, &mut record).unwrap();
+
+        let loaded = load_by_id(&dir, &key).unwrap().unwrap();
+        assert_eq!(loaded.id, key);
     }
 }
