@@ -21,7 +21,7 @@ use rustyline::error::ReadlineError;
 
 use file_reporter::{CompositeReporter, FileReporter};
 use provider_select::select_provider;
-use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter};
+use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter, YELLOW};
 use session_store::SessionRecord;
 
 const SYSTEM_PROMPT: &str = "\
@@ -305,24 +305,66 @@ async fn run_resume(id: Option<String>, task: Option<String>) {
     }
 }
 
-/// Builds the REPL's input prompt, e.g. `minder ❯ `, so a turn boundary
-/// reads clearly rather than a bare `> `. Colored only when stdout is a tty
-/// and `NO_COLOR` isn't set -- stdout because rustyline renders the prompt
-/// there, not stderr.
-fn repl_prompt() -> String {
-    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-        format!("{BOLD}{CYAN}minder{RESET} {CYAN}❯{RESET} ")
+/// Interior width of the input box (including the border characters).
+const BOX_WIDTH: usize = 64;
+
+/// Both the prompt and its surrounding box print to stdout (rustyline
+/// renders the prompt there, not stderr), so they need the same color
+/// decision or the border and the `❯` would disagree about `NO_COLOR`.
+fn color_enabled(stream_is_tty: bool) -> bool {
+    stream_is_tty && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn box_border(left: char, right: char, color: bool) -> String {
+    let rule = "─".repeat(BOX_WIDTH - 2);
+    if color {
+        format!("{DIM}{left}{rule}{right}{RESET}")
     } else {
-        "minder> ".to_string()
+        format!("{left}{rule}{right}")
+    }
+}
+
+/// Builds the REPL's input prompt: a boxed `❯ ` so a turn boundary reads as
+/// its own input area rather than a bare `> `. Only the left border lives in
+/// the prompt string itself -- rustyline owns everything after it, so the
+/// box can't close on the right without redrawing on every keystroke; see
+/// `run_repl` for the top/bottom rules drawn around it.
+fn repl_prompt(color: bool) -> String {
+    if color {
+        format!("{DIM}│{RESET} {BOLD}{CYAN}❯{RESET} ")
+    } else {
+        "| > ".to_string()
+    }
+}
+
+/// The line above each turn's input box: provider/model and working
+/// directory, so that context stays visible without repeating the full
+/// startup banner every turn.
+fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
+    let text = format!("{} · {}", session.provider_id(), dir.display());
+    if color { format!("{DIM}{text}{RESET}") } else { text }
+}
+
+/// The line below each turn's input box: the same keyboard shortcuts every
+/// time, so they're always one glance away instead of scrolled off after
+/// the first turn.
+fn hint_line(color: bool) -> String {
+    let text = "Ctrl-C cancel input · Ctrl-D or 'exit'/'quit' to leave";
+    if color {
+        format!("{DIM}{text}{RESET}")
+    } else {
+        text.to_string()
     }
 }
 
 /// Short "it's alive" banner shown once when a REPL starts, so launching
-/// `minder` feels intentional rather than dropping silently to a bare `> `.
-/// Colored only when stderr is a tty and `NO_COLOR` isn't set, matching
-/// `TerminalReporter`'s own rule.
+/// `minder` feels intentional rather than dropping silently into a bare
+/// prompt. The mark is a plain glyph, not a figlet wordmark -- it needs to
+/// render identically whether or not the terminal's font covers box-drawing
+/// or emoji beyond basic Unicode. Colored only when stderr is a tty and
+/// `NO_COLOR` isn't set, matching `TerminalReporter`'s own rule.
 fn print_banner(session: &AgentSession, record: &SessionRecord) {
-    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let color = color_enabled(std::io::stderr().is_terminal());
     let paint = |code: &str, text: &str| {
         if color {
             format!("{code}{text}{RESET}")
@@ -338,16 +380,23 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
         format!("resumed, {} prior message(s)", record.messages.len())
     };
 
+    // Three ◆ arranged as a diamond outline (top/left-right/bottom points)
+    // rather than one lone glyph -- a single character can't get visually
+    // bigger in a terminal (font size is fixed), so this fakes scale by
+    // spreading it across a few rows instead, the same trick figlet-style
+    // banners use.
+    let accent = format!("{YELLOW}{BOLD}");
     eprintln!();
+    eprintln!("  {}   {}", paint(&accent, " ◆ "), paint(BOLD, &format!("v{version}")));
     eprintln!(
-        "{} {}",
-        paint(BOLD, &format!("minder v{version}")),
-        paint(DIM, &format!("({} · {status})", session.provider_id()))
+        "  {}   {}",
+        paint(&accent, "◆ ◆"),
+        paint(DIM, &format!("{} · {status}", session.provider_id()))
     );
-    eprintln!("{}", paint(DIM, &working_dir().display().to_string()));
     eprintln!(
-        "{}",
-        paint(DIM, "'exit'/'quit' or Ctrl-D to leave, Ctrl-C to cancel input")
+        "  {}   {}",
+        paint(&accent, " ◆ "),
+        paint(DIM, &working_dir().display().to_string())
     );
     eprintln!();
 }
@@ -375,18 +424,31 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
         let _ = editor.load_history(path);
     }
 
-    let prompt = repl_prompt();
+    // Decided once (a terminal doesn't change tty-ness mid-session) and
+    // shared by every box/status/hint line drawn below, so they never
+    // disagree with the prompt itself about `NO_COLOR`.
+    let color = color_enabled(std::io::stdout().is_terminal());
+    let prompt = repl_prompt(color);
 
     loop {
+        println!("{}", status_line(session, dir, color));
+        println!("{}", box_border('╭', '╮', color));
+
         let line = match editor.readline(&prompt) {
             Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Interrupted) => {
+                println!("{}", box_border('╰', '╯', color));
+                continue;
+            }
             Err(ReadlineError::Eof) => break,
             Err(e) => {
                 eprintln!("error: {e}");
                 break;
             }
         };
+        println!("{}", box_border('╰', '╯', color));
+        println!("{}", hint_line(color));
+        println!();
 
         let line = line.trim();
         if line.is_empty() {
@@ -405,6 +467,7 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
             eprintln!("error: {e}");
         }
         persist(dir, record, session);
+        println!();
     }
 }
 

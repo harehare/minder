@@ -12,7 +12,7 @@ pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
 pub(crate) const CYAN: &str = "\x1b[36m";
 
 const RESULT_PREVIEW_CHARS: usize = 300;
