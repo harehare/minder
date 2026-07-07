@@ -24,8 +24,16 @@ use provider_select::select_provider;
 use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter};
 use session_store::SessionRecord;
 
-const SYSTEM_PROMPT: &str =
-    "You are a careful coding assistant. Use the available tools to inspect and run code before answering.";
+const SYSTEM_PROMPT: &str = "\
+You are minder, a coding agent working in a git repository via tool calls. Investigate with \
+`read_file`/`grep`/`glob`/`git_log`/`git_diff` before answering or editing -- read a file before \
+editing it, prefer `edit_file` over `write_file` for existing files, and verify a change with \
+`git_diff`/tests before calling it done.
+
+Delegate self-contained work to `agent`, and check `skill` for a matching project skill before \
+improvising. Only commit, push, or run other state-changing git/bash commands when asked.
+
+Keep replies short and grounded in what the tools actually returned.";
 
 const USAGE: &str = "usage:\n  \
     minder                           start an interactive session ('exit'/'quit' or Ctrl-D to leave)\n  \
