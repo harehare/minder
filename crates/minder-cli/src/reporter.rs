@@ -13,7 +13,7 @@ pub(crate) const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
+pub(crate) const CYAN: &str = "\x1b[36m";
 
 const RESULT_PREVIEW_CHARS: usize = 300;
 const MAX_DIFF_LINES: usize = 40;

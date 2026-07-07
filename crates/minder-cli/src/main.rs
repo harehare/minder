@@ -21,7 +21,7 @@ use rustyline::error::ReadlineError;
 
 use file_reporter::{CompositeReporter, FileReporter};
 use provider_select::select_provider;
-use reporter::{BOLD, DIM, RESET, TerminalReporter};
+use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter};
 use session_store::SessionRecord;
 
 const SYSTEM_PROMPT: &str =
@@ -297,6 +297,18 @@ async fn run_resume(id: Option<String>, task: Option<String>) {
     }
 }
 
+/// Builds the REPL's input prompt, e.g. `minder ❯ `, so a turn boundary
+/// reads clearly rather than a bare `> `. Colored only when stdout is a tty
+/// and `NO_COLOR` isn't set -- stdout because rustyline renders the prompt
+/// there, not stderr.
+fn repl_prompt() -> String {
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        format!("{BOLD}{CYAN}minder{RESET} {CYAN}❯{RESET} ")
+    } else {
+        "minder> ".to_string()
+    }
+}
+
 /// Short "it's alive" banner shown once when a REPL starts, so launching
 /// `minder` feels intentional rather than dropping silently to a bare `> `.
 /// Colored only when stderr is a tty and `NO_COLOR` isn't set, matching
@@ -355,8 +367,10 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
         let _ = editor.load_history(path);
     }
 
+    let prompt = repl_prompt();
+
     loop {
-        let line = match editor.readline("> ") {
+        let line = match editor.readline(&prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => break,
