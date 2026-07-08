@@ -30,6 +30,8 @@ mq-lang = { version = "0.6", default-features = false, features = ["std", "sync"
 mq-markdown.workspace = true
 two-face.workspace = true
 rustyline.workspace = true
+clap = { workspace = true }
+terminal_size = { workspace = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
