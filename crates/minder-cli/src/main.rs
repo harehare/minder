@@ -323,8 +323,23 @@ async fn run_resume(id: Option<String>, task: Option<String>) {
     }
 }
 
-/// Interior width of the input box (including the border characters).
-const BOX_WIDTH: usize = 64;
+/// Width used for the input box when the terminal's own width can't be
+/// determined (not a tty, e.g. output piped to a file).
+const FALLBACK_BOX_WIDTH: usize = 64;
+
+/// Floor on the box width so a slim terminal (or a bogus 0-width report)
+/// doesn't collapse the border into something unreadable.
+const MIN_BOX_WIDTH: usize = 20;
+
+/// Total width of the input box (including the border characters), matched
+/// to the terminal's current column count so the border spans the full
+/// width instead of a fixed size. Queried fresh on every draw rather than
+/// cached, so a mid-session terminal resize is picked up on the next turn.
+fn box_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(terminal_size::Width(w), _)| (w as usize).max(MIN_BOX_WIDTH))
+        .unwrap_or(FALLBACK_BOX_WIDTH)
+}
 
 /// Both the prompt and its surrounding box print to stdout (rustyline
 /// renders the prompt there, not stderr), so they need the same color
@@ -334,7 +349,7 @@ fn color_enabled(stream_is_tty: bool) -> bool {
 }
 
 fn box_border(left: char, right: char, color: bool) -> String {
-    let rule = "─".repeat(BOX_WIDTH - 2);
+    let rule = "─".repeat(box_width() - 2);
     if color {
         format!("{DIM}{left}{rule}{right}{RESET}")
     } else {
