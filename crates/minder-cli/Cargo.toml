@@ -26,6 +26,7 @@ minder-tools-wasm.workspace = true
 minder-tools-mcp = { workspace = true, optional = true }
 minder-hooks.workspace = true
 async-trait.workspace = true
+clap.workspace = true
 mq-lang = { version = "0.6", default-features = false, features = ["std", "sync", "file-io"] }
 mq-markdown.workspace = true
 two-face.workspace = true

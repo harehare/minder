@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use minder_core::{AgentSession, HookPort, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
@@ -35,16 +36,45 @@ improvising. Only commit, push, or run other state-changing git/bash commands wh
 
 Keep replies short and grounded in what the tools actually returned.";
 
-const USAGE: &str = "usage:\n  \
-    minder                           start an interactive session ('exit'/'quit' or Ctrl-D to leave)\n  \
-    minder \"<task>\"                  run a single task to completion (session saved for --continue)\n  \
-    minder --continue|-c [\"<task>\"]  resume the most recent session in this project\n  \
-    minder --resume|-r <id> [\"<task>\"] resume a specific session by id (or unambiguous prefix)\n  \
-    minder chat                     same as running with no arguments\n  \
-    minder loop <file.md> [\"<task>\"] work through the file's unchecked checklist items, then \
-    keep polling it for new ones (mq-lang embedded, see README) -- runs until stopped (Ctrl-C) \
-    or a safety limit is hit\n  \
-    (with no <task>, --continue/--resume drop into an interactive session too)";
+/// Multi-provider coding-agent CLI.
+///
+/// Run with no arguments to start an interactive session ('exit'/'quit' or
+/// Ctrl-D to leave). Pass a task string to run it to completion (the session
+/// is saved for --continue). With no <task>, --continue/--resume drop into
+/// an interactive session too.
+#[derive(Parser)]
+#[command(name = "minder", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    /// Resume the most recent session in this project
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    r#continue: bool,
+
+    /// Resume a specific session by id (or unambiguous prefix)
+    #[arg(short = 'r', long = "resume", value_name = "ID")]
+    resume: Option<String>,
+
+    /// Task to run to completion; with --continue/--resume, the task fed
+    /// into the resumed session
+    task: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Same as running with no arguments
+    Chat,
+    /// Work through the file's unchecked checklist items, then keep polling
+    /// it for new ones (mq-lang embedded, see README) -- runs until stopped
+    /// (Ctrl-C) or a safety limit is hit
+    Loop {
+        /// Markdown checklist file to work through
+        file: PathBuf,
+        /// Optional task hint guiding the first pass over the checklist
+        task_hint: Option<String>,
+    },
+}
 
 /// Builds the tool/hook/skill/plugin-wired session shared by both the
 /// one-shot and `loop` entry points -- only the prompt(s) fed into
@@ -188,48 +218,36 @@ enum Command {
     Resume { id: String, task: Option<String> },
     Chat,
     Loop { file: PathBuf, task_hint: Option<String> },
-    Usage,
 }
 
-fn parse_args(args: &[String]) -> Command {
-    match args.first().map(String::as_str) {
-        Some("loop") => match args.get(1) {
-            Some(file) => Command::Loop {
-                file: PathBuf::from(file),
-                task_hint: args.get(2).cloned(),
-            },
-            None => Command::Usage,
-        },
-        Some("chat") => Command::Chat,
-        Some("--continue") | Some("-c") => Command::Continue {
-            task: args.get(1).cloned(),
-        },
-        Some("--resume") | Some("-r") => match args.get(1) {
-            Some(id) => Command::Resume {
-                id: id.clone(),
-                task: args.get(2).cloned(),
-            },
-            None => Command::Usage,
-        },
-        Some(task) => Command::OneShot { task: task.to_string() },
-        None => Command::Chat,
+impl From<Cli> for Command {
+    fn from(cli: Cli) -> Self {
+        match cli.command {
+            Some(CliCommand::Chat) => return Command::Chat,
+            Some(CliCommand::Loop { file, task_hint }) => return Command::Loop { file, task_hint },
+            None => {}
+        }
+        if let Some(id) = cli.resume {
+            return Command::Resume { id, task: cli.task };
+        }
+        if cli.r#continue {
+            return Command::Continue { task: cli.task };
+        }
+        match cli.task {
+            Some(task) => Command::OneShot { task },
+            None => Command::Chat,
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    match parse_args(&args) {
+    match Command::from(Cli::parse()) {
         Command::OneShot { task } => run_one_shot(&task).await,
         Command::Continue { task } => run_resume(None, task).await,
         Command::Resume { id, task } => run_resume(Some(id), task).await,
         Command::Chat => run_chat().await,
         Command::Loop { file, task_hint } => run_loop_mode(&file, task_hint.as_deref()).await,
-        Command::Usage => {
-            eprintln!("{USAGE}");
-            std::process::exit(1);
-        }
     }
 }
 
