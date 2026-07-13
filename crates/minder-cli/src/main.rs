@@ -323,54 +323,56 @@ async fn run_resume(id: Option<String>, task: Option<String>) {
     }
 }
 
-/// Width used for the input box when the terminal's own width can't be
+/// Width used for the rule line when the terminal's own width can't be
 /// determined (not a tty, e.g. output piped to a file).
-const FALLBACK_BOX_WIDTH: usize = 64;
+const FALLBACK_RULE_WIDTH: usize = 64;
 
-/// Floor on the box width so a slim terminal (or a bogus 0-width report)
-/// doesn't collapse the border into something unreadable.
-const MIN_BOX_WIDTH: usize = 20;
+/// Floor on the rule width so a slim terminal (or a bogus 0-width report)
+/// doesn't collapse it into something unreadable.
+const MIN_RULE_WIDTH: usize = 20;
 
-/// Total width of the input box (including the border characters), matched
-/// to the terminal's current column count so the border spans the full
-/// width instead of a fixed size. Queried fresh on every draw rather than
-/// cached, so a mid-session terminal resize is picked up on the next turn.
-fn box_width() -> usize {
+/// Width of the rule line drawn above/below the input, matched to the
+/// terminal's current column count so it spans (almost) the full width.
+/// Kept one column short of the terminal's actual width -- filling every
+/// column triggers auto-wrap on many terminals, which pushed the closing
+/// rule off screen instead of onto its own line. Queried fresh on every
+/// draw rather than cached, so a mid-session terminal resize is picked up
+/// on the next turn.
+fn rule_width() -> usize {
     terminal_size::terminal_size()
-        .map(|(terminal_size::Width(w), _)| (w as usize).max(MIN_BOX_WIDTH))
-        .unwrap_or(FALLBACK_BOX_WIDTH)
+        .map(|(terminal_size::Width(w), _)| (w as usize).saturating_sub(1).max(MIN_RULE_WIDTH))
+        .unwrap_or(FALLBACK_RULE_WIDTH)
 }
 
-/// Both the prompt and its surrounding box print to stdout (rustyline
+/// Both the prompt and its surrounding rules print to stdout (rustyline
 /// renders the prompt there, not stderr), so they need the same color
-/// decision or the border and the `❯` would disagree about `NO_COLOR`.
+/// decision or the rule and the `❯` would disagree about `NO_COLOR`.
 fn color_enabled(stream_is_tty: bool) -> bool {
     stream_is_tty && std::env::var_os("NO_COLOR").is_none()
 }
 
-fn box_border(left: char, right: char, color: bool) -> String {
-    let rule = "─".repeat(box_width() - 2);
-    if color {
-        format!("{DIM}{left}{rule}{right}{RESET}")
-    } else {
-        format!("{left}{rule}{right}")
-    }
+/// A plain dashed rule marking the input area's top/bottom edge. Uses
+/// ASCII `-` rather than box-drawing characters: those render double-width
+/// under some CJK-locale terminal/font combinations, which threw off the
+/// column count and wrapped the line early, leaving only a stray corner
+/// glyph visible.
+fn rule_line(color: bool) -> String {
+    let rule = "-".repeat(rule_width());
+    if color { format!("{DIM}{rule}{RESET}") } else { rule }
 }
 
-/// Builds the REPL's input prompt: a boxed `❯ ` so a turn boundary reads as
-/// its own input area rather than a bare `> `. Only the left border lives in
-/// the prompt string itself -- rustyline owns everything after it, so the
-/// box can't close on the right without redrawing on every keystroke; see
-/// `run_repl` for the top/bottom rules drawn around it.
+/// Builds the REPL's input prompt: `❯ ` marks a turn boundary without a
+/// full box around it -- see `run_repl` for the rule lines drawn above and
+/// below it.
 fn repl_prompt(color: bool) -> String {
     if color {
-        format!("{DIM}│{RESET} {BOLD}{CYAN}❯{RESET} ")
+        format!("{BOLD}{CYAN}❯{RESET} ")
     } else {
-        "| > ".to_string()
+        "> ".to_string()
     }
 }
 
-/// The line above each turn's input box: provider/model and working
+/// The line above each turn's input area: provider/model and working
 /// directory, so that context stays visible without repeating the full
 /// startup banner every turn.
 fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
@@ -378,7 +380,7 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
     if color { format!("{DIM}{text}{RESET}") } else { text }
 }
 
-/// The line below each turn's input box: the same keyboard shortcuts every
+/// The line below each turn's input area: the same keyboard shortcuts every
 /// time, so they're always one glance away instead of scrolled off after
 /// the first turn.
 fn hint_line(color: bool) -> String {
@@ -458,19 +460,19 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
     }
 
     // Decided once (a terminal doesn't change tty-ness mid-session) and
-    // shared by every box/status/hint line drawn below, so they never
+    // shared by every rule/status/hint line drawn below, so they never
     // disagree with the prompt itself about `NO_COLOR`.
     let color = color_enabled(std::io::stdout().is_terminal());
     let prompt = repl_prompt(color);
 
     loop {
         println!("{}", status_line(session, dir, color));
-        println!("{}", box_border('╭', '╮', color));
+        println!("{}", rule_line(color));
 
         let line = match editor.readline(&prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
-                println!("{}", box_border('╰', '╯', color));
+                println!("{}", rule_line(color));
                 continue;
             }
             Err(ReadlineError::Eof) => break,
@@ -479,7 +481,7 @@ async fn run_repl(session: &mut AgentSession, dir: &Path, record: &mut SessionRe
                 break;
             }
         };
-        println!("{}", box_border('╰', '╯', color));
+        println!("{}", rule_line(color));
         println!("{}", hint_line(color));
         println!();
 
