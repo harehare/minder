@@ -121,8 +121,10 @@ piping `minder`'s answer elsewhere stays clean:
 
 ```sh
 $ minder "fix the off-by-one in the pagination helper"
+
 ● grep(pattern=page_size)
   ✓ src/pagination.rs:42:    let end = start + page_size;
+
 ● edit_file(path=src/pagination.rs)
   ✓ +1 -1
   --- a/src/pagination.rs

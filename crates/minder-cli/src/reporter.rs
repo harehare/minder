@@ -181,6 +181,12 @@ impl TerminalReporter {
         self.paint(BOLD, &format!("● {header}"))
     }
 
+    /// Keeps each tool step visually distinct without separating a result
+    /// from the call it belongs to.
+    fn format_tool_call_block(&self, line: &str) -> String {
+        format!("\n{line}")
+    }
+
     fn format_default_result(&self, outcome: &ToolExecOutcome, elapsed: Option<Duration>) -> String {
         let mark = if outcome.is_error {
             self.paint(RED, "✗")
@@ -271,11 +277,13 @@ impl Reporter for TerminalReporter {
             RenderDecision::Hide => {}
             RenderDecision::Text { value, style } => {
                 let line = self.painted_by_name(style.as_deref(), &value);
-                self.print_guarded(|| eprintln!("{line}")).await;
+                let block = self.format_tool_call_block(&line);
+                self.print_guarded(|| eprintln!("{block}")).await;
             }
             RenderDecision::Default => {
                 let line = self.format_default_call(call);
-                self.print_guarded(|| eprintln!("{line}")).await;
+                let block = self.format_tool_call_block(&line);
+                self.print_guarded(|| eprintln!("{block}")).await;
             }
         }
         let label = format!("Running {}", call.name);
@@ -475,6 +483,15 @@ mod tests {
         let rendered = reporter.render_diff(&long_diff);
         assert!(rendered.contains("more line(s)"));
         assert_eq!(rendered.lines().count(), MAX_DIFF_LINES + 1);
+    }
+
+    #[test]
+    fn tool_call_block_has_one_leading_blank_line() {
+        let reporter = no_color_reporter(None);
+        assert_eq!(
+            reporter.format_tool_call_block("● bash(command=ls)"),
+            "\n● bash(command=ls)"
+        );
     }
 
     #[tokio::test]
