@@ -420,6 +420,25 @@ def on_tool_call(call):
     default_on_tool_call(call); # still blocks rm -rf, .env, node_modules, .git
 ```
 
+These baseline checks are data, not an if/elif chain: `default_denylist()` in `default_policy.mq`
+is a plain array of rules (`{"match": "contains" | "path_segment", "arg_keys": [...], "needle":
+"...", "reason": "..."}`), and `default_matchers()` is a small dict mapping each `"match"` kind to
+the function that implements it. Adding a project-wide blocked command or path is appending a rule
+to that array -- no new mq control flow to write, and no Rust change either.
+
+For a project hook that wants to add its own rules without rewriting `on_tool_call` from scratch,
+`default_on_tool_call_with(call, extra_rules)` layers `extra_rules` (same shape as
+`default_denylist()`'s entries) on top of the baseline:
+
+```mq
+# .agent/hooks/security.mq
+def on_tool_call(call):
+  default_on_tool_call_with(call, [
+    {"match": "contains", "arg_keys": ["command"], "needle": "| sh", "reason": "no piping to a shell"},
+    {"match": "path_segment", "arg_keys": ["path"], "needle": "secrets", "reason": "secrets/ is excluded by policy"},
+  ]);
+```
+
 ### Overriding a tool's result
 
 `on_tool_call` can also `override`: `{"action": "override", "value": {"content": "...",
