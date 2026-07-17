@@ -13,6 +13,7 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, arguments: serde_json::Value, ctx: &ToolContext) -> ToolExecOutcome;
 }
 
+#[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub session_id: String,

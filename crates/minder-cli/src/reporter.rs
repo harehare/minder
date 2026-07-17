@@ -51,6 +51,11 @@ pub struct TerminalReporter {
     interactive: bool,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     spinner: Arc<Mutex<SpinnerState>>,
+    /// When `false`, `on_assistant_text` is a no-op -- used for `--output
+    /// json`, where the caller prints one JSON object itself after the turn
+    /// completes instead of letting assistant text stream to stdout as it's
+    /// generated.
+    print_assistant_text: bool,
 }
 
 impl TerminalReporter {
@@ -96,7 +101,15 @@ impl TerminalReporter {
             interactive,
             hooks,
             spinner,
+            print_assistant_text: true,
         }
+    }
+
+    /// Turns off `on_assistant_text` (tool call/result trace on stderr is
+    /// unaffected) -- see `print_assistant_text`.
+    pub fn silence_stdout(mut self) -> Self {
+        self.print_assistant_text = false;
+        self
     }
 
     fn paint(&self, code: &str, text: &str) -> String {
@@ -268,6 +281,9 @@ impl Reporter for TerminalReporter {
     }
 
     async fn on_assistant_text(&self, text: &str) {
+        if !self.print_assistant_text {
+            return;
+        }
         let rendered = crate::markdown::render(text, self.color);
         self.print_guarded(|| println!("{rendered}")).await;
     }
@@ -375,6 +391,7 @@ mod tests {
                 labels: HashMap::new(),
                 frame: 0,
             })),
+            print_assistant_text: true,
         }
     }
 

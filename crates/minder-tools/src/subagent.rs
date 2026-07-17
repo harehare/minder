@@ -359,6 +359,9 @@ mod tests {
         fn id(&self) -> &'static str {
             "scripted"
         }
+        fn model(&self) -> &str {
+            "scripted-model"
+        }
         async fn complete(
             &self,
             _messages: &[Message],

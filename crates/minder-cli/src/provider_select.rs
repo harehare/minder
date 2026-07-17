@@ -3,6 +3,8 @@ use std::sync::Arc;
 use minder_core::LlmProvider;
 use minder_providers::{AnthropicProvider, GeminiProvider, OllamaProvider, OpenAiProvider};
 
+use crate::config::ProjectConfig;
+
 /// Selects a provider via `MINDER_PROVIDER` (`anthropic` [default], `openai`,
 /// `gemini`, `ollama`), with the model overridable via `MINDER_MODEL` and
 /// each provider's own API key env var (`ANTHROPIC_API_KEY`,
@@ -10,28 +12,40 @@ use minder_providers::{AnthropicProvider, GeminiProvider, OllamaProvider, OpenAi
 /// server -- see `OLLAMA_BASE_URL`). Returned as `Arc` (not `Box`) so the
 /// same client can be reused by subagent sessions without reconnecting --
 /// see `AgentTool`.
-pub fn select_provider() -> Arc<dyn LlmProvider> {
-    let provider = std::env::var("MINDER_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
+///
+/// Precedence for `provider`/`model`/`ollama_base_url`: the env var wins if
+/// set, otherwise `cfg` (loaded from `.agent/config.toml`, see
+/// `crate::config`), otherwise the built-in default below.
+pub fn select_provider(cfg: &ProjectConfig) -> Arc<dyn LlmProvider> {
+    let provider = std::env::var("MINDER_PROVIDER")
+        .ok()
+        .or_else(|| cfg.provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+    let model_override = || std::env::var("MINDER_MODEL").ok().or_else(|| cfg.model.clone());
+
     match provider.as_str() {
         "anthropic" => {
             let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
-            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "claude-sonnet-5".to_string());
+            let model = model_override().unwrap_or_else(|| "claude-sonnet-5".to_string());
             Arc::new(AnthropicProvider::new(key, model))
         }
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY");
-            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
+            let model = model_override().unwrap_or_else(|| "gpt-5.4-mini".to_string());
             Arc::new(OpenAiProvider::new(key, model))
         }
         "gemini" => {
             let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
-            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
+            let model = model_override().unwrap_or_else(|| "gemini-3.5-flash".to_string());
             Arc::new(GeminiProvider::new(key, model))
         }
         "ollama" => {
-            let model = std::env::var("MINDER_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+            let model = model_override().unwrap_or_else(|| "llama3.2".to_string());
             let mut provider = OllamaProvider::new(model);
-            if let Ok(base_url) = std::env::var("OLLAMA_BASE_URL") {
+            let base_url = std::env::var("OLLAMA_BASE_URL")
+                .ok()
+                .or_else(|| cfg.ollama_base_url.clone());
+            if let Some(base_url) = base_url {
                 provider = provider.with_base_url(base_url);
             }
             Arc::new(provider)

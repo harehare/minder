@@ -35,6 +35,10 @@ impl LlmProvider for GeminiProvider {
         "gemini"
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &self,
         messages: &[Message],

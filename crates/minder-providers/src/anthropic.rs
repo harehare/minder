@@ -33,6 +33,10 @@ impl LlmProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &self,
         messages: &[Message],

@@ -335,6 +335,12 @@ impl AgentSession {
         self.provider.id()
     }
 
+    /// The active provider's model name (e.g. `"claude-sonnet-5"`), for
+    /// display purposes only -- not used for any routing decision.
+    pub fn model(&self) -> &str {
+        self.provider.model()
+    }
+
     /// Loads a saved transcript and marks the session started, so
     /// `before_agent_start` won't re-run. Used to resume a prior session.
     pub fn restore(&mut self, system_prompt: String, messages: Vec<Message>) {
@@ -449,6 +455,9 @@ mod tests {
     impl LlmProvider for ScriptedProvider {
         fn id(&self) -> &'static str {
             "scripted"
+        }
+        fn model(&self) -> &str {
+            "scripted-model"
         }
         async fn complete(
             &self,
@@ -704,6 +713,9 @@ mod tests {
         fn id(&self) -> &'static str {
             "flaky"
         }
+        fn model(&self) -> &str {
+            "flaky-model"
+        }
         async fn complete(
             &self,
             _messages: &[Message],
@@ -780,6 +792,9 @@ mod tests {
     impl LlmProvider for TransientThenOkProvider {
         fn id(&self) -> &'static str {
             "transient"
+        }
+        fn model(&self) -> &str {
+            "transient-model"
         }
         async fn complete(
             &self,

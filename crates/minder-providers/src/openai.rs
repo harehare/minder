@@ -32,6 +32,10 @@ impl LlmProvider for OpenAiProvider {
         "openai"
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &self,
         messages: &[Message],

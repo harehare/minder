@@ -4,6 +4,10 @@ use crate::message::{Message, ProviderResponse, ToolSpec};
 pub trait LlmProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
+    /// The model name in use (e.g. `"claude-sonnet-5"`), for display purposes
+    /// only -- not used for any routing decision.
+    fn model(&self) -> &str;
+
     async fn complete(
         &self,
         messages: &[Message],
