@@ -16,10 +16,10 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
-    AgentTool, BashTool, Checkpoint, CheckpointedTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool,
-    GitStatusTool, GlobTool, GrepTool, LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool,
-    WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills,
-    discover_subagents, format_checklist,
+    AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool, EditFileTool, GitCommitTool, GitDiffTool,
+    GitLogTool, GitStatusTool, GlobTool, GrepTool, LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents,
+    discover_skills, discover_subagents, format_checklist,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -58,7 +58,8 @@ editing it, prefer `edit_file` over `write_file` for existing files, and verify 
 `git_diff`/tests before calling it done.
 
 Delegate self-contained work to `agent`, and check `skill` for a matching project skill before \
-improvising. Only commit, push, or run other state-changing git/bash commands when asked.
+improvising. Only commit, push, or run other state-changing git/bash commands when asked. Use \
+`delete_file` (not `bash rm`) to remove a file -- it's recoverable, `rm` isn't.
 
 Use `todo_write` to plan and track progress on any task with several non-trivial steps -- keep at \
 most one item `in_progress` at a time and mark items `completed` as soon as they're actually done. \
@@ -156,9 +157,10 @@ struct BuiltSession {
     /// the model actually calls); kept here too, concretely typed, so
     /// `/todo` can read the current list without downcasting.
     todo: Arc<TodoWriteTool>,
-    /// Shared with the `write_file`/`edit_file` tools' `CheckpointedTool`
-    /// wrapper (see above) -- `run_turn_interruptible` starts a fresh
-    /// generation before each turn, and `/undo` reverts the most recent one.
+    /// Shared with the `write_file`/`edit_file`/`delete_file` tools'
+    /// `CheckpointedTool` wrapper (see above) -- `run_turn_interruptible`
+    /// starts a fresh generation before each turn, and `/undo` reverts the
+    /// most recent one.
     checkpoint: Arc<Checkpoint>,
 }
 
@@ -206,14 +208,15 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         }
     };
 
-    // Wraps write_file/edit_file (not bash -- see `Checkpoint`'s own docs on
-    // why arbitrary shell side effects aren't covered) so `/undo` can revert
-    // whatever the most recently completed turn changed.
+    // Wraps write_file/edit_file/delete_file (not bash -- see `Checkpoint`'s
+    // own docs on why arbitrary shell side effects aren't covered) so
+    // `/undo` can revert whatever the most recently completed turn changed.
     let checkpoint = Arc::new(Checkpoint::new());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadFileTool),
         Arc::new(CheckpointedTool::new(Arc::new(WriteFileTool), checkpoint.clone())),
         Arc::new(CheckpointedTool::new(Arc::new(EditFileTool), checkpoint.clone())),
+        Arc::new(CheckpointedTool::new(Arc::new(DeleteFileTool), checkpoint.clone())),
         Arc::new(BashTool),
         Arc::new(GlobTool),
         Arc::new(GrepTool),

@@ -1,5 +1,6 @@
 mod bash;
 mod checkpoint;
+mod delete_file;
 mod diff;
 mod edit_file;
 mod git;
@@ -17,6 +18,7 @@ mod write_file;
 
 pub use bash::BashTool;
 pub use checkpoint::{Checkpoint, CheckpointedTool};
+pub use delete_file::DeleteFileTool;
 pub use diff::{FileDiff, diff_files};
 pub use edit_file::EditFileTool;
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool};

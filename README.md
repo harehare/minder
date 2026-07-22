@@ -165,14 +165,14 @@ instruction instead of losing the whole session.
 
 ### Undoing a turn's file changes
 
-Every `write_file`/`edit_file` call is checkpointed: the first time a turn touches a given file,
-its prior content (or the fact that it didn't exist yet) is kept in memory before the edit lands.
-`/undo` restores every file the most recently completed turn touched back to that state, deleting
-any it created outright. It only ever reaches back one turn — running `/undo` again right after
-has nothing left to revert, and starting a new turn (or the plan-implementation turn after
-`/plan`) replaces what it's tracking. This is deliberately lightweight rather than git-based (no
-stash, no commit, no worktree): it won't catch a file a `bash` command edited or deleted directly,
-only the two dedicated file-editing tools.
+Every `write_file`/`edit_file`/`delete_file` call is checkpointed: the first time a turn touches a
+given file, its prior content (or the fact that it didn't exist yet) is kept in memory before the
+change lands. `/undo` restores every file the most recently completed turn touched back to that
+state — including a `delete_file`d one, straight back to its original path. It only ever reaches
+back one turn — running `/undo` again right after has nothing left to revert, and starting a new
+turn (or the plan-implementation turn after `/plan`) replaces what it's tracking. This is
+deliberately lightweight rather than git-based (no stash, no commit, no worktree): it won't catch
+a file a `bash` command edited or deleted directly, only the three dedicated file tools.
 
 ### REPL commands
 
@@ -360,6 +360,7 @@ Always registered:
 | `read_file` | Reads a file, optionally restricted to a 1-indexed inclusive line range |
 | `write_file` | Creates or overwrites a file, creating parent directories as needed |
 | `edit_file` | Replaces `old_string` with `new_string` in a file (must match exactly once unless `replace_all`) |
+| `delete_file` | Moves a file to `.agent/trash/` instead of deleting it outright; refuses directories |
 | `bash` | Runs a shell command and returns combined stdout/stderr (default 120s timeout) |
 | `glob` | Finds files matching a glob pattern, e.g. `**/*.rs` |
 | `grep` | Searches file contents by regex, honoring `.gitignore`, up to 200 matches |
