@@ -9,6 +9,7 @@ mod session_store;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
@@ -140,6 +141,11 @@ struct BuiltSession {
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     reporter: Arc<dyn Reporter>,
     tool_ctx: ToolContext,
+    /// Shared with `TerminalReporter`'s `on_thinking` gate -- toggling this
+    /// (via `/thinking`) takes effect on the next turn without rebuilding
+    /// the session. See `config::ProjectConfig::thinking_budget` for the
+    /// initial value.
+    show_thinking: Arc<AtomicBool>,
 }
 
 /// Loads `.agent/config.toml`, exiting like every other `.agent/` loader
@@ -249,7 +255,8 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         }
     }
 
-    let mut terminal_reporter_impl = TerminalReporter::new(hooks.clone());
+    let show_thinking = Arc::new(AtomicBool::new(cfg.thinking_budget.is_some()));
+    let mut terminal_reporter_impl = TerminalReporter::new(hooks.clone(), show_thinking.clone());
     if output == OutputFormat::Json {
         terminal_reporter_impl = terminal_reporter_impl.silence_stdout();
     }
@@ -311,6 +318,7 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         hooks,
         reporter,
         tool_ctx,
+        show_thinking,
     }
 }
 
@@ -617,6 +625,7 @@ Available commands:
   /model         Show the active provider and model
   /clear         Clear the conversation history (keeps the session file, starts fresh)
   /plan <task>   Investigate read-only and propose a plan for <task> before touching anything
+  /thinking      Toggle showing the model's extended-thinking output (Anthropic only)
   exit, quit     Leave (Ctrl-D also works)";
 
 /// Runs a `/`-prefixed REPL command. Returns `false` only for a command that
@@ -643,6 +652,10 @@ async fn handle_slash_command(
         }
         "plan" if !rest.is_empty() => run_plan_command(rest, built, dir, record, editor).await,
         "plan" => println!("Usage: /plan <task>"),
+        "thinking" => {
+            let shown = !built.show_thinking.fetch_xor(true, Ordering::Relaxed);
+            println!("Extended-thinking display is now {}.", if shown { "on" } else { "off" });
+        }
         other => println!("Unknown command '/{other}'. Type /help for a list."),
     }
 }

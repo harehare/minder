@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -56,10 +57,17 @@ pub struct TerminalReporter {
     /// completes instead of letting assistant text stream to stdout as it's
     /// generated.
     print_assistant_text: bool,
+    /// Runtime toggle for `on_thinking` (see `Reporter::on_thinking`) --
+    /// shared with the REPL's `/thinking` command via the same `Arc`, so
+    /// flipping it takes effect on the very next turn without rebuilding the
+    /// reporter. Defaults to whatever `.agent/config.toml`'s `thinking_budget`
+    /// implies: shown if extended thinking was requested, since a user who
+    /// opted into paying for it almost certainly wants to see it.
+    show_thinking: Arc<AtomicBool>,
 }
 
 impl TerminalReporter {
-    pub fn new(hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>) -> Self {
+    pub fn new(hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>, show_thinking: Arc<AtomicBool>) -> Self {
         let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         let interactive = std::io::stderr().is_terminal();
         let spinner = Arc::new(Mutex::new(SpinnerState {
@@ -102,6 +110,7 @@ impl TerminalReporter {
             hooks,
             spinner,
             print_assistant_text: true,
+            show_thinking,
         }
     }
 
@@ -182,6 +191,13 @@ impl TerminalReporter {
             return RenderDecision::Default;
         };
         hooks.lock().await.render_tool_result(call, outcome).await
+    }
+
+    /// Dim, indented rendering for a `Thinking` block -- deliberately
+    /// distinct from `format_default_call`'s bullet style, so a thinking
+    /// block reads as "the model's scratch space" rather than a tool step.
+    fn format_thinking(&self, text: &str) -> String {
+        format!("\n{}\n{}", self.paint(DIM, "✻ Thinking…"), self.paint(DIM, text))
     }
 
     fn format_default_call(&self, call: &ToolCall) -> String {
@@ -288,6 +304,14 @@ impl Reporter for TerminalReporter {
         self.print_guarded(|| println!("{rendered}")).await;
     }
 
+    async fn on_thinking(&self, text: &str) {
+        if !self.print_assistant_text || !self.show_thinking.load(Ordering::Relaxed) {
+            return;
+        }
+        let line = self.format_thinking(text);
+        self.print_guarded(|| eprintln!("{line}")).await;
+    }
+
     async fn on_tool_call(&self, call: &ToolCall) {
         match self.render_call_decision(call).await {
             RenderDecision::Hide => {}
@@ -392,6 +416,7 @@ mod tests {
                 frame: 0,
             })),
             print_assistant_text: true,
+            show_thinking: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -531,5 +556,25 @@ mod tests {
         let reporter = no_color_reporter(None);
         let line = reporter.format_default_result(&outcome(), Some(Duration::from_secs(3)));
         assert!(line.contains("(3.0s)"), "missing elapsed suffix in: {line}");
+    }
+
+    #[test]
+    fn format_thinking_labels_and_dims_the_text() {
+        let reporter = no_color_reporter(None);
+        assert_eq!(
+            reporter.format_thinking("working through the problem"),
+            "\n✻ Thinking…\nworking through the problem"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_thinking_is_a_noop_when_the_toggle_is_off() {
+        let mut reporter = no_color_reporter(None);
+        reporter.show_thinking = Arc::new(AtomicBool::new(false));
+        // Only observable effect is "doesn't panic and doesn't touch the
+        // spinner lock" -- there's no stdout/stderr capture in this test
+        // module (see other tests, which only check pure formatting), so
+        // this exercises the same early-return path other reporters rely on.
+        reporter.on_thinking("should not print").await;
     }
 }

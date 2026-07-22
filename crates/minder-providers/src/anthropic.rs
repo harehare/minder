@@ -14,6 +14,12 @@ pub struct AnthropicProvider {
     base_url: String,
     model: String,
     client: reqwest::Client,
+    /// `Some(n)` requests extended thinking with an `n`-token budget (the
+    /// resulting `Thinking` blocks flow through `Message`/`Reporter` like any
+    /// other content block -- see `Reporter::on_thinking`). `None` (the
+    /// default) omits the `thinking` field entirely, so behavior/cost is
+    /// unchanged unless a caller opts in.
+    thinking_budget: Option<u32>,
 }
 
 impl AnthropicProvider {
@@ -23,7 +29,13 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             client: reqwest::Client::new(),
+            thinking_budget: None,
         }
+    }
+
+    pub fn with_thinking_budget(mut self, budget_tokens: u32) -> Self {
+        self.thinking_budget = Some(budget_tokens);
+        self
     }
 }
 
@@ -45,10 +57,17 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let body = AnthropicRequest {
             model: self.model.clone(),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            // Anthropic requires max_tokens > thinking.budget_tokens, so the
+            // budget is added on top of the normal output budget rather than
+            // eating into it.
+            max_tokens: DEFAULT_MAX_TOKENS + self.thinking_budget.unwrap_or(0),
             system: system_prompt.map(str::to_string),
             messages: to_anthropic_messages(messages),
             tools: to_anthropic_tools(tools),
+            thinking: self.thinking_budget.map(|budget_tokens| AnthropicThinkingConfig {
+                thinking_type: "enabled",
+                budget_tokens,
+            }),
         };
 
         let resp = self
@@ -92,6 +111,15 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingConfig>,
+}
+
+#[derive(Serialize)]
+struct AnthropicThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -298,6 +326,55 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn parses_thinking_block_in_response() {
+        let raw = r#"{
+            "id": "msg_3", "type": "message", "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "let me work through this", "signature": "sig123"},
+                {"type": "text", "text": "here's the answer"}
+            ],
+            "model": "claude-sonnet-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 12}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_anthropic_response(parsed);
+
+        match &resp.message.content[0] {
+            ContentBlock::Thinking { text, signature } => {
+                assert_eq!(text, "let me work through this");
+                assert_eq!(signature.as_deref(), Some("sig123"));
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_config_is_omitted_by_default_and_present_when_requested() {
+        let without_thinking = AnthropicRequest {
+            model: "claude-sonnet-5".to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            thinking: None,
+        };
+        let json = serde_json::to_value(&without_thinking).unwrap();
+        assert!(json.get("thinking").is_none());
+
+        let with_thinking = AnthropicRequest {
+            thinking: Some(AnthropicThinkingConfig {
+                thinking_type: "enabled",
+                budget_tokens: 4000,
+            }),
+            ..without_thinking
+        };
+        let json = serde_json::to_value(&with_thinking).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 4000);
     }
 
     #[test]

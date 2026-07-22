@@ -19,6 +19,11 @@ pub trait Reporter: Send + Sync {
     /// Assistant text seen on any turn, including turns that also request a
     /// tool call (previously dropped silently -- see `AgentSession::run_turn`).
     async fn on_assistant_text(&self, _text: &str) {}
+    /// Extended-thinking content seen on a turn (only fired when the
+    /// provider actually returns a `Thinking` block, e.g. Anthropic with a
+    /// thinking budget configured -- see `AnthropicProvider::with_thinking_budget`).
+    /// Whether/how to display it is entirely up to the reporter.
+    async fn on_thinking(&self, _text: &str) {}
     /// Fired just before a tool call is executed (post-hook-transform).
     async fn on_tool_call(&self, _call: &ToolCall) {}
     /// Fired just after a tool call finishes (post-hook-transform).

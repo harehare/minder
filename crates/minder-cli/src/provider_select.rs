@@ -27,7 +27,15 @@ pub fn select_provider(cfg: &ProjectConfig) -> Arc<dyn LlmProvider> {
         "anthropic" => {
             let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
             let model = model_override().unwrap_or_else(|| "claude-sonnet-5".to_string());
-            Arc::new(AnthropicProvider::new(key, model))
+            let mut provider = AnthropicProvider::new(key, model);
+            let thinking_budget = std::env::var("MINDER_THINKING_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .or(cfg.thinking_budget);
+            if let Some(budget) = thinking_budget {
+                provider = provider.with_thinking_budget(budget);
+            }
+            Arc::new(provider)
         }
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY");

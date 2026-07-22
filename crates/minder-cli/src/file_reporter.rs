@@ -52,6 +52,10 @@ impl Reporter for FileReporter {
         self.write_line(&format!("assistant: {text}"));
     }
 
+    async fn on_thinking(&self, text: &str) {
+        self.write_line(&format!("thinking: {text}"));
+    }
+
     async fn on_tool_call(&self, call: &ToolCall) {
         self.write_line(&format!("tool_call: {}({})", call.name, call.arguments));
     }
@@ -101,6 +105,12 @@ impl Reporter for CompositeReporter {
         }
     }
 
+    async fn on_thinking(&self, text: &str) {
+        for r in &self.0 {
+            r.on_thinking(text).await;
+        }
+    }
+
     async fn on_tool_call(&self, call: &ToolCall) {
         for r in &self.0 {
             r.on_tool_call(call).await;
@@ -135,6 +145,7 @@ mod tests {
 
         reporter.on_turn_start().await;
         reporter.on_assistant_text("hello there").await;
+        reporter.on_thinking("mulling it over").await;
         reporter
             .on_tool_call(&ToolCall {
                 id: "1".to_string(),
@@ -162,6 +173,7 @@ mod tests {
 
         assert!(contents.contains("turn: waiting on model"));
         assert!(contents.contains("assistant: hello there"));
+        assert!(contents.contains("thinking: mulling it over"));
         assert!(contents.contains("tool_call: bash"));
         assert!(contents.contains("tool_result: bash [ok] a.txt"));
     }
@@ -184,7 +196,10 @@ mod tests {
     #[async_trait]
     impl Reporter for RecordingReporter {
         async fn on_assistant_text(&self, text: &str) {
-            self.0.lock().unwrap().push(text.to_string());
+            self.0.lock().unwrap().push(format!("text:{text}"));
+        }
+        async fn on_thinking(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("thinking:{text}"));
         }
     }
 
@@ -195,8 +210,9 @@ mod tests {
         let composite = CompositeReporter::new(vec![a.clone(), b.clone()]);
 
         composite.on_assistant_text("hi").await;
+        composite.on_thinking("hmm").await;
 
-        assert_eq!(a.0.lock().unwrap().as_slice(), ["hi"]);
-        assert_eq!(b.0.lock().unwrap().as_slice(), ["hi"]);
+        assert_eq!(a.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm"]);
+        assert_eq!(b.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm"]);
     }
 }

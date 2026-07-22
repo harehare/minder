@@ -111,8 +111,10 @@ impl AgentSession {
             self.messages.push(response.message.clone());
 
             for block in &response.message.content {
-                if let ContentBlock::Text(text) = block {
-                    self.reporter.on_assistant_text(text).await;
+                match block {
+                    ContentBlock::Text(text) => self.reporter.on_assistant_text(text).await,
+                    ContentBlock::Thinking { text, .. } => self.reporter.on_thinking(text).await,
+                    _ => {}
                 }
             }
 
@@ -524,6 +526,60 @@ mod tests {
                 output_tokens: 0,
             },
         }
+    }
+
+    /// Records `on_thinking`/`on_assistant_text` calls in order, so tests can
+    /// assert a `Thinking` block reaches the reporter distinctly from `Text`.
+    #[derive(Default)]
+    struct SpyReporter(StdMutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Reporter for SpyReporter {
+        async fn on_thinking(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("thinking:{text}"));
+        }
+        async fn on_assistant_text(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("text:{text}"));
+        }
+    }
+
+    fn thinking_then_text_response(thinking: &str, text: &str) -> ProviderResponse {
+        ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: thinking.to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text(text.to_string()),
+                ],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_block_reaches_the_reporter_ahead_of_the_final_text() {
+        let provider = ScriptedProvider::new(vec![thinking_then_text_response(
+            "working through the problem",
+            "here's the answer",
+        )]);
+        let spy = Arc::new(SpyReporter::default());
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "you are a test agent", test_ctx())
+            .with_reporter(spy.clone());
+
+        session.run_turn("solve it").await.unwrap();
+
+        assert_eq!(
+            spy.0.lock().unwrap().as_slice(),
+            [
+                "thinking:working through the problem".to_string(),
+                "text:here's the answer".to_string(),
+            ]
+        );
     }
 
     fn test_ctx() -> ToolContext {

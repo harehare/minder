@@ -7,15 +7,20 @@ use serde::Deserialize;
 /// resolves to all-`None`, same as every other `.agent/` input.
 ///
 /// Precedence when both are set: the matching env var (`MINDER_PROVIDER`,
-/// `MINDER_MODEL`, `OLLAMA_BASE_URL`) always wins over this file, so a
-/// one-off override never requires editing the project config back and
-/// forth -- see `provider_select::select_provider`.
+/// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_THINKING_BUDGET`) always wins
+/// over this file, so a one-off override never requires editing the project
+/// config back and forth -- see `provider_select::select_provider`.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub ollama_base_url: Option<String>,
+    /// Anthropic-only: requests extended thinking with this token budget
+    /// (unset by default -- no thinking requested, no cost/latency change).
+    /// Whether the resulting `Thinking` blocks are actually shown is a
+    /// separate, runtime-toggleable question -- see `/thinking` in the REPL.
+    pub thinking_budget: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +63,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
-            "provider = \"openai\"\nmodel = \"gpt-5.4\"\nollama_base_url = \"http://localhost:11434\"\n",
+            "provider = \"openai\"\nmodel = \"gpt-5.4\"\nollama_base_url = \"http://localhost:11434\"\nthinking_budget = 4000\n",
         )
         .unwrap();
 
@@ -68,6 +73,7 @@ mod tests {
         assert_eq!(cfg.provider.as_deref(), Some("openai"));
         assert_eq!(cfg.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(cfg.ollama_base_url.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(cfg.thinking_budget, Some(4000));
     }
 
     #[test]

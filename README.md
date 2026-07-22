@@ -165,6 +165,7 @@ instead of a task:
 | `/model` | Shows the active provider and model |
 | `/clear` | Clears the conversation history (the session file stays, so `--continue` still works, just with nothing to continue) |
 | `/plan <task>` | Investigates read-only and proposes a plan for `<task>` before touching anything -- see below |
+| `/thinking` | Toggles showing the model's extended-thinking output (Anthropic only, and only once `thinking_budget` is configured -- see below) |
 
 `/plan` runs `<task>` through a throwaway session that shares the real session's provider and
 [hooks](#hooks) but is only given read-only tools (`read_file`, `grep`, `glob`, `ls`, `git_diff`,
@@ -270,11 +271,21 @@ uses the same non-default provider. Set them once instead:
 provider = "openai"
 model = "gpt-5.4"
 # ollama_base_url = "http://localhost:11434"  # only read when provider = "ollama"
+# thinking_budget = 4000                      # Anthropic only, see below
 ```
 
 Every field is optional and the file itself is optional. Precedence is env var (a one-off override
 for this run) > `.agent/config.toml` (this project's default) > the built-in default from the table
 above -- setting `MINDER_MODEL` still wins even with a `model` in this file.
+
+### Extended thinking (Anthropic)
+
+`thinking_budget` (or the `MINDER_THINKING_BUDGET` env var, same precedence as everything else
+above) requests Anthropic [extended
+thinking](https://docs.claude.com/en/docs/build-with-claude/extended-thinking) with that many
+tokens as the budget. It's unset by default -- no thinking requested, no extra cost or latency.
+Once set, thinking is shown live (dimmed, above the final answer) by default; toggle it off/on
+per-session with `/thinking` without losing the budget setting itself.
 
 ### Running with gpt-oss
 
