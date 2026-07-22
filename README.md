@@ -360,6 +360,7 @@ Always registered:
 | `worktree_remove` | Removes a worktree and its directory (`git worktree remove`), leaving its branch intact |
 | `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees) |
 | `agent` | Delegates a task to a named subagent — always available via a built-in `general-purpose` subagent, no project config required; see [Subagents](#subagents) |
+| `todo_write` | Replaces the current todo list with a full updated one, so the model can plan and track progress on a multi-step task — see below |
 
 Registered only when configured:
 
@@ -373,6 +374,12 @@ the current one — e.g. running `main`'s test suite for comparison while mid-ed
 branch, or fanning a review out into a [subagent](#subagents) that works in isolation. minder
 itself doesn't switch its own working directory between worktrees; point a fresh `minder` process
 (or a `worktree_add`-created path passed to `bash`) at the new directory to actually work inside it.
+
+`todo_write` always replaces the *whole* list (never a partial patch), so the model restates the
+full current state on every call rather than the tool having to infer what changed. It's not
+offered to subagents or `/plan`'s read-only session — todo tracking is for the top-level
+conversation. Run `/todo` any time to see the current list without waiting for the model to call
+the tool itself.
 
 Additional tools can be supplied per-project as WASM plugins — see [Tool plugins (WASM)](#tool-plugins-wasm)
 — or from MCP servers, behind an opt-in feature — see [MCP servers (optional)](#mcp-servers-optional).

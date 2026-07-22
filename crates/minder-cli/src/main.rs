@@ -17,8 +17,8 @@ use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Repo
 use minder_hooks::HookEngine;
 use minder_tools::{
     AgentTool, BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool,
-    LsTool, ReadFileTool, SkillTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
-    WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
+    LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
+    WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents, format_checklist,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -58,6 +58,10 @@ editing it, prefer `edit_file` over `write_file` for existing files, and verify 
 
 Delegate self-contained work to `agent`, and check `skill` for a matching project skill before \
 improvising. Only commit, push, or run other state-changing git/bash commands when asked.
+
+Use `todo_write` to plan and track progress on any task with several non-trivial steps -- keep at \
+most one item `in_progress` at a time and mark items `completed` as soon as they're actually done. \
+Skip it for a single quick action.
 
 Keep replies short and grounded in what the tools actually returned.";
 
@@ -147,6 +151,10 @@ struct BuiltSession {
     /// the session. See `config::ProjectConfig::thinking_budget` for the
     /// initial value.
     show_thinking: Arc<AtomicBool>,
+    /// Also present in `tools` as a type-erased `Arc<dyn Tool>` (that's what
+    /// the model actually calls); kept here too, concretely typed, so
+    /// `/todo` can read the current list without downcasting.
+    todo: Arc<TodoWriteTool>,
 }
 
 /// Loads `.agent/config.toml`, exiting like every other `.agent/` loader
@@ -303,6 +311,12 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         reporter.clone(),
     )));
 
+    // Added after `agent` is built (not before) so subagents -- which
+    // inherit a snapshot of `tools` taken above -- don't get a shared todo
+    // list of their own; todo tracking is for the top-level conversation.
+    let todo = Arc::new(TodoWriteTool::new());
+    tools.push(todo.clone() as Arc<dyn Tool>);
+
     let session = AgentSession::new(
         provider.clone(),
         tools.clone(),
@@ -320,6 +334,7 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         reporter,
         tool_ctx,
         show_thinking,
+        todo,
     }
 }
 
@@ -690,6 +705,7 @@ Available commands:
   /clear         Clear the conversation history (keeps the session file, starts fresh)
   /plan <task>   Investigate read-only and propose a plan for <task> before touching anything
   /thinking      Toggle showing the model's extended-thinking output (Anthropic only)
+  /todo          Show the model's current todo list
   exit, quit     Leave (Ctrl-D also works)";
 
 /// Runs a `/`-prefixed REPL command. Returns `false` only for a command that
@@ -720,6 +736,7 @@ async fn handle_slash_command(
             let shown = !built.show_thinking.fetch_xor(true, Ordering::Relaxed);
             println!("Extended-thinking display is now {}.", if shown { "on" } else { "off" });
         }
+        "todo" => println!("{}", format_checklist(&built.todo.items())),
         other => println!("Unknown command '/{other}'. Type /help for a list."),
     }
 }

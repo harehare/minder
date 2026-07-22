@@ -238,12 +238,34 @@ impl TerminalReporter {
                 self.paint(RED, &format!("-{}", deletions.unwrap_or(0))),
                 self.render_diff(diff),
             )
+        } else if let Some(todos) = outcome.metadata.get("todos").and_then(|v| v.as_array()) {
+            format!("  {mark}{suffix}\n{}", self.render_todos(todos))
         } else {
             format!(
                 "  {mark} {}{suffix}",
                 self.paint(DIM, &truncate(&outcome.content, RESULT_PREVIEW_CHARS))
             )
         }
+    }
+
+    /// One line per todo item (`TodoWriteTool`'s `metadata.todos`), colored
+    /// by status -- reached via `outcome.metadata` rather than the tool
+    /// name, the same data-driven pattern `render_diff` uses for edits.
+    fn render_todos(&self, todos: &[serde_json::Value]) -> String {
+        todos
+            .iter()
+            .map(|t| {
+                let content = t.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                let (mark, style) = match status {
+                    "completed" => ("☑", GREEN),
+                    "in_progress" => ("◐", YELLOW),
+                    _ => ("☐", DIM),
+                };
+                format!("  {}", self.paint(style, &format!("{mark} {content}")))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Registers a live spinner label; no-op when stderr isn't a tty.
@@ -366,6 +388,12 @@ fn summarize_args(args: &serde_json::Value) -> String {
                 return format!("{key}={v}");
             }
         }
+        // `todo_write`'s full list is the interesting part and already gets
+        // its own rendering on the result line (see `render_todos`) -- a
+        // truncated JSON dump of it here would just be noise.
+        if let Some(todos) = obj.get("todos").and_then(|v| v.as_array()) {
+            return format!("{} item(s)", todos.len());
+        }
     }
     truncate(&args.to_string(), 100)
 }
@@ -393,6 +421,15 @@ mod tests {
     fn falls_back_to_truncated_json() {
         let args = serde_json::json!({"foo": "bar"});
         assert_eq!(summarize_args(&args), r#"{"foo":"bar"}"#);
+    }
+
+    #[test]
+    fn summarizes_a_todo_write_call_by_item_count_not_raw_json() {
+        let args = serde_json::json!({"todos": [
+            {"content": "a", "status": "pending"},
+            {"content": "b", "status": "completed"},
+        ]});
+        assert_eq!(summarize_args(&args), "2 item(s)");
     }
 
     #[test]
@@ -556,6 +593,24 @@ mod tests {
         let reporter = no_color_reporter(None);
         let line = reporter.format_default_result(&outcome(), Some(Duration::from_secs(3)));
         assert!(line.contains("(3.0s)"), "missing elapsed suffix in: {line}");
+    }
+
+    #[test]
+    fn todo_metadata_renders_one_line_per_item_instead_of_the_raw_content() {
+        let reporter = no_color_reporter(None);
+        let outcome = ToolExecOutcome {
+            content: "☐ a\n◐ b\n☑ c".to_string(),
+            is_error: false,
+            metadata: serde_json::json!({"todos": [
+                {"content": "a", "status": "pending"},
+                {"content": "b", "status": "in_progress"},
+                {"content": "c", "status": "completed"},
+            ]}),
+        };
+        let line = reporter.format_default_result(&outcome, None);
+        assert!(line.contains("☐ a"));
+        assert!(line.contains("◐ b"));
+        assert!(line.contains("☑ c"));
     }
 
     #[test]
