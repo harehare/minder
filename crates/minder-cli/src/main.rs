@@ -16,9 +16,10 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
-    AgentTool, BashTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool,
-    LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool,
-    WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents, format_checklist,
+    AgentTool, BashTool, Checkpoint, CheckpointedTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool,
+    GitStatusTool, GlobTool, GrepTool, LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool,
+    WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills,
+    discover_subagents, format_checklist,
 };
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -155,6 +156,10 @@ struct BuiltSession {
     /// the model actually calls); kept here too, concretely typed, so
     /// `/todo` can read the current list without downcasting.
     todo: Arc<TodoWriteTool>,
+    /// Shared with the `write_file`/`edit_file` tools' `CheckpointedTool`
+    /// wrapper (see above) -- `run_turn_interruptible` starts a fresh
+    /// generation before each turn, and `/undo` reverts the most recent one.
+    checkpoint: Arc<Checkpoint>,
 }
 
 /// Loads `.agent/config.toml`, exiting like every other `.agent/` loader
@@ -201,10 +206,14 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         }
     };
 
+    // Wraps write_file/edit_file (not bash -- see `Checkpoint`'s own docs on
+    // why arbitrary shell side effects aren't covered) so `/undo` can revert
+    // whatever the most recently completed turn changed.
+    let checkpoint = Arc::new(Checkpoint::new());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadFileTool),
-        Arc::new(WriteFileTool),
-        Arc::new(EditFileTool),
+        Arc::new(CheckpointedTool::new(Arc::new(WriteFileTool), checkpoint.clone())),
+        Arc::new(CheckpointedTool::new(Arc::new(EditFileTool), checkpoint.clone())),
         Arc::new(BashTool),
         Arc::new(GlobTool),
         Arc::new(GrepTool),
@@ -335,6 +344,7 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         tool_ctx,
         show_thinking,
         todo,
+        checkpoint,
     }
 }
 
@@ -706,6 +716,7 @@ Available commands:
   /plan <task>   Investigate read-only and propose a plan for <task> before touching anything
   /thinking      Toggle showing the model's extended-thinking output (Anthropic only)
   /todo          Show the model's current todo list
+  /undo          Revert the file changes from the most recently completed turn
   exit, quit     Leave (Ctrl-D also works)";
 
 /// Runs a `/`-prefixed REPL command. Returns `false` only for a command that
@@ -737,6 +748,7 @@ async fn handle_slash_command(
             println!("Extended-thinking display is now {}.", if shown { "on" } else { "off" });
         }
         "todo" => println!("{}", format_checklist(&built.todo.items())),
+        "undo" => run_undo_command(built, dir).await,
         other => println!("Unknown command '/{other}'. Type /help for a list."),
     }
 }
@@ -798,10 +810,28 @@ async fn run_plan_command(
     }
 
     let follow_up = format!("Implement the following plan:\n\n{plan_text}\n\nOriginal task: {task}");
+    built.checkpoint.start_turn();
     if let Err(e) = run_turn_interruptible(&mut built.session, &follow_up).await {
         print_turn_error(&e);
     }
     persist(dir, record, &built.session);
+}
+
+/// `/undo`: reverts every file the most recently completed turn's
+/// `write_file`/`edit_file` calls touched, back to how it looked just
+/// before that turn started (see `Checkpoint`). Only ever reaches back one
+/// turn -- running it again right after has nothing left to revert, and a
+/// `bash` command's own file changes were never tracked in the first place.
+async fn run_undo_command(built: &BuiltSession, dir: &Path) {
+    let restored = built.checkpoint.undo().await;
+    if restored.is_empty() {
+        println!("Nothing to undo.");
+        return;
+    }
+    println!("Reverted {} file(s):", restored.len());
+    for path in restored {
+        println!("  {}", path.strip_prefix(dir).unwrap_or(&path).display());
+    }
 }
 
 /// Short "it's alive" banner shown once when a REPL starts, so launching
@@ -919,6 +949,7 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
             continue;
         }
 
+        built.checkpoint.start_turn();
         if let Err(e) = run_turn_interruptible(&mut built.session, line).await {
             print_turn_error(&e);
         }

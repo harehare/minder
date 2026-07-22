@@ -163,6 +163,17 @@ this immediately. Either way, the turn's partial messages are discarded from his
 back at the prompt with the rest of the conversation intact, ready to redirect with a follow-up
 instruction instead of losing the whole session.
 
+### Undoing a turn's file changes
+
+Every `write_file`/`edit_file` call is checkpointed: the first time a turn touches a given file,
+its prior content (or the fact that it didn't exist yet) is kept in memory before the edit lands.
+`/undo` restores every file the most recently completed turn touched back to that state, deleting
+any it created outright. It only ever reaches back one turn — running `/undo` again right after
+has nothing left to revert, and starting a new turn (or the plan-implementation turn after
+`/plan`) replaces what it's tracking. This is deliberately lightweight rather than git-based (no
+stash, no commit, no worktree): it won't catch a file a `bash` command edited or deleted directly,
+only the two dedicated file-editing tools.
+
 ### REPL commands
 
 A line starting with `/` inside `minder chat` (or any interactive session) is a REPL command
@@ -175,6 +186,8 @@ instead of a task:
 | `/clear` | Clears the conversation history (the session file stays, so `--continue` still works, just with nothing to continue) |
 | `/plan <task>` | Investigates read-only and proposes a plan for `<task>` before touching anything -- see below |
 | `/thinking` | Toggles showing the model's extended-thinking output (Anthropic only, and only once `thinking_budget` is configured -- see below) |
+| `/todo` | Shows the model's current todo list (from `todo_write`) |
+| `/undo` | Reverts the `write_file`/`edit_file` changes from the most recently completed turn -- see below |
 
 `/plan` runs `<task>` through a throwaway session that shares the real session's provider and
 [hooks](#hooks) but is only given read-only tools (`read_file`, `grep`, `glob`, `ls`, `git_diff`,
