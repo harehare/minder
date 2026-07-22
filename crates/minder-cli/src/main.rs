@@ -10,6 +10,7 @@ use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
@@ -438,6 +439,69 @@ fn working_dir() -> PathBuf {
     std::env::current_dir().expect("cwd")
 }
 
+/// How long an interrupted turn gets to wind down gracefully after a Ctrl-C
+/// (e.g. `bash` killing its child process, see `bash.rs`) before it's force-
+/// aborted regardless -- see `run_turn_interruptible`.
+const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
+
+/// Runs `session.run_turn(input)` the same as calling it directly, except a
+/// Ctrl-C during the turn interrupts it instead of killing the whole
+/// process. First Ctrl-C cancels the turn's tools (`AgentSession::reset_cancel_token`)
+/// and waits up to `INTERRUPT_GRACE_PERIOD` for the turn to notice and wind
+/// down on its own -- e.g. `bash` killing its child process rather than
+/// leaving it orphaned. A second Ctrl-C during that window (or the grace
+/// period simply elapsing) force-aborts immediately regardless.
+///
+/// Either way, an interrupted turn's partial messages are discarded (see
+/// `AgentSession::discard_interrupted_turn`) so the next turn starts from a
+/// clean, correctly-alternating transcript instead of one a provider might
+/// reject. The interrupted task itself isn't lost, though: the REPL just
+/// loops back to the prompt with full history intact, ready for a follow-up
+/// instruction -- the same "stop and redirect" flow other coding agents
+/// offer via Esc, just bound to Ctrl-C here since minder's REPL already
+/// treats Ctrl-C-during-input as "cancel this line" (see `run_repl`).
+async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Result<Message, AgentError> {
+    let pre_turn_len = session.messages().len();
+    let cancel = session.reset_cancel_token();
+
+    // Scoped so `turn` (and the mutable borrow of `session` it holds) ends
+    // with this block, before `discard_interrupted_turn` below needs its
+    // own borrow -- `tokio::pin!`'s storage otherwise outlives the binding
+    // itself, into the rest of the function.
+    let result = {
+        let turn = session.run_turn(input);
+        tokio::pin!(turn);
+
+        tokio::select! {
+            result = &mut turn => return result,
+            _ = tokio::signal::ctrl_c() => {}
+        }
+
+        cancel.cancel();
+        tokio::select! {
+            result = &mut turn => result,
+            _ = tokio::signal::ctrl_c() => Err(AgentError::Interrupted),
+            _ = tokio::time::sleep(INTERRUPT_GRACE_PERIOD) => Err(AgentError::Interrupted),
+        }
+    };
+
+    if matches!(result, Err(AgentError::Interrupted)) {
+        session.discard_interrupted_turn(pre_turn_len);
+    }
+    result
+}
+
+/// Prints a turn's error the way it deserves: an interrupt is an expected,
+/// user-initiated outcome (plain notice, no "error:" framing), everything
+/// else is a real failure.
+fn print_turn_error(err: &AgentError) {
+    if matches!(err, AgentError::Interrupted) {
+        println!("Interrupted.");
+    } else {
+        eprintln!("error: {err}");
+    }
+}
+
 /// Refreshes a session record from the live session's transcript and saves
 /// it, so the process can be resumed later via `--continue`/`--resume`.
 /// Best-effort: a save failure is a warning, never fatal to the turn itself.
@@ -611,7 +675,7 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
 /// time, so they're always one glance away instead of scrolled off after
 /// the first turn.
 fn hint_line(color: bool) -> String {
-    let text = "Ctrl-C cancel input · Ctrl-D or 'exit'/'quit' to leave · /help for commands";
+    let text = "Ctrl-C cancel input/turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands";
     if color {
         format!("{DIM}{text}{RESET}")
     } else {
@@ -691,8 +755,12 @@ async fn run_plan_command(
     )
     .with_reporter(built.reporter.clone());
 
-    let plan_text = match plan_session.run_turn(task).await {
+    let plan_text = match run_turn_interruptible(&mut plan_session, task).await {
         Ok(message) => message.text(),
+        Err(AgentError::Interrupted) => {
+            println!("Planning interrupted.");
+            return;
+        }
         Err(e) => {
             eprintln!("error: planning turn failed: {e}");
             return;
@@ -713,8 +781,8 @@ async fn run_plan_command(
     }
 
     let follow_up = format!("Implement the following plan:\n\n{plan_text}\n\nOriginal task: {task}");
-    if let Err(e) = built.session.run_turn(&follow_up).await {
-        eprintln!("error: {e}");
+    if let Err(e) = run_turn_interruptible(&mut built.session, &follow_up).await {
+        print_turn_error(&e);
     }
     persist(dir, record, &built.session);
 }
@@ -834,8 +902,8 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
             continue;
         }
 
-        if let Err(e) = built.session.run_turn(line).await {
-            eprintln!("error: {e}");
+        if let Err(e) = run_turn_interruptible(&mut built.session, line).await {
+            print_turn_error(&e);
         }
         persist(dir, record, &built.session);
         println!();
@@ -891,6 +959,154 @@ async fn run_loop_mode(file: &Path, task_hint: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::{ProviderError, ProviderResponse, Role, StopReason, Tool, ToolContext, Usage};
+
+    /// Always answers with fixed `text` -- enough to prove
+    /// `run_turn_interruptible` behaves like a plain `run_turn` when nothing
+    /// ever interrupts it (the interrupt path itself needs a real SIGINT, so
+    /// isn't exercised by this in-process test suite).
+    struct FixedTextProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FixedTextProvider {
+        fn id(&self) -> &'static str {
+            "fixed"
+        }
+        fn model(&self) -> &str {
+            "fixed-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[minder_core::ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Ok(ProviderResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![minder_core::ContentBlock::Text(self.0.to_string())],
+                    metadata: serde_json::Value::Null,
+                },
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    fn test_tool_ctx() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "test".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_interruptible_matches_plain_run_turn_when_uninterrupted() {
+        let mut session = AgentSession::new(
+            Arc::new(FixedTextProvider("all done")),
+            Vec::<Arc<dyn Tool>>::new(),
+            None,
+            "test agent",
+            test_tool_ctx(),
+        );
+
+        let result = run_turn_interruptible(&mut session, "do something").await.unwrap();
+
+        assert_eq!(result.text(), "all done");
+        // user input + assistant reply, nothing rolled back since nothing interrupted it
+        assert_eq!(session.messages().len(), 2);
+    }
+
+    /// Real, end-to-end verification of the thing `run_turn_interruptible`
+    /// exists for: a live SIGINT to this test's own process should cancel a
+    /// running `bash` command (killing its child rather than waiting out
+    /// its full duration) and let the turn wind down gracefully within
+    /// `INTERRUPT_GRACE_PERIOD`. Sends a real signal to the current
+    /// process, so it's opt-in (`--ignored`) rather than part of the
+    /// default suite -- same convention as the providers' `live_round_trip`
+    /// tests that need real external state.
+    #[tokio::test]
+    #[ignore = "sends a real SIGINT to this test's own process -- run explicitly with --ignored"]
+    async fn ctrl_c_interrupts_a_running_bash_command_instead_of_waiting_out_its_full_duration() {
+        struct ScriptedProvider(std::sync::Mutex<std::collections::VecDeque<ProviderResponse>>);
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ScriptedProvider {
+            fn id(&self) -> &'static str {
+                "scripted"
+            }
+            fn model(&self) -> &str {
+                "scripted-model"
+            }
+            async fn complete(
+                &self,
+                _messages: &[Message],
+                _tools: &[minder_core::ToolSpec],
+                _system_prompt: Option<&str>,
+            ) -> Result<ProviderResponse, ProviderError> {
+                Ok(self.0.lock().unwrap().pop_front().expect("script exhausted"))
+            }
+        }
+
+        let tool_use = ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![minder_core::ContentBlock::ToolUse(minder_core::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command": "sleep 30", "timeout_secs": 60}),
+                })],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        };
+        let final_text = ProviderResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![minder_core::ContentBlock::Text("acknowledged".to_string())],
+                metadata: serde_json::Value::Null,
+            },
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+
+        let provider = Arc::new(ScriptedProvider(std::sync::Mutex::new(
+            [tool_use, final_text].into_iter().collect(),
+        )));
+        let mut session = AgentSession::new(
+            provider,
+            vec![Arc::new(minder_tools::BashTool) as Arc<dyn Tool>],
+            None,
+            "test agent",
+            test_tool_ctx(),
+        );
+
+        let pid = std::process::id();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = tokio::process::Command::new("kill")
+                .arg("-INT")
+                .arg(pid.to_string())
+                .status()
+                .await;
+        });
+
+        let start = std::time::Instant::now();
+        let result = run_turn_interruptible(&mut session, "run something slow").await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "expected a graceful completion after the tool call was cancelled, got {result:?}"
+        );
+        assert_eq!(result.unwrap().text(), "acknowledged");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "took {elapsed:?} -- the cancelled `sleep 30` should have been killed almost instantly"
+        );
+    }
 
     #[test]
     fn empty_piped_input_leaves_the_task_untouched() {

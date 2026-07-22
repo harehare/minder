@@ -154,6 +154,15 @@ When stderr is a terminal, a spinner also runs while the model is thinking or a 
 still executing (`⠋ Thinking (2.3s)`, `⠋ Running bash (0.8s)`), so a long step never looks stalled;
 it's replaced by the normal `✓`/`✗` line as soon as that step finishes.
 
+### Interrupting a turn
+
+Ctrl-C during a turn (not just while typing) stops it instead of killing the whole process:
+a running `bash`/`git_*` call gets a moment to actually wind down (e.g. `bash` kills its child
+process rather than orphaning it) before being force-aborted regardless -- a second Ctrl-C forces
+this immediately. Either way, the turn's partial messages are discarded from history and you're
+back at the prompt with the rest of the conversation intact, ready to redirect with a follow-up
+instruction instead of losing the whole session.
+
 ### REPL commands
 
 A line starting with `/` inside `minder chat` (or any interactive session) is a REPL command

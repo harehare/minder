@@ -48,6 +48,11 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("blocked by hook: {0}")]
     HookBlocked(String),
+    /// The turn was cancelled mid-flight (e.g. Ctrl-C in the REPL) rather
+    /// than failing on its own -- see `AgentSession::reset_cancel_token` and
+    /// `AgentSession::discard_interrupted_turn`.
+    #[error("interrupted")]
+    Interrupted,
 }
 
 impl AgentSession {
@@ -349,6 +354,27 @@ impl AgentSession {
         self.system_prompt = system_prompt;
         self.messages = messages;
         self.started = true;
+    }
+
+    /// Swaps in a fresh, un-cancelled `CancellationToken` for this turn and
+    /// returns a clone of it, so a caller (e.g. the REPL's Ctrl-C handling)
+    /// can cancel just this turn's in-flight tool calls without permanently
+    /// poisoning every later turn -- `CancellationToken` never un-cancels
+    /// itself once fired, so reusing one across turns would mean the first
+    /// interrupt silently cancels every tool call from then on.
+    pub fn reset_cancel_token(&mut self) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.tool_ctx.cancel = token.clone();
+        token
+    }
+
+    /// Rolls the transcript back to `pre_turn_len` (the length just before
+    /// the interrupted turn started), discarding whatever partial
+    /// user/assistant/tool-result messages it left behind. Without this, an
+    /// interrupted turn can leave a trailing message whose role doesn't
+    /// correctly alternate with the next turn's, which providers reject.
+    pub fn discard_interrupted_turn(&mut self, pre_turn_len: usize) {
+        self.messages.truncate(pre_turn_len);
     }
 }
 
@@ -758,6 +784,49 @@ mod tests {
 
         session.run_turn("follow up").await.unwrap();
         assert_eq!(session.messages().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_cancel_token_returns_a_fresh_uncancelled_token_each_time() {
+        let provider = ScriptedProvider::new(vec![]);
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test agent", test_ctx());
+
+        let first = session.reset_cancel_token();
+        first.cancel();
+        assert!(first.is_cancelled());
+
+        let second = session.reset_cancel_token();
+        assert!(
+            !second.is_cancelled(),
+            "a later turn's token must not inherit an earlier turn's cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_interrupted_turn_rolls_the_transcript_back() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_response("call_1", "echo", serde_json::json!({"text": "hi"})),
+            text_response("done"),
+        ]);
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(EchoTool)],
+            None,
+            "test agent",
+            test_ctx(),
+        );
+        session.restore("test agent".to_string(), vec![Message::user_text("earlier turn")]);
+        let pre_turn_len = session.messages().len();
+
+        // A real interrupt drops the turn mid-flight; here the turn just
+        // runs to completion, but `discard_interrupted_turn` only cares
+        // about rolling `messages` back to a prior length, so exercising it
+        // against a normal turn's (larger) transcript is equivalent.
+        session.run_turn("do something").await.unwrap();
+        assert!(session.messages().len() > pre_turn_len);
+
+        session.discard_interrupted_turn(pre_turn_len);
+        assert_eq!(session.messages().len(), pre_turn_len);
     }
 
     struct FlakyThenOkProvider {
