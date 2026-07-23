@@ -21,8 +21,13 @@ use minder_tools::{
     WebSearchTool, WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents,
     discover_skills, discover_subagents, format_checklist,
 };
-use rustyline::DefaultEditor;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 
 use file_reporter::{CompositeReporter, FileReporter};
 use provider_select::select_provider;
@@ -722,6 +727,120 @@ Available commands:
   /undo          Revert the file changes from the most recently completed turn
   exit, quit     Leave (Ctrl-D also works)";
 
+/// Names accepted by `handle_slash_command`, kept in sync with `SLASH_HELP`
+/// above; also drives completion/hinting in `SlashCommandHelper`.
+const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "plan", "thinking", "todo", "undo"];
+
+/// Commands still matching what's typed after `/`, or `None` if `line`/`pos`
+/// isn't in "typing a command name" position at all (no leading `/`, cursor
+/// not at the end, or a space already reached -- i.e. past the command name
+/// into its arguments).
+fn matching_slash_commands(line: &str, pos: usize) -> Option<Vec<&'static str>> {
+    if pos != line.len() {
+        return None;
+    }
+    let typed = line.strip_prefix('/')?;
+    if typed.contains(' ') {
+        return None;
+    }
+    Some(
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|cmd| cmd.starts_with(typed))
+            .collect(),
+    )
+}
+
+/// A hint shown after the cursor while typing a `/`-command: either the rest
+/// of the single remaining command name (so `Right`/`End` accepts it like a
+/// shell autosuggestion), or, while still ambiguous, a plain listing of every
+/// command still in the running -- so typing bare `/` immediately shows what
+/// can be selected instead of waiting for a Tab press.
+struct SlashCommandHint {
+    display: String,
+    completion_len: usize,
+}
+
+impl rustyline::hint::Hint for SlashCommandHint {
+    fn display(&self) -> &str {
+        &self.display
+    }
+
+    fn completion(&self) -> Option<&str> {
+        (self.completion_len > 0).then(|| &self.display[..self.completion_len])
+    }
+}
+
+/// Line-editor helper wired into `ReplEditor`: `Completer` handles Tab, and
+/// `Hinter` shows a live suggestion after every keystroke without needing
+/// Tab at all. `color` mirrors the REPL's own `NO_COLOR`/tty decision so the
+/// hint text is dimmed consistently with everything else `run_repl` prints.
+struct SlashCommandHelper {
+    color: bool,
+}
+
+impl Completer for SlashCommandHelper {
+    type Candidate = Pair;
+
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let Some(matches) = matching_slash_commands(line, pos) else {
+            return Ok((pos, Vec::new()));
+        };
+        let candidates = matches
+            .into_iter()
+            .map(|cmd| Pair {
+                display: format!("/{cmd}"),
+                replacement: format!("/{cmd} "),
+            })
+            .collect();
+        Ok((0, candidates))
+    }
+}
+
+impl Hinter for SlashCommandHelper {
+    type Hint = SlashCommandHint;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<SlashCommandHint> {
+        let matches = matching_slash_commands(line, pos)?;
+        let typed_len = pos - 1; // chars typed after the leading '/'
+        match matches.as_slice() {
+            [] => None,
+            [only] => {
+                let suffix = &only[typed_len..];
+                (!suffix.is_empty()).then(|| SlashCommandHint {
+                    display: suffix.to_string(),
+                    completion_len: suffix.len(),
+                })
+            }
+            many => {
+                let list = many.iter().map(|cmd| format!("/{cmd}")).collect::<Vec<_>>().join("  ");
+                Some(SlashCommandHint {
+                    display: format!("  {list}"),
+                    completion_len: 0,
+                })
+            }
+        }
+    }
+}
+
+impl Highlighter for SlashCommandHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        if self.color {
+            std::borrow::Cow::Owned(format!("{DIM}{hint}{RESET}"))
+        } else {
+            std::borrow::Cow::Borrowed(hint)
+        }
+    }
+}
+impl Validator for SlashCommandHelper {}
+impl Helper for SlashCommandHelper {}
+
+/// The concrete editor type used by the REPL: `rustyline`'s `DefaultEditor`
+/// with `SlashCommandHelper` swapped in for `()` so Tab-completion and live
+/// hints work.
+type ReplEditor = Editor<SlashCommandHelper, FileHistory>;
+
 /// Runs a `/`-prefixed REPL command. Returns `false` only for a command that
 /// should end the REPL (none do today, but keeping the return type leaves
 /// room for e.g. a future `/exit` alias without changing every call site).
@@ -730,7 +849,7 @@ async fn handle_slash_command(
     built: &mut BuiltSession,
     dir: &Path,
     record: &mut SessionRecord,
-    editor: &mut DefaultEditor,
+    editor: &mut ReplEditor,
 ) {
     let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
@@ -767,7 +886,7 @@ async fn run_plan_command(
     built: &mut BuiltSession,
     dir: &Path,
     record: &mut SessionRecord,
-    editor: &mut DefaultEditor,
+    editor: &mut ReplEditor,
 ) {
     println!("Planning (read-only investigation, no changes will be made)...");
     println!();
@@ -901,17 +1020,19 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
 async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord) {
     print_banner(&built.session, record);
 
+    // Decided once (a terminal doesn't change tty-ness mid-session) and
+    // shared by every rule/status/hint line drawn below -- and the slash
+    // command hinter -- so they never disagree with the prompt itself about
+    // `NO_COLOR`.
+    let color = color_enabled(std::io::stdout().is_terminal());
+    let prompt = repl_prompt(color);
+
     let history = session_store::history_path(dir).ok();
-    let mut editor = DefaultEditor::new().expect("failed to initialize line editor");
+    let mut editor: ReplEditor = Editor::new().expect("failed to initialize line editor");
+    editor.set_helper(Some(SlashCommandHelper { color }));
     if let Some(path) = &history {
         let _ = editor.load_history(path);
     }
-
-    // Decided once (a terminal doesn't change tty-ness mid-session) and
-    // shared by every rule/status/hint line drawn below, so they never
-    // disagree with the prompt itself about `NO_COLOR`.
-    let color = color_enabled(std::io::stdout().is_terminal());
-    let prompt = repl_prompt(color);
 
     loop {
         println!("{}", status_line(&built.session, dir, color));
@@ -1206,5 +1327,79 @@ mod tests {
         let payload = json_result_payload("anthropic", "claude-sonnet-5", &err);
         assert!(payload["answer"].is_null());
         assert!(payload["error"].as_str().unwrap().contains("blocked by policy"));
+    }
+
+    fn complete_at_cursor(line: &str) -> (usize, Vec<Pair>) {
+        let history = rustyline::history::MemHistory::new();
+        let ctx = Context::new(&history);
+        SlashCommandHelper { color: false }
+            .complete(line, line.len(), &ctx)
+            .unwrap()
+    }
+
+    fn hint_at_cursor(line: &str) -> Option<String> {
+        let history = rustyline::history::MemHistory::new();
+        let ctx = Context::new(&history);
+        SlashCommandHelper { color: false }
+            .hint(line, line.len(), &ctx)
+            .map(|h| rustyline::hint::Hint::display(&h).to_string())
+    }
+
+    #[test]
+    fn slash_completion_lists_all_commands_for_bare_slash() {
+        let (start, candidates) = complete_at_cursor("/");
+        assert_eq!(start, 0);
+        let names: Vec<&str> = candidates.iter().map(|p| p.display.as_str()).collect();
+        assert_eq!(names.len(), SLASH_COMMANDS.len());
+        assert!(names.contains(&"/plan"));
+    }
+
+    #[test]
+    fn slash_completion_narrows_by_prefix() {
+        let (_, candidates) = complete_at_cursor("/th");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/thinking");
+        assert_eq!(candidates[0].replacement, "/thinking ");
+    }
+
+    #[test]
+    fn slash_completion_stops_after_the_command_name() {
+        let (_, candidates) = complete_at_cursor("/plan fix the ");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn slash_completion_empty_for_plain_text() {
+        let (_, candidates) = complete_at_cursor("hello");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn slash_hint_lists_every_command_for_bare_slash() {
+        let hint = hint_at_cursor("/").expect("bare '/' should hint the full command list");
+        for cmd in SLASH_COMMANDS {
+            assert!(hint.contains(&format!("/{cmd}")), "hint {hint:?} missing /{cmd}");
+        }
+    }
+
+    #[test]
+    fn slash_hint_completes_the_rest_of_a_single_match() {
+        let hint = hint_at_cursor("/th").expect("'/th' uniquely matches '/thinking'");
+        assert_eq!(hint, "inking");
+    }
+
+    #[test]
+    fn slash_hint_absent_once_a_command_is_fully_typed() {
+        assert_eq!(hint_at_cursor("/thinking"), None);
+    }
+
+    #[test]
+    fn slash_hint_absent_past_the_command_name() {
+        assert_eq!(hint_at_cursor("/plan fix the "), None);
+    }
+
+    #[test]
+    fn slash_hint_absent_for_plain_text() {
+        assert_eq!(hint_at_cursor("hello"), None);
     }
 }
