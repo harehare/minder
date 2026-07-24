@@ -174,6 +174,22 @@ turn (or the plan-implementation turn after `/plan`) replaces what it's tracking
 deliberately lightweight rather than git-based (no stash, no commit, no worktree): it won't catch
 a file a `bash` command edited or deleted directly, only the three dedicated file tools.
 
+### Attaching files with `@path`
+
+An `@path` word -- a file or directory, relative to the working directory or absolute -- attaches
+that path's contents to the task. Works the same way whether typed at the `chat` prompt or inside a
+one-shot/`--continue`/`--resume` task string:
+
+```sh
+minder "review @src/pagination.rs for off-by-one bugs"
+minder chat
+❯ summarize what's in @src/
+```
+
+A file's content is inlined in a fenced code block; a directory gets a shallow (one-level) listing.
+Only a path that actually exists on disk expands -- `@here` in "thanks @here for the review" is left
+untouched, no path resolution attempted. In `chat`, Tab-completes and live-hints like `/`-commands do.
+
 ### REPL commands
 
 A line starting with `/` inside `minder chat` (or any interactive session) is a REPL command

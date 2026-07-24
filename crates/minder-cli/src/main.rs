@@ -2,6 +2,7 @@ mod config;
 mod file_reporter;
 mod loop_mode;
 mod markdown;
+mod mentions;
 mod provider_select;
 mod reporter;
 mod session_store;
@@ -106,7 +107,9 @@ struct Cli {
     output: OutputFormat,
 
     /// Task to run to completion; with --continue/--resume, the task fed
-    /// into the resumed session
+    /// into the resumed session. An `@path` word (file or directory,
+    /// relative to the cwd or absolute) attaches that path's contents --
+    /// same convention the interactive REPL uses (see `mentions.rs`).
     task: Option<String>,
 }
 
@@ -464,12 +467,21 @@ fn combine_task_with_piped_input(task: String, piped: &str) -> String {
     }
 }
 
+/// Same `@path` expansion `run_repl` applies to each typed line.
+fn expand_task_mentions(task: String) -> String {
+    mentions::expand_mentions(&task, &working_dir())
+}
+
 #[tokio::main]
 async fn main() {
     match Command::from(Cli::parse()) {
-        Command::OneShot { task, output } => run_one_shot(&with_piped_stdin(task), output).await,
-        Command::Continue { task, output } => run_resume(None, task.map(with_piped_stdin), output).await,
-        Command::Resume { id, task, output } => run_resume(Some(id), task.map(with_piped_stdin), output).await,
+        Command::OneShot { task, output } => run_one_shot(&with_piped_stdin(expand_task_mentions(task)), output).await,
+        Command::Continue { task, output } => {
+            run_resume(None, task.map(expand_task_mentions).map(with_piped_stdin), output).await
+        }
+        Command::Resume { id, task, output } => {
+            run_resume(Some(id), task.map(expand_task_mentions).map(with_piped_stdin), output).await
+        }
         Command::Chat => run_chat().await,
         Command::Loop { file, task_hint } => run_loop_mode(&file, task_hint.as_deref()).await,
         Command::Completion { shell } => print_completion(shell),
@@ -716,7 +728,8 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
 /// time, so they're always one glance away instead of scrolled off after
 /// the first turn.
 fn hint_line(color: bool) -> String {
-    let text = "Ctrl-C cancel input/turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands";
+    let text =
+        "Ctrl-C cancel input/turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands · @path attaches a file/dir";
     if color {
         format!("{DIM}{text}{RESET}")
     } else {
@@ -733,7 +746,9 @@ Available commands:
   /thinking      Toggle showing the model's extended-thinking output (Anthropic only)
   /todo          Show the model's current todo list
   /undo          Revert the file changes from the most recently completed turn
-  exit, quit     Leave (Ctrl-D also works)";
+  exit, quit     Leave (Ctrl-D also works)
+
+Type @path (Tab to complete) to attach a file or directory's contents, e.g. @src/main.rs or @src/.";
 
 /// Names accepted by `handle_slash_command`, kept in sync with `SLASH_HELP`
 /// above; also drives completion/hinting in `SlashCommandHelper`.
@@ -782,27 +797,30 @@ impl rustyline::hint::Hint for SlashCommandHint {
 
 /// Line-editor helper wired into `ReplEditor`: `Completer` handles Tab, and
 /// `Hinter` shows a live suggestion after every keystroke without needing
-/// Tab at all. `color` mirrors the REPL's own `NO_COLOR`/tty decision so the
-/// hint text is dimmed consistently with everything else `run_repl` prints.
+/// Tab at all. Covers both `/`-commands and `@path` mentions (see `mentions.rs`).
 struct SlashCommandHelper {
     color: bool,
+    working_dir: PathBuf,
 }
 
 impl Completer for SlashCommandHelper {
     type Candidate = Pair;
 
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let Some(matches) = matching_slash_commands(line, pos) else {
-            return Ok((pos, Vec::new()));
-        };
-        let candidates = matches
-            .into_iter()
-            .map(|cmd| Pair {
-                display: format!("/{cmd}"),
-                replacement: format!("/{cmd} "),
-            })
-            .collect();
-        Ok((0, candidates))
+        if let Some(matches) = matching_slash_commands(line, pos) {
+            let candidates = matches
+                .into_iter()
+                .map(|cmd| Pair {
+                    display: format!("/{cmd}"),
+                    replacement: format!("/{cmd} "),
+                })
+                .collect();
+            return Ok((0, candidates));
+        }
+        if let Some((start, prefix)) = mentions::at_mention_token(line, pos) {
+            return Ok((start, mentions::complete_at_mention(prefix, &self.working_dir)));
+        }
+        Ok((pos, Vec::new()))
     }
 }
 
@@ -810,25 +828,37 @@ impl Hinter for SlashCommandHelper {
     type Hint = SlashCommandHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<SlashCommandHint> {
-        let matches = matching_slash_commands(line, pos)?;
-        let typed_len = pos - 1; // chars typed after the leading '/'
-        match matches.as_slice() {
-            [] => None,
-            [only] => {
-                let suffix = &only[typed_len..];
-                (!suffix.is_empty()).then(|| SlashCommandHint {
-                    display: suffix.to_string(),
-                    completion_len: suffix.len(),
-                })
-            }
-            many => {
-                let list = many.iter().map(|cmd| format!("/{cmd}")).collect::<Vec<_>>().join("  ");
-                Some(SlashCommandHint {
-                    display: format!("  {list}"),
-                    completion_len: 0,
-                })
-            }
+        if let Some(matches) = matching_slash_commands(line, pos) {
+            let typed_len = pos - 1; // chars typed after the leading '/'
+            return match matches.as_slice() {
+                [] => None,
+                [only] => {
+                    let suffix = &only[typed_len..];
+                    (!suffix.is_empty()).then(|| SlashCommandHint {
+                        display: suffix.to_string(),
+                        completion_len: suffix.len(),
+                    })
+                }
+                many => {
+                    let list = many.iter().map(|cmd| format!("/{cmd}")).collect::<Vec<_>>().join("  ");
+                    Some(SlashCommandHint {
+                        display: format!("  {list}"),
+                        completion_len: 0,
+                    })
+                }
+            };
         }
+        // Ghost-text hints only make sense at end-of-line.
+        if pos == line.len()
+            && let Some((_, prefix)) = mentions::at_mention_token(line, pos)
+            && let Some((display, completion_len)) = mentions::at_mention_hint(prefix, &self.working_dir)
+        {
+            return Some(SlashCommandHint {
+                display,
+                completion_len,
+            });
+        }
+        None
     }
 }
 
@@ -1069,7 +1099,10 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
 
     let history = session_store::history_path(dir).ok();
     let mut editor: ReplEditor = Editor::new().expect("failed to initialize line editor");
-    editor.set_helper(Some(SlashCommandHelper { color }));
+    editor.set_helper(Some(SlashCommandHelper {
+        color,
+        working_dir: dir.to_path_buf(),
+    }));
     if let Some(path) = &history {
         let _ = editor.load_history(path);
     }
@@ -1113,8 +1146,9 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
             continue;
         }
 
+        let expanded = mentions::expand_mentions(line, dir);
         built.checkpoint.start_turn();
-        if let Err(e) = run_turn_interruptible(&mut built.session, line).await {
+        if let Err(e) = run_turn_interruptible(&mut built.session, &expanded).await {
             print_turn_error(&e);
         }
         persist(dir, record, &built.session);
@@ -1370,18 +1404,23 @@ mod tests {
         assert!(payload["error"].as_str().unwrap().contains("blocked by policy"));
     }
 
+    fn test_helper() -> SlashCommandHelper {
+        SlashCommandHelper {
+            color: false,
+            working_dir: std::env::temp_dir(),
+        }
+    }
+
     fn complete_at_cursor(line: &str) -> (usize, Vec<Pair>) {
         let history = rustyline::history::MemHistory::new();
         let ctx = Context::new(&history);
-        SlashCommandHelper { color: false }
-            .complete(line, line.len(), &ctx)
-            .unwrap()
+        test_helper().complete(line, line.len(), &ctx).unwrap()
     }
 
     fn hint_at_cursor(line: &str) -> Option<String> {
         let history = rustyline::history::MemHistory::new();
         let ctx = Context::new(&history);
-        SlashCommandHelper { color: false }
+        test_helper()
             .hint(line, line.len(), &ctx)
             .map(|h| rustyline::hint::Hint::display(&h).to_string())
     }
