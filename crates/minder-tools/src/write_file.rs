@@ -88,6 +88,7 @@ mod tests {
             working_dir: std::env::temp_dir().join(format!("minder-write-file-test-{}", uuid::Uuid::new_v4())),
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         }
     }
 

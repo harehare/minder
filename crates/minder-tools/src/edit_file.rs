@@ -106,6 +106,7 @@ mod tests {
             working_dir: dir,
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         }
     }
 

@@ -10,7 +10,7 @@ use serde::Deserialize;
 /// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_THINKING_BUDGET`) always wins
 /// over this file, so a one-off override never requires editing the project
 /// config back and forth -- see `provider_select::select_provider`.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub provider: Option<String>,

@@ -1,8 +1,11 @@
 use async_trait::async_trait;
-use minder_core::{AgentSession, HookPort, LlmProvider, Reporter, Tool, ToolContext, ToolExecOutcome};
+use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Reporter, Tool, ToolContext, ToolExecOutcome};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+use crate::mailbox_tools::{CheckMessagesTool, SendMessageTool};
 
 /// A named, isolated `AgentSession` the main loop can delegate a task to via
 /// `AgentTool`. Defined like a `Skill`: a directory with a frontmatter file.
@@ -14,6 +17,11 @@ pub struct Subagent {
     /// except `agent` itself (see `AgentTool::new`).
     pub tools: Option<Vec<String>>,
     pub system_prompt: String,
+    /// Static per-subagent model/provider override, resolved through
+    /// `AgentTool`'s `ProviderFactory` -- `None` means use the parent's
+    /// default provider. A per-call `model` tool argument wins over this.
+    pub model: Option<String>,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +56,8 @@ pub fn builtin_subagents() -> Vec<Subagent> {
                          complete answer -- your caller only ever sees this final reply, none of \
                          your intermediate tool calls."
             .to_string(),
+        model: None,
+        provider: None,
     }]
 }
 
@@ -109,6 +119,8 @@ fn parse_subagent(path: &Path, raw: &str) -> Result<Subagent, SubagentLoadError>
     let mut name = None;
     let mut description = None;
     let mut tools = None;
+    let mut model = None;
+    let mut provider = None;
     for line in frontmatter.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -120,6 +132,8 @@ fn parse_subagent(path: &Path, raw: &str) -> Result<Subagent, SubagentLoadError>
             "tools" if !value.is_empty() => {
                 tools = Some(value.split(',').map(|t| t.trim().to_string()).collect::<Vec<_>>())
             }
+            "model" if !value.is_empty() => model = Some(value.to_string()),
+            "provider" if !value.is_empty() => provider = Some(value.to_string()),
             _ => {}
         }
     }
@@ -132,8 +146,15 @@ fn parse_subagent(path: &Path, raw: &str) -> Result<Subagent, SubagentLoadError>
         description,
         tools,
         system_prompt: body.trim().to_string(),
+        model,
+        provider,
     })
 }
+
+/// Builds a provider for a given (provider name, model) pair, e.g. wrapping
+/// `provider_select::build_provider` -- lets `AgentTool` resolve a model
+/// override without depending on `minder-providers` itself.
+pub type ProviderFactory = dyn Fn(&str, &str) -> Result<Arc<dyn LlmProvider>, String> + Send + Sync;
 
 /// Exposes discovered subagents as a single `agent` tool, mirroring
 /// `SkillTool`: calling it with `{name, task}` runs that subagent's own
@@ -148,6 +169,11 @@ pub struct AgentTool {
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     reporter: Arc<dyn Reporter>,
     description: String,
+    /// Resolves a model override (per-call `model` argument, or a
+    /// `Subagent`'s static `model`/`provider`) into a real provider. `None`
+    /// means overrides aren't supported in this context -- the `model`
+    /// argument is left out of the schema entirely (see `parameters_schema`).
+    provider_factory: Option<Arc<ProviderFactory>>,
 }
 
 impl AgentTool {
@@ -157,6 +183,7 @@ impl AgentTool {
         base_tools: Vec<Arc<dyn Tool>>,
         hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
         reporter: Arc<dyn Reporter>,
+        provider_factory: Option<Arc<ProviderFactory>>,
     ) -> Self {
         let list = subagents
             .iter()
@@ -167,7 +194,9 @@ impl AgentTool {
             "Delegates a task to a named subagent, running it to completion in an isolated \
              session and returning its final answer. Use this to hand off a well-scoped piece \
              of work (e.g. a focused review or search) instead of doing it inline, especially \
-             when it would otherwise clutter this conversation with intermediate tool calls.\n\n\
+             when it would otherwise clutter this conversation with intermediate tool calls. \
+             Call it more than once in the same turn to run subagents concurrently -- they can \
+             then coordinate with each other via send_message/check_messages.\n\n\
              Available subagents:\n{list}"
         );
         Self {
@@ -177,6 +206,7 @@ impl AgentTool {
             hooks,
             reporter,
             description,
+            provider_factory,
         }
     }
 }
@@ -185,6 +215,7 @@ impl AgentTool {
 struct Args {
     name: String,
     task: String,
+    model: Option<String>,
 }
 
 #[async_trait]
@@ -199,19 +230,28 @@ impl Tool for AgentTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         let names: Vec<&str> = self.subagents.iter().map(|s| s.name.as_str()).collect();
+        let mut properties = serde_json::json!({
+            "name": {
+                "type": "string",
+                "description": "Name of the subagent to delegate to",
+                "enum": names
+            },
+            "task": {
+                "type": "string",
+                "description": "The task to hand off, in enough detail for the subagent to act without further clarification (it starts with no conversation history)"
+            }
+        });
+        if self.provider_factory.is_some() {
+            properties["model"] = serde_json::json!({
+                "type": "string",
+                "description": "Override the model used for this call, same provider as the \
+                                 default -- e.g. a smaller/faster model for a simple task, a \
+                                 stronger one for a complex one. Omit to use the default."
+            });
+        }
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Name of the subagent to delegate to",
-                    "enum": names
-                },
-                "task": {
-                    "type": "string",
-                    "description": "The task to hand off, in enough detail for the subagent to act without further clarification (it starts with no conversation history)"
-                }
-            },
+            "properties": properties,
             "required": ["name", "task"]
         })
     }
@@ -234,7 +274,36 @@ impl Tool for AgentTool {
             ));
         };
 
-        let tools: Vec<Arc<dyn Tool>> = match &subagent.tools {
+        // Precedence: per-call `model` argument > the subagent's own static
+        // `model`/`provider` default > the parent's provider (no override,
+        // no factory call at all).
+        let provider = match (&args.model, &subagent.model, &subagent.provider) {
+            (None, None, None) => self.provider.clone(),
+            (model_arg, subagent_model, subagent_provider) => {
+                let Some(factory) = &self.provider_factory else {
+                    return error(format!(
+                        "subagent '{}' requested a model override but none is configured in this context",
+                        subagent.name
+                    ));
+                };
+                let provider_name = subagent_provider.as_deref().unwrap_or(self.provider.id());
+                let model_name = model_arg
+                    .as_deref()
+                    .or(subagent_model.as_deref())
+                    .unwrap_or(self.provider.model());
+                match factory(provider_name, model_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return error(format!(
+                            "subagent '{}' model override '{model_name}' failed: {e}",
+                            subagent.name
+                        ));
+                    }
+                }
+            }
+        };
+
+        let mut tools: Vec<Arc<dyn Tool>> = match &subagent.tools {
             Some(allowed) => self
                 .base_tools
                 .iter()
@@ -244,31 +313,79 @@ impl Tool for AgentTool {
             None => self.base_tools.clone(),
         };
 
-        let child_ctx = ToolContext {
-            working_dir: ctx.working_dir.clone(),
-            session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
-            cancel: ctx.cancel.clone(),
-        };
+        // Only present when this call is running alongside siblings in one
+        // concurrent `agent` batch (see `AgentSession::run_turn`) -- gives
+        // the subagent a way to coordinate with them.
+        let mut system_prompt = subagent.system_prompt.clone();
+        if let Some(mailbox) = &ctx.mailbox {
+            tools.push(Arc::new(SendMessageTool {
+                mailbox: mailbox.clone(),
+                from: subagent.name.clone(),
+            }));
+            tools.push(Arc::new(CheckMessagesTool {
+                mailbox: mailbox.clone(),
+                name: subagent.name.clone(),
+            }));
+            system_prompt.push_str(
+                "\n\nYou're running alongside other subagents in this batch. Use `send_message`/\
+                 `check_messages` to coordinate if useful -- delivery is best-effort.",
+            );
+        }
 
-        let mut session = AgentSession::new(
-            self.provider.clone(),
-            tools,
-            self.hooks.clone(),
-            subagent.system_prompt.clone(),
-            child_ctx,
-        )
-        .with_reporter(self.reporter.clone());
+        let mut attempt = 0u32;
+        loop {
+            let child_ctx = ToolContext {
+                working_dir: ctx.working_dir.clone(),
+                session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
+                cancel: ctx.cancel.clone(),
+                mailbox: None,
+            };
+            let mut session = AgentSession::new(
+                provider.clone(),
+                tools.clone(),
+                self.hooks.clone(),
+                system_prompt.clone(),
+                child_ctx,
+            )
+            .with_reporter(self.reporter.clone());
 
-        match session.run_turn(&args.task).await {
-            Ok(message) => ToolExecOutcome {
-                content: message.text(),
-                is_error: false,
-                metadata: serde_json::Value::Null,
-            },
-            Err(e) => error(format!("subagent '{}' failed: {e}", subagent.name)),
+            match session.run_turn(&args.task).await {
+                Ok(message) => {
+                    return ToolExecOutcome {
+                        content: message.text(),
+                        is_error: false,
+                        metadata: serde_json::Value::Null,
+                    };
+                }
+                // Only provider errors are retried -- a hook block or interrupt is never one to retry.
+                Err(e @ AgentError::Provider(_)) if attempt < MAX_SUBAGENT_RETRIES => {
+                    attempt += 1;
+                    self.reporter
+                        .on_retry(
+                            attempt as usize,
+                            MAX_SUBAGENT_RETRIES as usize,
+                            SUBAGENT_RETRY_DELAY,
+                            &format!("subagent '{}': {e}", subagent.name),
+                        )
+                        .await;
+                    tokio::time::sleep(SUBAGENT_RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    return error(format!(
+                        "subagent '{}' failed after {} attempt(s): {e}",
+                        subagent.name,
+                        attempt + 1
+                    ));
+                }
+            }
         }
     }
 }
+
+/// A failed subagent gets this many retries (fresh session each time, not a
+/// resume of the failed one) before giving up -- see `AgentTool::execute`.
+const MAX_SUBAGENT_RETRIES: u32 = 2;
+const SUBAGENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 fn error(message: String) -> ToolExecOutcome {
     ToolExecOutcome {
@@ -428,6 +545,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         }
     }
 
@@ -440,16 +558,12 @@ mod tests {
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecursionProbeTool(call_count.clone()))];
 
         let tool = AgentTool::new(
-            vec![Subagent {
-                name: "reviewer".to_string(),
-                description: "Reviews code".to_string(),
-                tools: None,
-                system_prompt: "You review code.".to_string(),
-            }],
+            vec![reviewer_subagent()],
             provider,
             base_tools,
             None,
             Arc::new(minder_core::NoopReporter),
+            None,
         );
 
         let outcome = tool
@@ -481,16 +595,12 @@ mod tests {
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecursionProbeTool(call_count.clone()))];
 
         let tool = AgentTool::new(
-            vec![Subagent {
-                name: "reviewer".to_string(),
-                description: "Reviews code".to_string(),
-                tools: None,
-                system_prompt: "You review code.".to_string(),
-            }],
+            vec![reviewer_subagent()],
             provider,
             base_tools,
             None,
             Arc::new(minder_core::NoopReporter),
+            None,
         );
 
         let outcome = tool
@@ -514,10 +624,389 @@ mod tests {
             vec![],
             None,
             Arc::new(minder_core::NoopReporter),
+            None,
         );
         let outcome = tool
             .execute(serde_json::json!({"name": "nope", "task": "x"}), &ctx())
             .await;
         assert!(outcome.is_error);
+    }
+
+    struct FlakyProvider {
+        calls: StdMutex<usize>,
+        fail_times: usize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        fn id(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls <= self.fail_times {
+                // status 400 is non-transient, so session.rs won't retry it internally --
+                // each call here is exactly one subagent-level attempt.
+                Err(ProviderError::Api {
+                    status: 400,
+                    body: "flaky".to_string(),
+                })
+            } else {
+                Ok(text_response("recovered"))
+            }
+        }
+    }
+
+    fn reviewer_subagent() -> Subagent {
+        Subagent {
+            name: "reviewer".to_string(),
+            description: "Reviews code".to_string(),
+            tools: None,
+            system_prompt: "You review code.".to_string(),
+            model: None,
+            provider: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subagent_recovers_after_failures_below_the_retry_cap() {
+        let provider = Arc::new(FlakyProvider {
+            calls: StdMutex::new(0),
+            fail_times: MAX_SUBAGENT_RETRIES as usize,
+        });
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            provider,
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            None,
+        );
+
+        let outcome = tool
+            .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
+            .await;
+
+        assert!(!outcome.is_error, "expected recovery, got: {outcome:?}");
+        assert_eq!(outcome.content, "recovered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subagent_gives_up_after_exhausting_retries_and_reports_attempt_count() {
+        let provider = Arc::new(FlakyProvider {
+            calls: StdMutex::new(0),
+            fail_times: MAX_SUBAGENT_RETRIES as usize + 1,
+        });
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            provider,
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            None,
+        );
+
+        let outcome = tool
+            .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(
+            outcome
+                .content
+                .contains(&format!("after {} attempt(s)", MAX_SUBAGENT_RETRIES + 1)),
+            "expected attempt count in: {}",
+            outcome.content
+        );
+    }
+
+    struct BlockingHooks;
+
+    #[async_trait]
+    impl HookPort for BlockingHooks {
+        async fn before_agent_start(&mut self, _system_prompt: &str) -> minder_core::HookDecision<String> {
+            minder_core::HookDecision::Block("policy says no".to_string())
+        }
+        async fn on_context(&mut self, messages: &[Message]) -> minder_core::HookDecision<Vec<Message>> {
+            minder_core::HookDecision::Allow(messages.to_vec())
+        }
+        async fn on_tool_call(&mut self, call: &ToolCall) -> minder_core::ToolCallDecision {
+            minder_core::ToolCallDecision::Allow(call.clone())
+        }
+        async fn on_tool_result(&mut self, result: &minder_core::ToolResultInfo) -> minder_core::HookDecision<String> {
+            minder_core::HookDecision::Allow(result.content.clone())
+        }
+        async fn before_compact(&mut self, _messages: &[Message]) -> minder_core::HookDecision<()> {
+            minder_core::HookDecision::Allow(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_block_is_never_retried() {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingProvider(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl LlmProvider for CountingProvider {
+            fn id(&self) -> &'static str {
+                "counting"
+            }
+            fn model(&self) -> &str {
+                "counting-model"
+            }
+            async fn complete(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _system_prompt: Option<&str>,
+            ) -> Result<ProviderResponse, ProviderError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(text_response("should not be reached"))
+            }
+        }
+        let hooks: Box<dyn HookPort> = Box::new(BlockingHooks);
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            Arc::new(CountingProvider(call_count.clone())),
+            vec![],
+            Some(Arc::new(tokio::sync::Mutex::new(hooks))),
+            Arc::new(minder_core::NoopReporter),
+            None,
+        );
+
+        let outcome = tool
+            .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("after 1 attempt(s)"),
+            "got: {}",
+            outcome.content
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a hook block is a deterministic policy decision -- retrying it is pointless"
+        );
+    }
+
+    fn text_response_provider(text: &'static str) -> Arc<dyn LlmProvider> {
+        Arc::new(ScriptedProvider(StdMutex::new(vec![text_response(text)].into())))
+    }
+
+    #[tokio::test]
+    async fn a_per_call_model_argument_routes_to_the_override_provider() {
+        let override_provider = text_response_provider("used override");
+        let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = factory_calls.clone();
+        let factory: Arc<ProviderFactory> = Arc::new(move |_provider_name, model| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (model == "cheap-model")
+                .then(|| override_provider.clone())
+                .ok_or_else(|| format!("unexpected model '{model}'"))
+        });
+
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "reviewer", "task": "review this", "model": "cheap-model"}),
+                &ctx(),
+            )
+            .await;
+
+        assert!(!outcome.is_error, "got: {}", outcome.content);
+        assert_eq!(outcome.content, "used override");
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_static_model_default_is_used_with_no_per_call_override() {
+        let override_provider = text_response_provider("used pinned default");
+        let factory: Arc<ProviderFactory> = Arc::new(move |_name, model| {
+            (model == "pinned-model")
+                .then(|| override_provider.clone())
+                .ok_or_else(|| format!("unexpected model '{model}'"))
+        });
+
+        let mut subagent = reviewer_subagent();
+        subagent.model = Some("pinned-model".to_string());
+
+        let tool = AgentTool::new(
+            vec![subagent],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+
+        let outcome = tool
+            .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
+            .await;
+
+        assert!(!outcome.is_error, "got: {}", outcome.content);
+        assert_eq!(outcome.content, "used pinned default");
+    }
+
+    #[tokio::test]
+    async fn a_per_call_model_argument_wins_over_the_subagents_static_default() {
+        let pinned_provider = text_response_provider("used pinned");
+        let call_provider = text_response_provider("used call override");
+        let factory: Arc<ProviderFactory> = Arc::new(move |_name, model| match model {
+            "pinned-model" => Ok(pinned_provider.clone()),
+            "cheap-model" => Ok(call_provider.clone()),
+            other => Err(format!("unexpected model '{other}'")),
+        });
+
+        let mut subagent = reviewer_subagent();
+        subagent.model = Some("pinned-model".to_string());
+
+        let tool = AgentTool::new(
+            vec![subagent],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "reviewer", "task": "review this", "model": "cheap-model"}),
+                &ctx(),
+            )
+            .await;
+
+        assert_eq!(outcome.content, "used call override");
+    }
+
+    #[tokio::test]
+    async fn no_override_means_the_factory_is_never_invoked() {
+        let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = factory_calls.clone();
+        let factory: Arc<ProviderFactory> = Arc::new(move |_name, _model| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("should never be called".to_string())
+        });
+
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+
+        let outcome = tool
+            .execute(serde_json::json!({"name": "reviewer", "task": "review this"}), &ctx())
+            .await;
+
+        assert!(!outcome.is_error, "got: {}", outcome.content);
+        assert_eq!(outcome.content, "used default");
+        assert_eq!(
+            factory_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the default (no-override) path must never call the factory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_factory_is_a_tool_error_not_a_panic() {
+        let factory: Arc<ProviderFactory> = Arc::new(|_name, _model| Err("missing API key".to_string()));
+
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "reviewer", "task": "review this", "model": "unknown-model"}),
+                &ctx(),
+            )
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("missing API key"), "got: {}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn requesting_an_override_with_no_factory_configured_is_a_tool_error() {
+        let tool = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            None,
+        );
+
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "reviewer", "task": "review this", "model": "cheap-model"}),
+                &ctx(),
+            )
+            .await;
+
+        assert!(outcome.is_error);
+    }
+
+    #[test]
+    fn model_argument_is_only_advertised_when_a_provider_factory_is_configured() {
+        let without_factory = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            None,
+        );
+        assert!(without_factory.parameters_schema()["properties"].get("model").is_none());
+
+        let factory: Arc<ProviderFactory> = Arc::new(|_name, _model| Err("unused".to_string()));
+        let with_factory = AgentTool::new(
+            vec![reviewer_subagent()],
+            text_response_provider("used default"),
+            vec![],
+            None,
+            Arc::new(minder_core::NoopReporter),
+            Some(factory),
+        );
+        assert!(with_factory.parameters_schema()["properties"].get("model").is_some());
+    }
+
+    #[test]
+    fn frontmatter_model_and_provider_overrides_are_parsed() {
+        let agent_dir = scratch_dir();
+        write_agent(
+            &agent_dir,
+            "quick",
+            "---\nname: quick\ndescription: Fast searches\nmodel: claude-haiku-4-5\nprovider: anthropic\n---\nbody\n",
+        );
+        let subagents = discover_subagents(&agent_dir).unwrap();
+        assert_eq!(subagents[0].model, Some("claude-haiku-4-5".to_string()));
+        assert_eq!(subagents[0].provider, Some("anthropic".to_string()));
     }
 }

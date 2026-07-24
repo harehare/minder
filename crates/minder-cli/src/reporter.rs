@@ -385,7 +385,12 @@ fn summarize_args(args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
         for key in ["path", "command", "pattern", "url", "name", "query"] {
             if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-                return format!("{key}={v}");
+                // `agent` calls carry both -- show the model override alongside
+                // the subagent name instead of hiding it.
+                return match (key, obj.get("model").and_then(|v| v.as_str())) {
+                    ("name", Some(model)) => format!("{key}={v} model={model}"),
+                    _ => format!("{key}={v}"),
+                };
             }
         }
         // `todo_write`'s full list is the interesting part and already gets
@@ -415,6 +420,18 @@ mod tests {
     fn summarizes_path_argument() {
         let args = serde_json::json!({"path": "src/main.rs", "content": "..."});
         assert_eq!(summarize_args(&args), "path=src/main.rs");
+    }
+
+    #[test]
+    fn an_agent_call_with_a_model_override_shows_both_name_and_model() {
+        let args = serde_json::json!({"name": "reviewer", "task": "...", "model": "claude-haiku-4-5"});
+        assert_eq!(summarize_args(&args), "name=reviewer model=claude-haiku-4-5");
+    }
+
+    #[test]
+    fn an_agent_call_without_a_model_override_shows_only_name() {
+        let args = serde_json::json!({"name": "reviewer", "task": "..."});
+        assert_eq!(summarize_args(&args), "name=reviewer");
     }
 
     #[test]

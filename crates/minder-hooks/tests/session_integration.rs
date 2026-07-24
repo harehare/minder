@@ -110,6 +110,7 @@ async fn hook_script_blocks_destructive_command_through_the_real_agent_loop() {
         working_dir: std::env::temp_dir(),
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        mailbox: None,
     };
 
     let mut session = AgentSession::new(
@@ -151,6 +152,7 @@ async fn hook_script_allows_safe_command_through_the_real_agent_loop() {
         working_dir: std::env::temp_dir(),
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        mailbox: None,
     };
 
     let mut session = AgentSession::new(
@@ -190,6 +192,7 @@ async fn default_policy_blocks_destructive_command_with_no_project_hooks_at_all(
         working_dir: std::env::temp_dir(),
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        mailbox: None,
     };
 
     let mut session = AgentSession::new(

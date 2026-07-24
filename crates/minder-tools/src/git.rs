@@ -297,6 +297,7 @@ mod tests {
             working_dir: dir,
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         };
         run_git(&["init"], &ctx, timeout()).await;
         run_git(&["config", "user.email", "test@example.com"], &ctx, timeout()).await;

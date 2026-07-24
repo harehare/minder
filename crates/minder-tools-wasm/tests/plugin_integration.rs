@@ -24,6 +24,7 @@ fn ctx() -> ToolContext {
         working_dir: std::env::temp_dir(),
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        mailbox: None,
     }
 }
 

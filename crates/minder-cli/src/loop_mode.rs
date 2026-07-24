@@ -317,6 +317,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         };
         let mut session = minder_core::AgentSession::new(
             Arc::new(provider),

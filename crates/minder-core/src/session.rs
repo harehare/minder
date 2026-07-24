@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hooks::{HookDecision, HookPort, ToolCallDecision, ToolResultInfo};
+use crate::mailbox::Mailbox;
 use crate::message::{
     ContentBlock, Message, ProviderResponse, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
 };
@@ -84,8 +85,19 @@ impl AgentSession {
     }
 
     /// Runs one user turn to completion (looping on tool calls as needed)
-    /// and returns the final assistant message.
+    /// and returns the final assistant message. On error, rolls the
+    /// transcript back to before this call -- otherwise a failed turn leaves
+    /// a dangling user message that breaks role alternation on the next call.
     pub async fn run_turn(&mut self, user_input: &str) -> Result<Message, AgentError> {
+        let pre_turn_len = self.messages.len();
+        let result = self.run_turn_inner(user_input).await;
+        if result.is_err() {
+            self.messages.truncate(pre_turn_len);
+        }
+        result
+    }
+
+    async fn run_turn_inner(&mut self, user_input: &str) -> Result<Message, AgentError> {
         if !self.started {
             self.system_prompt = self.run_before_agent_start().await?;
             self.started = true;
@@ -137,7 +149,7 @@ impl AgentSession {
                     continue;
                 }
                 self.reporter.on_tool_call(call).await;
-                let outcome = self.execute_with_hooks(call.clone()).await?;
+                let outcome = self.execute_with_hooks(call.clone(), &self.tool_ctx).await?;
                 self.reporter.on_tool_result(call, &outcome).await;
                 results[i] = Some(ToolResult {
                     tool_call_id: call.id.clone(),
@@ -150,12 +162,19 @@ impl AgentSession {
                 for &i in &concurrent_indices {
                     self.reporter.on_tool_call(&tool_calls[i]).await;
                 }
+                // One shared mailbox per batch, so these siblings can coordinate via
+                // send_message/check_messages -- see `ToolContext::mailbox`.
+                let batch_ctx = ToolContext {
+                    mailbox: Some(Mailbox::new()),
+                    ..self.tool_ctx.clone()
+                };
                 // Shared reborrow so these futures can run concurrently.
                 let session = &*self;
                 let futures = concurrent_indices.iter().map(|&i| {
                     let call = tool_calls[i].clone();
+                    let batch_ctx = &batch_ctx;
                     async move {
-                        let outcome = session.execute_with_hooks(call.clone()).await?;
+                        let outcome = session.execute_with_hooks(call.clone(), batch_ctx).await?;
                         session.reporter.on_tool_result(&call, &outcome).await;
                         Ok::<(usize, ToolResult), AgentError>((
                             i,
@@ -267,7 +286,7 @@ impl AgentSession {
         self.messages.drain(0..drop_count);
     }
 
-    async fn execute_with_hooks(&self, call: ToolCall) -> Result<ToolExecOutcome, AgentError> {
+    async fn execute_with_hooks(&self, call: ToolCall, ctx: &ToolContext) -> Result<ToolExecOutcome, AgentError> {
         let decision = if let Some(hooks) = &self.hooks {
             hooks.lock().await.on_tool_call(&call).await
         } else {
@@ -276,7 +295,7 @@ impl AgentSession {
 
         match decision {
             ToolCallDecision::Allow(effective_call) => {
-                let outcome = self.execute_tool(&effective_call).await;
+                let outcome = self.execute_tool(&effective_call, ctx).await;
                 self.run_tool_result_hook(&effective_call.name, outcome).await
             }
             ToolCallDecision::Block(reason) => Ok(ToolExecOutcome {
@@ -292,9 +311,9 @@ impl AgentSession {
     }
 
     /// Unknown tool name -> error result with a suggestion, not a hard failure.
-    async fn execute_tool(&self, call: &ToolCall) -> ToolExecOutcome {
+    async fn execute_tool(&self, call: &ToolCall, ctx: &ToolContext) -> ToolExecOutcome {
         match self.tools.iter().find(|t| t.name() == call.name) {
-            Some(tool) => tool.execute(call.arguments.clone(), &self.tool_ctx).await,
+            Some(tool) => tool.execute(call.arguments.clone(), ctx).await,
             None => ToolExecOutcome {
                 content: unknown_tool_message(&call.name, &self.tools),
                 is_error: true,
@@ -613,6 +632,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         }
     }
 
@@ -964,6 +984,106 @@ mod tests {
 
         let err = session.run_turn("go").await.unwrap_err();
         assert!(matches!(err, AgentError::Provider(ProviderError::RateLimited { .. })));
+    }
+
+    struct AlwaysFailingProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for AlwaysFailingProvider {
+        fn id(&self) -> &'static str {
+            "always-failing"
+        }
+        fn model(&self) -> &str {
+            "always-failing-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::Api {
+                status: 400,
+                body: "bad request".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_transient_error_rolls_the_turn_back_instead_of_leaving_a_dangling_message() {
+        let mut session = AgentSession::new(Arc::new(AlwaysFailingProvider), vec![], None, "test", test_ctx());
+        session.restore(
+            "test".to_string(),
+            vec![
+                Message::user_text("earlier turn"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text("earlier reply".to_string())],
+                    metadata: serde_json::Value::Null,
+                },
+            ],
+        );
+        let pre_turn_len = session.messages().len();
+
+        let err = session.run_turn("this will fail").await.unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::Provider(ProviderError::Api { status: 400, .. })
+        ));
+        assert_eq!(
+            session.messages().len(),
+            pre_turn_len,
+            "a failed turn must not leave a dangling, unanswered user message behind"
+        );
+    }
+
+    struct FailOnceThenOkProvider {
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailOnceThenOkProvider {
+        fn id(&self) -> &'static str {
+            "fail-once"
+        }
+        fn model(&self) -> &str {
+            "fail-once-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Err(ProviderError::Api {
+                    status: 400,
+                    body: "bad request".to_string(),
+                })
+            } else {
+                Ok(text_response("recovered"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_does_not_prevent_the_next_turn_from_succeeding() {
+        let provider = FailOnceThenOkProvider {
+            calls: StdMutex::new(0),
+        };
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
+
+        session.run_turn("first, will fail").await.unwrap_err();
+
+        let final_message = session.run_turn("second, should work").await.unwrap();
+        match &final_message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "recovered"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // user input, assistant reply -- no leftover dangling message from the failed first turn.
+        assert_eq!(session.messages().len(), 2);
     }
 
     #[tokio::test]

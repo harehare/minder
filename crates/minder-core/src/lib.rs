@@ -1,4 +1,5 @@
 pub mod hooks;
+pub mod mailbox;
 pub mod message;
 pub mod provider;
 pub mod reporter;
@@ -6,6 +7,7 @@ pub mod session;
 pub mod tool;
 
 pub use hooks::{HookDecision, HookPort, RenderDecision, ToolCallDecision, ToolResultInfo};
+pub use mailbox::{Mailbox, MailboxMessage};
 pub use message::{
     ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec, Usage,
 };

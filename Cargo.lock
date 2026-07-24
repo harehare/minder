@@ -2001,6 +2001,7 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "ignore",
  "minder-core",
  "minder-hooks",
  "minder-providers",

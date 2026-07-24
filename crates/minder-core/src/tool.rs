@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::mailbox::Mailbox;
+
 /// Trait lives here (not in `minder-tools`) so `AgentSession` can hold
 /// `Vec<Box<dyn Tool>>` without minder-core depending on minder-tools.
 /// Concrete tool implementations (read_file, bash, ...) live in minder-tools.
@@ -18,6 +20,10 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     pub session_id: String,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Set only for tool calls run concurrently in one `agent` batch (see
+    /// `AgentSession::run_turn`), so those subagents can coordinate via
+    /// `send_message`/`check_messages`. `None` for every other tool call.
+    pub mailbox: Option<Mailbox>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

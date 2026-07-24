@@ -17,9 +17,9 @@ use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Repo
 use minder_hooks::HookEngine;
 use minder_tools::{
     AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool, EditFileTool, GitCommitTool, GitDiffTool,
-    GitLogTool, GitStatusTool, GlobTool, GrepTool, LsTool, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents,
-    discover_skills, discover_subagents, format_checklist,
+    GitLogTool, GitStatusTool, GlobTool, GrepTool, LsTool, ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool,
+    WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool,
+    builtin_subagents, discover_skills, discover_subagents, format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -196,6 +196,7 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         working_dir: working_dir.clone(),
         session_id: "cli".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        mailbox: None,
     };
 
     let has_project_hooks = agent_dir.join("hooks").is_dir() || agent_dir.join("hooks.mq").is_file();
@@ -320,12 +321,19 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
             std::process::exit(1);
         }
     }
+    let provider_factory: Arc<ProviderFactory> = {
+        let cfg = cfg.clone();
+        Arc::new(move |provider: &str, model: &str| {
+            provider_select::build_provider(provider, Some(model.to_string()), &cfg)
+        })
+    };
     tools.push(Arc::new(AgentTool::new(
         subagents,
         provider.clone(),
         tools.clone(),
         hooks.clone(),
         reporter.clone(),
+        Some(provider_factory),
     )));
 
     // Added after `agent` is built (not before) so subagents -- which
@@ -875,6 +883,29 @@ async fn handle_slash_command(
     }
 }
 
+/// Forwards everything except assistant text/thinking -- used by `/plan` to
+/// keep the tool-call trace live without duplicating the final plan text.
+struct MuteTextReporter(Arc<dyn Reporter>);
+
+#[async_trait::async_trait]
+impl Reporter for MuteTextReporter {
+    async fn on_turn_start(&self) {
+        self.0.on_turn_start().await;
+    }
+    async fn on_turn_end(&self) {
+        self.0.on_turn_end().await;
+    }
+    async fn on_tool_call(&self, call: &minder_core::ToolCall) {
+        self.0.on_tool_call(call).await;
+    }
+    async fn on_tool_result(&self, call: &minder_core::ToolCall, outcome: &minder_core::ToolExecOutcome) {
+        self.0.on_tool_result(call, outcome).await;
+    }
+    async fn on_retry(&self, attempt: usize, max_attempts: usize, delay: Duration, reason: &str) {
+        self.0.on_retry(attempt, max_attempts, delay, reason).await;
+    }
+}
+
 /// `/plan <task>`: runs `task` through a throwaway `AgentSession` that
 /// shares the real session's provider/hooks (same sharing `AgentTool` uses
 /// for subagents) but only has read-only tools, so it can investigate and
@@ -897,6 +928,8 @@ async fn run_plan_command(
         .filter(|t| PLAN_READ_ONLY_TOOLS.contains(&t.name()))
         .cloned()
         .collect();
+    // Mutes live text streaming so the plan isn't shown twice -- see below.
+    let plan_reporter: Arc<dyn Reporter> = Arc::new(MuteTextReporter(built.reporter.clone()));
     let mut plan_session = AgentSession::new(
         built.provider.clone(),
         read_only_tools,
@@ -904,7 +937,7 @@ async fn run_plan_command(
         PLAN_SYSTEM_PROMPT,
         built.tool_ctx.clone(),
     )
-    .with_reporter(built.reporter.clone());
+    .with_reporter(plan_reporter);
 
     let plan_text = match run_turn_interruptible(&mut plan_session, task).await {
         Ok(message) => message.text(),
@@ -918,7 +951,14 @@ async fn run_plan_command(
         }
     };
 
-    println!("{plan_text}");
+    if plan_text.trim().is_empty() {
+        println!("(model returned no plan text -- try rephrasing the task, or check /thinking output above)");
+        println!();
+        return;
+    }
+
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    println!("{}", markdown::render(&plan_text, color));
     println!();
 
     let confirmed = match editor.readline("Proceed with this plan? [y/N] ") {
@@ -1170,6 +1210,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
         }
     }
 
