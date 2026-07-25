@@ -14,25 +14,37 @@
 </div>
 
 Multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness with policy/observability
-hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language rather than a
-general-purpose scripting language — `mq-lang` has no builtin for file writes, network requests, or
-process execution, so hooks can observe, block, or transform agent behavior without being able to
-cause side effects themselves.
-
-The agent loop is a standard ReAct-style tool-calling loop; hooks only answer narrow policy
-questions at five fixed interception points and never drive the loop itself. Every tool call and
-result streams live to the terminal — see [Live execution display](#live-execution-display).
-`mq-lang` also powers the harness's [autonomous loop mode](#autonomous-loop-mode): `minder loop
-TODO.md` re-queries a Markdown checklist after each turn and keeps working through unchecked items,
-with no user in the loop and no external `mq` binary required.
+hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language — a standard
+ReAct-style tool-calling loop where hooks only answer narrow policy questions at five fixed
+interception points and never drive the loop itself.
 
 > [!IMPORTANT]
 > This project is under active development and has not been thoroughly tested end to end yet. Providers, tools, and hooks work individually in unit tests, but the full agent loop hasn't seen broad real-world verification — expect rough edges.
 
-See `crates/minder-core`, `crates/minder-providers`, `crates/minder-tools`, `crates/minder-tools-wasm`, `crates/minder-tools-mcp`, `crates/minder-hooks`, `crates/minder-cli`.
+## Why minder?
+
+- **Policy without a general-purpose scripting language** — hooks are written in [`mq`](https://github.com/harehare/mq)'s embeddable query language, which has no builtin for file writes, network requests, or process execution, so a hook can observe, block, or transform agent behavior but can't itself cause side effects.
+- **Nothing hidden** — every tool call and result streams live to the terminal as it happens, split across stdout (the conversation) and stderr (the execution trace), not just the final answer. See [Live execution display](#live-execution-display).
+- **Multi-provider** — Anthropic, OpenAI, Gemini, and local Ollama (including gpt-oss) behind one interface, switched with a single env var.
+- **Extensible without forking** — project-local [skills](#skills), [subagents](#subagents), [hooks](#hooks), [WASM tool plugins](#tool-plugins-wasm), and optional [MCP servers](#mcp-servers-optional) all live under `.agent/` in the target repo, not in minder itself.
+- **Unattended runs** — [`minder loop`](#autonomous-loop-mode) re-queries a Markdown checklist after each turn and keeps working through unchecked items, with retry/backoff on transient provider errors and a session that survives a restart.
+
+## Packages
+
+| Crate | Description |
+|---|---|
+| [`minder-cli`](crates/minder-cli) | Command-line interface — `minder`, `minder chat`, `minder loop` |
+| [`minder-core`](crates/minder-core) | Session/turn loop, tool-calling protocol, and hook port trait |
+| [`minder-providers`](crates/minder-providers) | Anthropic/OpenAI/Gemini/Ollama client implementations |
+| [`minder-tools`](crates/minder-tools) | Built-in tools (file, shell, git, web) |
+| [`minder-tools-wasm`](crates/minder-tools-wasm) | WASI plugin loader and sandboxed host runtime for tool plugins |
+| [`minder-tools-mcp`](crates/minder-tools-mcp) | MCP client — spawns configured servers and exposes their tools |
+| [`minder-hooks`](crates/minder-hooks) | mq-based hook engine (`.agent/hooks/*.mq`) |
 
 ## Contents
 
+- [Why minder?](#why-minder)
+- [Packages](#packages)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Scripting and automation](#scripting-and-automation)
@@ -45,6 +57,7 @@ See `crates/minder-core`, `crates/minder-providers`, `crates/minder-tools`, `cra
 - [MCP servers (optional)](#mcp-servers-optional)
 - [Autonomous loop mode](#autonomous-loop-mode)
 - [Development](#development)
+- [Support](#support)
 
 ## Install
 
@@ -827,6 +840,12 @@ All crates publish to crates.io under the `minder-*` prefix (`cargo install mind
 `vX.Y.Z` tag push also runs [`cargo-publish.yml`](.github/workflows/cargo-publish.yml) (needs a
 `CARGO_REGISTRY_TOKEN` secret). Prefer a GitHub Release binary if you don't want to build from
 source (see [Install](#install)).
+
+## Support
+
+- 🐛 [Report a bug](https://github.com/harehare/minder/issues/new)
+- 💡 [Request a feature](https://github.com/harehare/minder/issues/new)
+- ⭐ [Star the project](https://github.com/harehare/minder) if you find it useful!
 
 ## License
 
