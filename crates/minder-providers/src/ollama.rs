@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use minder_core::{
     ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall, ToolResultContent,
@@ -6,6 +8,15 @@ use minder_core::{
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
+
+/// Reasoning models (gpt-oss and friends) can legitimately spend minutes
+/// generating hidden `thinking` tokens before any content comes back, so
+/// this needs to be generous -- but a remote/tunneled Ollama host that goes
+/// quiet mid-response (dead proxy, dropped connection) must still fail
+/// eventually instead of hanging the session forever with no output.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct OllamaProvider {
     base_url: String,
     model: String,
@@ -17,7 +28,15 @@ impl OllamaProvider {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
+                // Detects a connection that's silently gone dead (common
+                // through proxies/tunnels) instead of waiting the full
+                // REQUEST_TIMEOUT to notice.
+                .tcp_keepalive(Duration::from_secs(60))
+                .build()
+                .expect("reqwest client config is static and valid"),
         }
     }
 
@@ -134,6 +153,11 @@ struct OlResponse {
     message: OlResponseMessage,
     #[serde(default)]
     done: bool,
+    /// Set when `done` is true; e.g. "stop" or "length" (context/predict
+    /// budget exhausted). Reasoning models can burn the whole budget on
+    /// hidden `thinking` and never reach a final answer -- without this,
+    /// that case was indistinguishable from a normal, complete "stop".
+    done_reason: Option<String>,
     prompt_eval_count: Option<u32>,
     eval_count: Option<u32>,
 }
@@ -141,6 +165,12 @@ struct OlResponse {
 #[derive(Deserialize)]
 struct OlResponseMessage {
     content: String,
+    /// Chain-of-thought from reasoning models (gpt-oss, deepseek-r1, ...).
+    /// Ollama returns this separately from `content`; dropping it silently
+    /// meant a response that was all thinking and no final answer showed up
+    /// as an empty assistant message with nothing reported to the user.
+    #[serde(default)]
+    thinking: String,
     #[serde(default)]
     tool_calls: Vec<OlToolCall>,
 }
@@ -224,6 +254,12 @@ fn to_ollama_tools(tools: &[ToolSpec]) -> Vec<OlTool> {
 
 fn from_ollama_response(resp: OlResponse) -> ProviderResponse {
     let mut content = Vec::new();
+    if !resp.message.thinking.is_empty() {
+        content.push(ContentBlock::Thinking {
+            text: resp.message.thinking,
+            signature: None,
+        });
+    }
     if !resp.message.content.is_empty() {
         content.push(ContentBlock::Text(resp.message.content));
     }
@@ -239,6 +275,8 @@ fn from_ollama_response(resp: OlResponse) -> ProviderResponse {
 
     let stop_reason = if has_tool_calls {
         StopReason::ToolUse
+    } else if resp.done_reason.as_deref() == Some("length") {
+        StopReason::MaxTokens
     } else if resp.done {
         StopReason::EndTurn
     } else {
@@ -274,6 +312,39 @@ mod tests {
             ContentBlock::Text(t) => assert_eq!(t, "hello there"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn surfaces_thinking_as_a_content_block() {
+        let raw = r#"{
+            "message": {"role": "assistant", "content": "42", "thinking": "let me reason..."},
+            "done": true
+        }"#;
+        let parsed: OlResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_ollama_response(parsed);
+        match &resp.message.content[0] {
+            ContentBlock::Thinking { text, .. } => assert_eq!(text, "let me reason..."),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        match &resp.message.content[1] {
+            ContentBlock::Text(t) => assert_eq!(t, "42"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_by_length_is_reported_as_max_tokens_not_a_silent_end_turn() {
+        // A reasoning model can burn its whole budget on hidden `thinking`
+        // and never reach a final answer -- `content` stays empty, but this
+        // must not look like a normal, complete turn.
+        let raw = r#"{
+            "message": {"role": "assistant", "content": "", "thinking": "still reasoning when cut off"},
+            "done": true,
+            "done_reason": "length"
+        }"#;
+        let parsed: OlResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_ollama_response(parsed);
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
     }
 
     #[test]
