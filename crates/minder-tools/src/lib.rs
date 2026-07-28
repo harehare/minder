@@ -1,3 +1,5 @@
+mod agent_monitor;
+mod agent_registry;
 mod bash;
 mod checkpoint;
 mod delete_file;
@@ -8,6 +10,7 @@ mod glob_tool;
 mod grep;
 mod ls;
 mod mailbox_tools;
+mod numeric;
 mod read_file;
 mod skill;
 mod subagent;
@@ -17,6 +20,8 @@ mod web_search;
 mod worktree;
 mod write_file;
 
+pub use agent_monitor::{AgentOutputTool, AgentStopTool, ListAgentsTool};
+pub use agent_registry::{AgentRegistry, AgentRunSnapshot, AgentRunStatus};
 pub use bash::BashTool;
 pub use checkpoint::{Checkpoint, CheckpointedTool};
 pub use delete_file::DeleteFileTool;

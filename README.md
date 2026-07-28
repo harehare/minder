@@ -458,6 +458,21 @@ Subagent names must be unique, and startup fails on a missing frontmatter field,
 `agents/code-reviewer/AGENT.md` for a runnable example (copy `agents/` to `.agent/agents/` to try
 it).
 
+### Background subagents
+
+Pass `background: true` in an `agent` call to start it and get an id back immediately instead of
+waiting for its final answer — useful for a long-running task, or several independent ones you
+want running while you keep doing other work in the main conversation:
+
+| Tool | Does |
+|---|---|
+| `list_agents` | Lists background runs (newest first) with id, status, and elapsed time |
+| `agent_output` | Fetches a run's result by id; pass `wait_secs` to block until it finishes |
+| `agent_stop` | Cancels a run by id (best-effort — stops it before its next step, not mid-flight) |
+
+These three are only ever offered to the top-level conversation, not to a subagent's own tool list
+(same as `todo_write`), so delegation still can't recurse.
+
 ## Hooks
 
 ```

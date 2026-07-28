@@ -10,6 +10,7 @@ pub struct BashTool;
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default, deserialize_with = "crate::numeric::deserialize_timeout_secs")]
     timeout_secs: Option<u64>,
 }
 
@@ -126,5 +127,21 @@ mod tests {
             .await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_float_timeout_secs_is_accepted_instead_of_a_u64_type_error() {
+        let outcome = BashTool
+            .execute(serde_json::json!({"command": "echo ok", "timeout_secs": 5.0}), &ctx())
+            .await;
+        assert!(!outcome.is_error, "got: {}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn a_negative_timeout_secs_clamps_to_the_floor_instead_of_erroring() {
+        let outcome = BashTool
+            .execute(serde_json::json!({"command": "echo ok", "timeout_secs": -1}), &ctx())
+            .await;
+        assert!(!outcome.is_error, "got: {}", outcome.content);
     }
 }

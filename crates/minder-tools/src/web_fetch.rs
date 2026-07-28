@@ -98,7 +98,7 @@ struct Args {
     url: String,
     #[serde(default)]
     max_bytes: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::numeric::deserialize_timeout_secs")]
     timeout_secs: Option<u64>,
 }
 
@@ -244,6 +244,23 @@ mod tests {
             )
             .await;
         assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_float_timeout_secs_is_accepted_instead_of_a_u64_type_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/hello"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("hi"))
+            .mount(&server)
+            .await;
+
+        let outcome = WebFetchTool::new_allowing_loopback()
+            .execute(
+                serde_json::json!({"url": format!("{}/hello", server.uri()), "timeout_secs": 5.0}),
+                &ctx(),
+            )
+            .await;
+        assert!(!outcome.is_error, "got: {}", outcome.content);
     }
 
     #[tokio::test]

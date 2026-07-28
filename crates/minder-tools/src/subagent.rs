@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent_registry::AgentRegistry;
 use crate::mailbox_tools::{CheckMessagesTool, SendMessageTool};
 
 /// A named, isolated `AgentSession` the main loop can delegate a task to via
@@ -174,6 +175,10 @@ pub struct AgentTool {
     /// means overrides aren't supported in this context -- the `model`
     /// argument is left out of the schema entirely (see `parameters_schema`).
     provider_factory: Option<Arc<ProviderFactory>>,
+    /// Tracks runs started with `background: true` so `list_agents`/
+    /// `agent_output`/`agent_stop` (registered alongside this tool, see
+    /// `main.rs::build_session`) can inspect or cancel them later.
+    registry: Arc<AgentRegistry>,
 }
 
 impl AgentTool {
@@ -184,6 +189,7 @@ impl AgentTool {
         hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
         reporter: Arc<dyn Reporter>,
         provider_factory: Option<Arc<ProviderFactory>>,
+        registry: Arc<AgentRegistry>,
     ) -> Self {
         let list = subagents
             .iter()
@@ -196,7 +202,9 @@ impl AgentTool {
              of work (e.g. a focused review or search) instead of doing it inline, especially \
              when it would otherwise clutter this conversation with intermediate tool calls. \
              Call it more than once in the same turn to run subagents concurrently -- they can \
-             then coordinate with each other via send_message/check_messages.\n\n\
+             then coordinate with each other via send_message/check_messages. Pass \
+             `background: true` to start it and return immediately instead of waiting -- check \
+             on it later with `list_agents`/`agent_output`, or cancel it with `agent_stop`.\n\n\
              Available subagents:\n{list}"
         );
         Self {
@@ -207,6 +215,7 @@ impl AgentTool {
             reporter,
             description,
             provider_factory,
+            registry,
         }
     }
 }
@@ -216,6 +225,8 @@ struct Args {
     name: String,
     task: String,
     model: Option<String>,
+    #[serde(default)]
+    background: bool,
 }
 
 #[async_trait]
@@ -249,6 +260,13 @@ impl Tool for AgentTool {
                                  stronger one for a complex one. Omit to use the default."
             });
         }
+        properties["background"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Run this subagent in the background instead of waiting for its \
+                             final answer -- returns an id immediately. Check on it with \
+                             `list_agents`/`agent_output`, or cancel it with `agent_stop`. \
+                             Default false (wait for the result)."
+        });
         serde_json::json!({
             "type": "object",
             "properties": properties,
@@ -332,51 +350,117 @@ impl Tool for AgentTool {
             );
         }
 
-        let mut attempt = 0u32;
-        loop {
+        if !args.background {
             let child_ctx = ToolContext {
                 working_dir: ctx.working_dir.clone(),
                 session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
                 cancel: ctx.cancel.clone(),
                 mailbox: None,
             };
-            let mut session = AgentSession::new(
-                provider.clone(),
-                tools.clone(),
+            return run_subagent_to_completion(
+                subagent.name.clone(),
+                args.task.clone(),
+                provider,
+                tools,
                 self.hooks.clone(),
-                system_prompt.clone(),
+                system_prompt,
+                self.reporter.clone(),
                 child_ctx,
             )
-            .with_reporter(self.reporter.clone());
+            .await;
+        }
 
-            match session.run_turn(&args.task).await {
-                Ok(message) => {
-                    return ToolExecOutcome {
-                        content: message.text(),
-                        is_error: false,
-                        metadata: serde_json::Value::Null,
-                    };
-                }
-                // Only provider errors are retried -- a hook block or interrupt is never one to retry.
-                Err(e @ AgentError::Provider(_)) if attempt < MAX_SUBAGENT_RETRIES => {
-                    attempt += 1;
-                    self.reporter
-                        .on_retry(
-                            attempt as usize,
-                            MAX_SUBAGENT_RETRIES as usize,
-                            SUBAGENT_RETRY_DELAY,
-                            &format!("subagent '{}': {e}", subagent.name),
-                        )
-                        .await;
-                    tokio::time::sleep(SUBAGENT_RETRY_DELAY).await;
-                }
-                Err(e) => {
-                    return error(format!(
-                        "subagent '{}' failed after {} attempt(s): {e}",
-                        subagent.name,
-                        attempt + 1
-                    ));
-                }
+        // Child of the caller's own token: an interrupt of the whole turn
+        // takes this background run down with it, but `agent_stop` cancelling
+        // just this run doesn't touch its siblings (see `CancellationToken`'s
+        // parent/child semantics).
+        let cancel = ctx.cancel.child_token();
+        let id = self.registry.start(&subagent.name, &args.task, cancel.clone());
+        let child_ctx = ToolContext {
+            working_dir: ctx.working_dir.clone(),
+            session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
+            cancel,
+            mailbox: None,
+        };
+
+        let registry = self.registry.clone();
+        let reporter = self.reporter.clone();
+        let hooks = self.hooks.clone();
+        let subagent_name = subagent.name.clone();
+        let task = args.task.clone();
+        let run_id = id.clone();
+        tokio::spawn(async move {
+            let outcome =
+                run_subagent_to_completion(subagent_name, task, provider, tools, hooks, system_prompt, reporter, child_ctx)
+                    .await;
+            registry.finish(&run_id, outcome.content, outcome.is_error);
+        });
+
+        ToolExecOutcome {
+            content: format!(
+                "Started subagent '{}' in the background as {id}. Use `list_agents` to check \
+                 its status, `agent_output` to fetch its result, or `agent_stop` to cancel it.",
+                subagent.name
+            ),
+            is_error: false,
+            metadata: serde_json::json!({ "id": id, "background": true }),
+        }
+    }
+}
+
+/// Runs one subagent turn to completion, retrying a transient provider error
+/// up to `MAX_SUBAGENT_RETRIES` times with a fresh session each attempt (not
+/// a resume of the failed one). Shared by `AgentTool::execute`'s foreground
+/// and background (`tokio::spawn`-ed) paths, so both get identical retry
+/// behavior.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_to_completion(
+    subagent_name: String,
+    task: String,
+    provider: Arc<dyn LlmProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+    hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+    system_prompt: String,
+    reporter: Arc<dyn Reporter>,
+    child_ctx: ToolContext,
+) -> ToolExecOutcome {
+    let mut attempt = 0u32;
+    loop {
+        let mut session = AgentSession::new(
+            provider.clone(),
+            tools.clone(),
+            hooks.clone(),
+            system_prompt.clone(),
+            child_ctx.clone(),
+        )
+        .with_reporter(reporter.clone());
+
+        match session.run_turn(&task).await {
+            Ok(message) => {
+                return ToolExecOutcome {
+                    content: message.text(),
+                    is_error: false,
+                    metadata: serde_json::Value::Null,
+                };
+            }
+            // Only provider errors are retried -- a hook block or interrupt is never one to retry.
+            Err(e @ AgentError::Provider(_)) if attempt < MAX_SUBAGENT_RETRIES => {
+                attempt += 1;
+                reporter
+                    .on_retry(
+                        attempt as usize,
+                        MAX_SUBAGENT_RETRIES as usize,
+                        SUBAGENT_RETRY_DELAY,
+                        &format!("subagent '{subagent_name}': {e}"),
+                    )
+                    .await;
+                tokio::time::sleep(SUBAGENT_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                return error(format!(
+                    "subagent '{subagent_name}' failed after {} attempt(s): {e}",
+                    attempt + 1
+                ));
             }
         }
     }
@@ -564,6 +648,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -601,6 +686,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -625,6 +711,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
         let outcome = tool
             .execute(serde_json::json!({"name": "nope", "task": "x"}), &ctx())
@@ -690,6 +777,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -713,6 +801,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -780,6 +869,7 @@ mod tests {
             Some(Arc::new(tokio::sync::Mutex::new(hooks))),
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -822,6 +912,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -855,6 +946,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -885,6 +977,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -913,6 +1006,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -939,6 +1033,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -961,6 +1056,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
 
         let outcome = tool
@@ -982,6 +1078,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             None,
+            Arc::new(AgentRegistry::new()),
         );
         assert!(without_factory.parameters_schema()["properties"].get("model").is_none());
 
@@ -993,6 +1090,7 @@ mod tests {
             None,
             Arc::new(minder_core::NoopReporter),
             Some(factory),
+            Arc::new(AgentRegistry::new()),
         );
         assert!(with_factory.parameters_schema()["properties"].get("model").is_some());
     }

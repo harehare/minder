@@ -17,10 +17,11 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
-    AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool, EditFileTool, GitCommitTool, GitDiffTool,
-    GitLogTool, GitStatusTool, GlobTool, GrepTool, LsTool, ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool,
-    WebFetchTool, WebSearchTool, WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool, WriteFileTool,
-    builtin_subagents, discover_skills, discover_subagents, format_checklist,
+    AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool,
+    EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool, ListAgentsTool, LsTool,
+    ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WorktreeAddTool,
+    WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
+    format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -64,8 +65,10 @@ editing it, prefer `edit_file` over `write_file` for existing files, and verify 
 `git_diff`/tests before calling it done.
 
 Delegate self-contained work to `agent`, and check `skill` for a matching project skill before \
-improvising. Only commit, push, or run other state-changing git/bash commands when asked. Use \
-`delete_file` (not `bash rm`) to remove a file -- it's recoverable, `rm` isn't.
+improvising. Pass `background: true` to `agent` for a long-running or parallelizable piece of \
+work you don't need to wait on -- check on it later with `list_agents`/`agent_output`, or cancel \
+it with `agent_stop`. Only commit, push, or run other state-changing git/bash commands when \
+asked. Use `delete_file` (not `bash rm`) to remove a file -- it's recoverable, `rm` isn't.
 
 Use `todo_write` to plan and track progress on any task with several non-trivial steps -- keep at \
 most one item `in_progress` at a time and mark items `completed` as soon as they're actually done. \
@@ -330,6 +333,7 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
             provider_select::build_provider(provider, Some(model.to_string()), &cfg)
         })
     };
+    let agent_registry = Arc::new(AgentRegistry::new());
     tools.push(Arc::new(AgentTool::new(
         subagents,
         provider.clone(),
@@ -337,13 +341,18 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         hooks.clone(),
         reporter.clone(),
         Some(provider_factory),
+        agent_registry.clone(),
     )));
 
     // Added after `agent` is built (not before) so subagents -- which
     // inherit a snapshot of `tools` taken above -- don't get a shared todo
-    // list of their own; todo tracking is for the top-level conversation.
+    // list, or the ability to inspect/cancel background runs, of their own;
+    // both are for the top-level conversation only.
     let todo = Arc::new(TodoWriteTool::new());
     tools.push(todo.clone() as Arc<dyn Tool>);
+    tools.push(Arc::new(ListAgentsTool::new(agent_registry.clone())));
+    tools.push(Arc::new(AgentOutputTool::new(agent_registry.clone())));
+    tools.push(Arc::new(AgentStopTool::new(agent_registry)));
 
     let session = AgentSession::new(
         provider.clone(),
