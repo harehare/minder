@@ -41,6 +41,12 @@ pub struct AgentSession {
     started: bool,
     /// Input tokens from the last response; drives proactive compaction.
     last_input_tokens: Option<u32>,
+    /// Set by `enable_steering` -- lets a caller (e.g. the REPL, while a
+    /// user types over a running turn) queue text that gets spliced into
+    /// the transcript at the next safe point instead of waiting for this
+    /// turn to end. `None` means steering isn't wired up, the common case
+    /// (subagents, tests, non-interactive runs).
+    steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +80,7 @@ impl AgentSession {
             tool_ctx,
             started: false,
             last_input_tokens: None,
+            steering_rx: None,
         }
     }
 
@@ -82,6 +89,18 @@ impl AgentSession {
     pub fn with_reporter(mut self, reporter: Arc<dyn Reporter>) -> Self {
         self.reporter = reporter;
         self
+    }
+
+    /// Opts this session into mid-turn steering: returns a sender a caller
+    /// can use to queue a user message while a turn is running. Queued text
+    /// isn't spliced in immediately (there's no safe mid-provider-call
+    /// injection point) -- it's picked up the next time this turn reaches a
+    /// tool-results message (or, failing that, the start of the *next*
+    /// `run_turn` call) and appended there, see `drain_steering`.
+    pub fn enable_steering(&mut self) -> tokio::sync::mpsc::UnboundedSender<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.steering_rx = Some(rx);
+        tx
     }
 
     /// Runs one user turn to completion (looping on tool calls as needed)
@@ -104,6 +123,8 @@ impl AgentSession {
         }
 
         self.messages.push(Message::user_text(user_input));
+        let injected_at = self.messages.len() - 1;
+        self.drain_steering(injected_at).await;
 
         loop {
             self.maybe_compact().await?;
@@ -196,6 +217,8 @@ impl AgentSession {
                 .map(|r| r.expect("every tool_calls index is filled by one of the two loops above"))
                 .collect();
             self.messages.push(Message::tool_results(results));
+            let tool_results_at = self.messages.len() - 1;
+            self.drain_steering(tool_results_at).await;
         }
     }
 
@@ -395,6 +418,27 @@ impl AgentSession {
     pub fn discard_interrupted_turn(&mut self, pre_turn_len: usize) {
         self.messages.truncate(pre_turn_len);
     }
+
+    /// Appends any steering text queued since the last drain onto
+    /// `self.messages[at]` as extra content blocks, rather than pushing a
+    /// new message -- providers that project `Role::Tool` onto their own
+    /// "user" role (see `minder-providers`' Anthropic mapping) would see two
+    /// consecutive user turns if this were a separate `Message::user_text`,
+    /// which several reject outright. Appending onto the message already at
+    /// that slot keeps the transcript's role alternation exactly as it was.
+    async fn drain_steering(&mut self, at: usize) {
+        let Some(rx) = &mut self.steering_rx else { return };
+        let mut drained = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            drained.push(text);
+        }
+        for text in drained {
+            self.reporter.on_steering_message(&text).await;
+            self.messages[at]
+                .content
+                .push(ContentBlock::Text(format!("[User, while you were working on this]: {text}")));
+        }
+    }
 }
 
 /// Suggests the closest registered tool name (Levenshtein distance) for a typo'd call.
@@ -585,6 +629,9 @@ mod tests {
         }
         async fn on_assistant_text(&self, text: &str) {
             self.0.lock().unwrap().push(format!("text:{text}"));
+        }
+        async fn on_steering_message(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("steering:{text}"));
         }
     }
 
@@ -847,6 +894,87 @@ mod tests {
 
         session.discard_interrupted_turn(pre_turn_len);
         assert_eq!(session.messages().len(), pre_turn_len);
+    }
+
+    #[tokio::test]
+    async fn drain_steering_appends_onto_the_existing_message_at_that_index() {
+        // Exercises `drain_steering` directly rather than through a real
+        // `run_turn`: sending before the turn even starts would just get
+        // picked up by *that* turn's own initial drain (there's only one
+        // queue), so this is the deterministic way to pin down what a
+        // mid-turn arrival (a real race between the terminal and the
+        // running turn, in practice) does to an already-pushed message.
+        let provider = ScriptedProvider::new(vec![
+            tool_use_response("call_1", "echo", serde_json::json!({"text": "hi"})),
+            text_response("done"),
+        ]);
+        let reporter = Arc::new(SpyReporter::default());
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(EchoTool)],
+            None,
+            "test agent",
+            test_ctx(),
+        )
+        .with_reporter(reporter.clone());
+        session.run_turn("do something").await.unwrap();
+        let tool_results_idx = session
+            .messages()
+            .iter()
+            .position(|m| m.role == Role::Tool)
+            .expect("a tool-results message was pushed");
+
+        let steering_tx = session.enable_steering();
+        steering_tx.send("also check the licensing".to_string()).unwrap();
+        session.drain_steering(tool_results_idx).await;
+
+        let has_steering_text = session.messages()[tool_results_idx]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("also check the licensing")));
+        assert!(has_steering_text, "got: {:?}", session.messages()[tool_results_idx]);
+        assert!(
+            reporter
+                .0
+                .lock()
+                .unwrap()
+                .contains(&"steering:also check the licensing".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_text_left_unconsumed_by_one_turn_carries_over_to_the_next() {
+        // Only a text response -- the turn ends after the very first
+        // provider call, before the loop ever reaches a tool-results drain
+        // point, so anything queued after `run_turn` returns has nowhere to
+        // land until the *next* call's initial drain.
+        let provider = ScriptedProvider::new(vec![text_response("immediate reply"), text_response("second reply")]);
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test agent", test_ctx());
+        let steering_tx = session.enable_steering();
+
+        session.run_turn("first").await.unwrap();
+        steering_tx.send("don't forget the changelog".to_string()).unwrap();
+        session.run_turn("second").await.unwrap();
+
+        let messages = session.messages();
+        let second_user_message = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .expect("the second turn's user message");
+        let has_steering_text = second_user_message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("don't forget the changelog")));
+        assert!(has_steering_text, "got: {second_user_message:?}");
+    }
+
+    #[tokio::test]
+    async fn no_enable_steering_call_means_drain_is_a_harmless_noop() {
+        let provider = ScriptedProvider::new(vec![text_response("reply")]);
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test agent", test_ctx());
+        // enable_steering was never called -- steering_rx stays None.
+        session.run_turn("hi").await.unwrap();
     }
 
     struct FlakyThenOkProvider {

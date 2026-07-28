@@ -172,12 +172,18 @@ overridable per-project from `.agent/hooks/*.mq` — see [Customizing the displa
 runs while the model is thinking or a tool call is executing (`⠋ Thinking (2.3s)`), replaced by the
 normal `✓`/`✗` line as soon as that step finishes.
 
-### Interrupting a turn
+### Interrupting or steering a turn
 
-Ctrl-C during a turn (not just while typing) stops it instead of killing the whole process: a
-running `bash`/`git_*` call gets a moment to wind down (e.g. `bash` kills its child process rather
-than orphaning it) before being force-aborted regardless — a second Ctrl-C forces this immediately.
-The turn's partial messages are discarded from history; the rest of the conversation stays intact.
+Esc or Ctrl-C during a turn (not just while typing) stops it instead of killing the whole process:
+a running `bash`/`git_*` call gets a moment to wind down (e.g. `bash` kills its child process
+rather than orphaning it) before being force-aborted regardless — a second Esc/Ctrl-C forces this
+immediately. The turn's partial messages are discarded from history; the rest of the conversation
+stays intact.
+
+You don't have to wait for a turn to finish (or interrupt it) to say something either: just start
+typing while it's running and press Enter. That line doesn't start a new turn — it's spliced into
+the *current* one at the next safe point (typically right after the in-flight tool call finishes),
+so the model sees it alongside whatever it was already doing instead of losing that progress.
 
 ### Undoing a turn's file changes
 

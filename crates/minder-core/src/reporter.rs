@@ -30,6 +30,9 @@ pub trait Reporter: Send + Sync {
     async fn on_tool_result(&self, _call: &ToolCall, _outcome: &ToolExecOutcome) {}
     /// Fired before sleeping to retry a transient provider error.
     async fn on_retry(&self, _attempt: usize, _max_attempts: usize, _delay: Duration, _reason: &str) {}
+    /// Fired when text queued via `AgentSession::enable_steering` (typed
+    /// while a turn was already running) gets spliced into the transcript.
+    async fn on_steering_message(&self, _text: &str) {}
 }
 
 /// Default reporter: observes nothing, prints nothing.

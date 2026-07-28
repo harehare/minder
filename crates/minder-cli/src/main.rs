@@ -1,5 +1,6 @@
 mod config;
 mod file_reporter;
+mod input_watcher;
 mod loop_mode;
 mod markdown;
 mod mentions;
@@ -32,6 +33,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
 use file_reporter::{CompositeReporter, FileReporter};
+use input_watcher::InputWatcher;
 use provider_select::select_provider;
 use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter, YELLOW};
 use session_store::SessionRecord;
@@ -501,51 +503,58 @@ fn working_dir() -> PathBuf {
     std::env::current_dir().expect("cwd")
 }
 
-/// How long an interrupted turn gets to wind down gracefully after a Ctrl-C
-/// (e.g. `bash` killing its child process, see `bash.rs`) before it's force-
-/// aborted regardless -- see `run_turn_interruptible`.
+/// How long an interrupted turn gets to wind down gracefully after an
+/// Esc/Ctrl-C (e.g. `bash` killing its child process, see `bash.rs`) before
+/// it's force-aborted regardless -- see `run_turn_interruptible`.
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
 
-/// Runs `session.run_turn(input)` the same as calling it directly, except a
-/// Ctrl-C during the turn interrupts it instead of killing the whole
-/// process. First Ctrl-C cancels the turn's tools (`AgentSession::reset_cancel_token`)
-/// and waits up to `INTERRUPT_GRACE_PERIOD` for the turn to notice and wind
-/// down on its own -- e.g. `bash` killing its child process rather than
-/// leaving it orphaned. A second Ctrl-C during that window (or the grace
-/// period simply elapsing) force-aborts immediately regardless.
+/// Runs `session.run_turn(input)` the same as calling it directly, except
+/// Esc or Ctrl-C during the turn interrupts it instead of killing the whole
+/// process (see `InputWatcher`), and any other line typed + Enter is
+/// steered into the still-running turn (`AgentSession::enable_steering`)
+/// instead of waiting for it to finish. First Esc/Ctrl-C cancels the turn's
+/// tools (`AgentSession::reset_cancel_token`) and waits up to
+/// `INTERRUPT_GRACE_PERIOD` for the turn to notice and wind down on its own
+/// -- e.g. `bash` killing its child process rather than leaving it orphaned.
+/// A second Esc/Ctrl-C during that window (or the grace period simply
+/// elapsing) force-aborts immediately regardless.
 ///
 /// Either way, an interrupted turn's partial messages are discarded (see
 /// `AgentSession::discard_interrupted_turn`) so the next turn starts from a
 /// clean, correctly-alternating transcript instead of one a provider might
 /// reject. The interrupted task itself isn't lost, though: the REPL just
 /// loops back to the prompt with full history intact, ready for a follow-up
-/// instruction -- the same "stop and redirect" flow other coding agents
-/// offer via Esc, just bound to Ctrl-C here since minder's REPL already
-/// treats Ctrl-C-during-input as "cancel this line" (see `run_repl`).
+/// instruction.
 async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
+    let steering_tx = session.enable_steering();
+    let mut watcher = InputWatcher::spawn(cancel, steering_tx);
 
     // Scoped so `turn` (and the mutable borrow of `session` it holds) ends
     // with this block, before `discard_interrupted_turn` below needs its
     // own borrow -- `tokio::pin!`'s storage otherwise outlives the binding
     // itself, into the rest of the function.
-    let result = {
+    let result = 'turn: {
         let turn = session.run_turn(input);
         tokio::pin!(turn);
 
         tokio::select! {
-            result = &mut turn => return result,
-            _ = tokio::signal::ctrl_c() => {}
+            result = &mut turn => break 'turn result,
+            _ = watcher.next_cancel() => {}
         }
 
-        cancel.cancel();
+        // The watcher already called `cancel.cancel()` itself before
+        // notifying -- just wait out the grace period for a graceful stop,
+        // or force-abort on a second interrupt or the timeout.
         tokio::select! {
             result = &mut turn => result,
-            _ = tokio::signal::ctrl_c() => Err(AgentError::Interrupted),
+            _ = watcher.next_cancel() => Err(AgentError::Interrupted),
             _ = tokio::time::sleep(INTERRUPT_GRACE_PERIOD) => Err(AgentError::Interrupted),
         }
     };
+
+    watcher.stop().await;
 
     if matches!(result, Err(AgentError::Interrupted)) {
         session.discard_interrupted_turn(pre_turn_len);
@@ -737,8 +746,8 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
 /// time, so they're always one glance away instead of scrolled off after
 /// the first turn.
 fn hint_line(color: bool) -> String {
-    let text =
-        "Ctrl-C cancel input/turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands · @path attaches a file/dir";
+    let text = "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D or 'exit'/'quit' to leave \
+                · /help for commands · @path attaches a file/dir";
     if color {
         format!("{DIM}{text}{RESET}")
     } else {
