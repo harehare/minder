@@ -130,7 +130,9 @@ impl Tool for AgentOutputTool {
             Err(e) => return error(format!("invalid arguments: {e}")),
         };
 
-        let deadline = args.wait_secs.map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
+        let deadline = args
+            .wait_secs
+            .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
 
         loop {
             let Some(run) = self.registry.get(&args.id) else {
@@ -139,7 +141,10 @@ impl Tool for AgentOutputTool {
 
             if run.status != AgentRunStatus::Running {
                 return ToolExecOutcome {
-                    content: run.result.clone().unwrap_or_else(|| status_label(run.status).to_string()),
+                    content: run
+                        .result
+                        .clone()
+                        .unwrap_or_else(|| status_label(run.status).to_string()),
                     is_error: run.status == AgentRunStatus::Failed,
                     metadata: run_metadata(&run),
                 };
@@ -316,7 +321,10 @@ mod tests {
         let id = registry.start("a", "task", CancellationToken::new());
         let tool = AgentOutputTool::new(registry.clone());
 
-        let waiting = tokio::spawn(async move { tool.execute(serde_json::json!({"id": id, "wait_secs": 30}), &ctx()).await });
+        let waiting = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"id": id, "wait_secs": 30}), &ctx())
+                .await
+        });
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         registry.finish(&registry.list()[0].id.clone(), "finished".to_string(), false);
@@ -350,7 +358,10 @@ mod tests {
 
         let outcome = tool.execute(serde_json::json!({"id": id}), &ctx()).await;
         assert!(!outcome.is_error);
-        assert_eq!(registry.get(outcome.metadata["id"].as_str().unwrap()).unwrap().status, AgentRunStatus::Cancelled);
+        assert_eq!(
+            registry.get(outcome.metadata["id"].as_str().unwrap()).unwrap().status,
+            AgentRunStatus::Cancelled
+        );
     }
 
     #[tokio::test]

@@ -390,9 +390,17 @@ impl Tool for AgentTool {
         let task = args.task.clone();
         let run_id = id.clone();
         tokio::spawn(async move {
-            let outcome =
-                run_subagent_to_completion(subagent_name, task, provider, tools, hooks, system_prompt, reporter, child_ctx)
-                    .await;
+            let outcome = run_subagent_to_completion(
+                subagent_name,
+                task,
+                provider,
+                tools,
+                hooks,
+                system_prompt,
+                reporter,
+                child_ctx,
+            )
+            .await;
             registry.finish(&run_id, outcome.content, outcome.is_error);
         });
 
