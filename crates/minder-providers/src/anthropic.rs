@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use minder_core::{
-    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall, ToolResult,
-    ToolResultContent, ToolSpec, Usage,
+    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Reporter, Role, StopReason, ToolCall,
+    ToolResult, ToolResultContent, ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,7 @@ impl LlmProvider for AnthropicProvider {
                 thinking_type: "enabled",
                 budget_tokens,
             }),
+            stream: false,
         };
 
         let resp = self
@@ -98,6 +100,206 @@ impl LlmProvider for AnthropicProvider {
 
         Ok(from_anthropic_response(parsed))
     }
+
+    async fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        system_prompt: Option<&str>,
+        reporter: &dyn Reporter,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let body = AnthropicRequest {
+            model: self.model.clone(),
+            max_tokens: DEFAULT_MAX_TOKENS + self.thinking_budget.unwrap_or(0),
+            system: system_prompt.map(str::to_string),
+            messages: to_anthropic_messages(messages),
+            tools: to_anthropic_tools(tools),
+            thinking: self.thinking_budget.map(|budget_tokens| AnthropicThinkingConfig {
+                thinking_type: "enabled",
+                budget_tokens,
+            }),
+            stream: true,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ProviderError::RateLimited { retry_after_secs: None });
+        }
+        if !status.is_success() {
+            let text = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let mut accum = StreamAccumulator::default();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            line_buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim_end().strip_prefix("data: ") else {
+                    continue; // blank line, `event: ...` line, or a comment
+                };
+                if accum.handle_event(data, reporter).await? {
+                    return Ok(from_anthropic_response(accum.into_response()));
+                }
+            }
+        }
+
+        Ok(from_anthropic_response(accum.into_response()))
+    }
+}
+
+/// Assembles Anthropic's SSE stream (`content_block_start`/`_delta`/`_stop`,
+/// `message_start`/`_delta`/`_stop`) into the same shape `complete`'s single
+/// JSON response parses into, so both paths share `from_anthropic_response`.
+/// Blocks arrive strictly in index order, so a plain `Vec` (pushed on each
+/// `content_block_start`) tracks them without needing an index map.
+#[derive(Default)]
+struct StreamAccumulator {
+    blocks: Vec<PendingBlock>,
+    stop_reason: Option<String>,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+enum PendingBlock {
+    Text(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        partial_json: String,
+    },
+}
+
+impl StreamAccumulator {
+    /// Returns `Ok(true)` once `message_stop` closes the stream.
+    async fn handle_event(&mut self, data: &str, reporter: &dyn Reporter) -> Result<bool, ProviderError> {
+        let event: serde_json::Value =
+            serde_json::from_str(data).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        match event.get("type").and_then(|v| v.as_str()) {
+            Some("message_start") => {
+                if let Some(tokens) = event["message"]["usage"]["input_tokens"].as_u64() {
+                    self.input_tokens = tokens as u32;
+                }
+            }
+            Some("content_block_start") => {
+                let block = &event["content_block"];
+                let pending = match block["type"].as_str() {
+                    Some("tool_use") => PendingBlock::ToolUse {
+                        id: block["id"].as_str().unwrap_or_default().to_string(),
+                        name: block["name"].as_str().unwrap_or_default().to_string(),
+                        partial_json: String::new(),
+                    },
+                    Some("thinking") => PendingBlock::Thinking {
+                        text: String::new(),
+                        signature: None,
+                    },
+                    _ => PendingBlock::Text(String::new()),
+                };
+                self.blocks.push(pending);
+            }
+            Some("content_block_delta") => {
+                let Some(current) = self.blocks.last_mut() else {
+                    return Ok(false);
+                };
+                let delta = &event["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        let text = delta["text"].as_str().unwrap_or_default();
+                        if let PendingBlock::Text(buf) = current {
+                            buf.push_str(text);
+                        }
+                        reporter.on_assistant_text_delta(text).await;
+                    }
+                    Some("thinking_delta") => {
+                        if let PendingBlock::Thinking { text, .. } = current {
+                            text.push_str(delta["thinking"].as_str().unwrap_or_default());
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let PendingBlock::Thinking { signature, .. } = current {
+                            *signature = Some(delta["signature"].as_str().unwrap_or_default().to_string());
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let PendingBlock::ToolUse { partial_json, .. } = current {
+                            partial_json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(reason) = event["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(reason.to_string());
+                }
+                if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
+                    self.output_tokens = tokens as u32;
+                }
+            }
+            Some("message_stop") => return Ok(true),
+            Some("error") => {
+                let message = event["error"]["message"].as_str().unwrap_or("unknown stream error");
+                return Err(ProviderError::Transport(message.to_string()));
+            }
+            _ => {} // ping, content_block_stop -- nothing to do
+        }
+        Ok(false)
+    }
+
+    fn into_response(self) -> AnthropicResponse {
+        let content = self
+            .blocks
+            .into_iter()
+            .map(|b| match b {
+                PendingBlock::Text(text) => AnthropicContentBlock::Text { text },
+                PendingBlock::Thinking { text, signature } => AnthropicContentBlock::Thinking {
+                    thinking: text,
+                    signature,
+                },
+                PendingBlock::ToolUse { id, name, partial_json } => AnthropicContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: if partial_json.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&partial_json).unwrap_or(serde_json::json!({}))
+                    },
+                },
+            })
+            .collect();
+
+        AnthropicResponse {
+            content,
+            stop_reason: self.stop_reason,
+            usage: AnthropicUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            },
+        }
+    }
 }
 
 // -- wire format --
@@ -113,6 +315,8 @@ struct AnthropicRequest {
     tools: Vec<AnthropicTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinkingConfig>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -361,6 +565,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             thinking: None,
+            stream: false,
         };
         let json = serde_json::to_value(&without_thinking).unwrap();
         assert!(json.get("thinking").is_none());
@@ -415,6 +620,177 @@ mod tests {
         let mapped = to_anthropic_messages(&messages);
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "user");
+    }
+
+    /// Records every `on_assistant_text_delta` call, so streaming tests can
+    /// assert deltas arrived live rather than only checking the final
+    /// accumulated response.
+    #[derive(Default)]
+    struct RecordingReporter {
+        deltas: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Reporter for RecordingReporter {
+        async fn on_assistant_text_delta(&self, delta: &str) {
+            self.deltas.lock().unwrap().push(delta.to_string());
+        }
+    }
+
+    /// Feeds each `data: ...` line (skipping blanks and `event:` lines, same
+    /// as `complete_streaming`'s real parsing) through a fresh accumulator.
+    async fn accumulate(sse_lines: &[&str], reporter: &dyn Reporter) -> AnthropicResponse {
+        let mut accum = StreamAccumulator::default();
+        for line in sse_lines {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if accum.handle_event(data, reporter).await.unwrap() {
+                break;
+            }
+        }
+        accum.into_response()
+    }
+
+    #[tokio::test]
+    async fn streaming_text_deltas_are_reported_live_and_assembled_in_order() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"data: {"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0}}}"#,
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello, "}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world!"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["Hello, ", "world!"]);
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.usage.input_tokens, 7);
+        assert_eq!(resp.usage.output_tokens, 5);
+        match &resp.content[0] {
+            AnthropicContentBlock::Text { text } => assert_eq!(text, "Hello, world!"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_use_accumulates_partial_json_across_deltas() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert!(
+            reporter.deltas.lock().unwrap().is_empty(),
+            "tool args aren't streamed as text"
+        );
+        match &resp.content[0] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "bash");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_thinking_block_accumulates_text_and_signature() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me "}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+            &reporter,
+        )
+        .await;
+
+        match &resp.content[0] {
+            AnthropicContentBlock::Thinking { thinking, signature } => {
+                assert_eq!(thinking, "let me think");
+                assert_eq!(signature.as_deref(), Some("sig123"));
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_error_event_surfaces_as_a_provider_error() {
+        let reporter = RecordingReporter::default();
+        let mut accum = StreamAccumulator::default();
+        let err = accum
+            .handle_event(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+                &reporter,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(msg) if msg == "overloaded"));
+    }
+
+    /// Unlike `accumulate` above (which feeds synthetic lines straight into
+    /// the accumulator), this goes over a real socket via `wiremock` -- the
+    /// thing actually worth distrusting is `reqwest`'s `bytes_stream` plus
+    /// our own line-buffering, since TCP can fragment the body at any byte
+    /// offset regardless of where the SSE line breaks fall.
+    #[tokio::test]
+    async fn complete_streaming_parses_a_real_sse_response_over_http() {
+        let server = wiremock::MockServer::start().await;
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider {
+            api_key: "test".to_string(),
+            base_url: server.uri(),
+            model: "claude-sonnet-5".to_string(),
+            client: reqwest::Client::new(),
+            thinking_budget: None,
+        };
+
+        let reporter = RecordingReporter::default();
+        let resp = provider
+            .complete_streaming(&[Message::user_text("hi")], &[], None, &reporter)
+            .await
+            .unwrap();
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["hi"]);
+        match &resp.message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "hi"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
     }
 
     /// Live smoke test against the real API. Requires ANTHROPIC_API_KEY;

@@ -234,7 +234,7 @@ impl AgentSession {
         loop {
             let result = self
                 .provider
-                .complete(messages, tool_specs, Some(&self.system_prompt))
+                .complete_streaming(messages, tool_specs, Some(&self.system_prompt), self.reporter.as_ref())
                 .await;
             match &result {
                 Err(err) if is_transient_error(err) && attempt < MAX_TRANSIENT_RETRIES => {

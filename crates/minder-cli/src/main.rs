@@ -565,9 +565,20 @@ async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Resu
 /// Prints a turn's error the way it deserves: an interrupt is an expected,
 /// user-initiated outcome (plain notice, no "error:" framing), everything
 /// else is a real failure.
-fn print_turn_error(err: &AgentError) {
+///
+/// An interrupt only discards the turn from the *transcript* (see
+/// `AgentSession::discard_interrupted_turn`) -- any `write_file`/`edit_file`
+/// calls that already ran before the interrupt land are still on disk, with
+/// nothing in the conversation remembering it happened. `checkpoint` still
+/// knows, though, so this warns instead of leaving that mismatch silent.
+fn print_turn_error(err: &AgentError, checkpoint: &Checkpoint) {
     if matches!(err, AgentError::Interrupted) {
         println!("Interrupted.");
+        if !checkpoint.is_empty() {
+            println!(
+                "note: this turn already edited file(s) on disk before being interrupted -- run /undo to revert them."
+            );
+        }
     } else {
         eprintln!("error: {err}");
     }
@@ -745,9 +756,16 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
 /// The line below each turn's input area: the same keyboard shortcuts every
 /// time, so they're always one glance away instead of scrolled off after
 /// the first turn.
-fn hint_line(color: bool) -> String {
-    let text = "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D or 'exit'/'quit' to leave \
-                · /help for commands · @path attaches a file/dir";
+/// `key_watching_supported`: whether Esc/steering actually work here (see
+/// `input_watcher::supports_key_watching`), not just Ctrl-C.
+fn hint_line(color: bool, key_watching_supported: bool) -> String {
+    let text = if key_watching_supported {
+        "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D or 'exit'/'quit' to leave \
+         · /help for commands · @path attaches a file/dir"
+    } else {
+        "Ctrl-C cancels a running turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands \
+         · @path attaches a file/dir"
+    };
     if color {
         format!("{DIM}{text}{RESET}")
     } else {
@@ -1022,7 +1040,7 @@ async fn run_plan_command(
     let follow_up = format!("Implement the following plan:\n\n{plan_text}\n\nOriginal task: {task}");
     built.checkpoint.start_turn();
     if let Err(e) = run_turn_interruptible(&mut built.session, &follow_up).await {
-        print_turn_error(&e);
+        print_turn_error(&e, &built.checkpoint);
     }
     persist(dir, record, &built.session);
 }
@@ -1115,6 +1133,13 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
     let color = color_enabled(std::io::stdout().is_terminal());
     let prompt = repl_prompt(color);
 
+    let key_watching_supported = input_watcher::supports_key_watching();
+    if !key_watching_supported {
+        eprintln!(
+            "warning: this terminal doesn't support raw input -- only Ctrl-C (not Esc) cancels a running turn, and mid-turn steering is unavailable"
+        );
+    }
+
     let history = session_store::history_path(dir).ok();
     let mut editor: ReplEditor = Editor::new().expect("failed to initialize line editor");
     editor.set_helper(Some(SlashCommandHelper {
@@ -1142,7 +1167,7 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
             }
         };
         println!("{}", rule_line(color));
-        println!("{}", hint_line(color));
+        println!("{}", hint_line(color, key_watching_supported));
         println!();
 
         let line = line.trim();
@@ -1167,7 +1192,7 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
         let expanded = mentions::expand_mentions(line, dir);
         built.checkpoint.start_turn();
         if let Err(e) = run_turn_interruptible(&mut built.session, &expanded).await {
-            print_turn_error(&e);
+            print_turn_error(&e, &built.checkpoint);
         }
         persist(dir, record, &built.session);
         println!();

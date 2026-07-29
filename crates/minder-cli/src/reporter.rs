@@ -32,6 +32,80 @@ struct SpinnerState {
     frame: usize,
 }
 
+/// A piece of streamed assistant text ready to print.
+#[derive(Debug)]
+enum StreamSegment {
+    /// A complete line of prose (includes its trailing `\n`), printed
+    /// as-is -- no markdown styling, since re-rendering it would need
+    /// redrawing already-printed terminal lines (see `StreamSegmenter`).
+    Prose(String),
+    /// A complete fenced code block (opening ``` through closing ```),
+    /// ready for `crate::markdown::render`'s syntax highlighting.
+    CodeBlock(String),
+}
+
+/// Incrementally splits streamed assistant text into printable pieces, so
+/// `TerminalReporter` can print prose live as it arrives while still giving
+/// code blocks real syntax highlighting -- the two goals are in tension
+/// since highlighting needs the whole block, but reprinting a fully
+/// re-rendered response over what's already on the terminal would need
+/// cursor-based redraw tricks this deliberately avoids. The accepted
+/// tradeoff: prose loses markdown styling (bold/headings/etc.) in exchange
+/// for appearing as it's generated instead of only once the turn ends.
+#[derive(Default)]
+struct StreamSegmenter {
+    /// Not yet part of a complete line, or (while `fence` is set) part of an
+    /// still-open code block.
+    pending: String,
+    /// `Some(buffer)` from the opening ``` line up to (not including) the
+    /// as-yet-unseen closing ``` line.
+    fence: Option<String>,
+}
+
+impl StreamSegmenter {
+    /// Feeds in a chunk of newly streamed text, returning every segment it
+    /// completed (usually zero or one, but a chunk spanning several
+    /// newlines can complete more than one).
+    fn push(&mut self, delta: &str) -> Vec<StreamSegment> {
+        self.pending.push_str(delta);
+        let mut ready = Vec::new();
+
+        while let Some(pos) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=pos).collect();
+            let is_fence_marker = line.trim() == "```";
+
+            match &mut self.fence {
+                Some(buf) => {
+                    buf.push_str(&line);
+                    if is_fence_marker {
+                        ready.push(StreamSegment::CodeBlock(std::mem::take(buf)));
+                        self.fence = None;
+                    }
+                }
+                None if line.trim_start().starts_with("```") => self.fence = Some(line),
+                None => ready.push(StreamSegment::Prose(line)),
+            }
+        }
+        ready
+    }
+
+    /// Called once the text block is fully done: flushes a trailing partial
+    /// line, or an unterminated code fence (best-effort -- still run
+    /// through the highlighter, which falls back to raw text if it doesn't
+    /// parse), and resets for the next block.
+    fn finish(&mut self) -> Option<StreamSegment> {
+        let pending = std::mem::take(&mut self.pending);
+        match self.fence.take() {
+            Some(mut buf) => {
+                buf.push_str(&pending);
+                Some(StreamSegment::CodeBlock(buf))
+            }
+            None if !pending.is_empty() => Some(StreamSegment::Prose(pending)),
+            None => None,
+        }
+    }
+}
+
 /// Prints live progress to the terminal as a turn runs: assistant text goes
 /// to stdout (it's the actual conversation), tool calls/results/diffs go to
 /// stderr (execution trace), matching the existing convention of `eprintln!`
@@ -64,6 +138,9 @@ pub struct TerminalReporter {
     /// implies: shown if extended thinking was requested, since a user who
     /// opted into paying for it almost certainly wants to see it.
     show_thinking: Arc<AtomicBool>,
+    /// Incremental state for `on_assistant_text_delta`'s current text block,
+    /// reset each time `on_assistant_text` flushes it -- see `StreamSegmenter`.
+    stream: Mutex<StreamSegmenter>,
 }
 
 impl TerminalReporter {
@@ -111,6 +188,7 @@ impl TerminalReporter {
             spinner,
             print_assistant_text: true,
             show_thinking,
+            stream: Mutex::new(StreamSegmenter::default()),
         }
     }
 
@@ -280,18 +358,22 @@ impl TerminalReporter {
             .insert(key.to_string(), (label, Instant::now()));
     }
 
-    /// Clears a spinner label, returning how long it was active.
+    /// Clears a spinner label, returning how long it was active. A no-op
+    /// (including the line clear) if `key` wasn't active -- callers like
+    /// `on_assistant_text_delta` call this on every delta to lazily stop the
+    /// turn spinner on the first one, and a repeat clear would erase text
+    /// that's already been streamed to the same terminal row.
     async fn stop_spinner(&self, key: &str) -> Option<Duration> {
         if !self.interactive {
             return None;
         }
         let mut state = self.spinner.lock().await;
-        let elapsed = state.labels.remove(key).map(|(_, started)| started.elapsed());
+        let (_, started) = state.labels.remove(key)?;
         if state.labels.is_empty() {
             eprint!("\r\x1b[2K");
             let _ = std::io::stderr().flush();
         }
-        elapsed
+        Some(started.elapsed())
     }
 
     /// Prints a line while holding the spinner lock, so the ticker task
@@ -306,6 +388,17 @@ impl TerminalReporter {
             f();
         }
     }
+
+    /// Prose prints as-is (no markdown styling -- see `StreamSegmenter`'s
+    /// doc comment for why); a code block goes through the same
+    /// syntax-highlighting pass a complete response would get.
+    fn print_segment(&self, segment: StreamSegment) {
+        match segment {
+            StreamSegment::Prose(line) => print!("{line}"),
+            StreamSegment::CodeBlock(block) => print!("{}", crate::markdown::render(&block, self.color)),
+        }
+        let _ = std::io::stdout().flush();
+    }
 }
 
 #[async_trait]
@@ -318,12 +411,31 @@ impl Reporter for TerminalReporter {
         self.stop_spinner(TURN_LABEL_KEY).await;
     }
 
-    async fn on_assistant_text(&self, text: &str) {
+    async fn on_assistant_text_delta(&self, delta: &str) {
         if !self.print_assistant_text {
             return;
         }
-        let rendered = crate::markdown::render(text, self.color);
-        self.print_guarded(|| println!("{rendered}")).await;
+        // First delta of a turn: the spinner's done its job, get it out of
+        // the way of the text that's about to print on the same row.
+        self.stop_spinner(TURN_LABEL_KEY).await;
+        for segment in self.stream.lock().await.push(delta) {
+            self.print_segment(segment);
+        }
+    }
+
+    /// By the time this fires, every delta for `text` already streamed
+    /// through `on_assistant_text_delta` -- this just flushes whatever's
+    /// still buffered (a trailing partial line, or an unterminated code
+    /// fence) and resets for the next block. `text` itself is unused: it's
+    /// always equal to what's already been streamed and printed.
+    async fn on_assistant_text(&self, _text: &str) {
+        if !self.print_assistant_text {
+            return;
+        }
+        if let Some(segment) = self.stream.lock().await.finish() {
+            self.print_segment(segment);
+        }
+        println!();
     }
 
     async fn on_thinking(&self, text: &str) {
@@ -377,6 +489,19 @@ impl Reporter for TerminalReporter {
         );
         self.print_guarded(|| eprintln!("{line}")).await;
     }
+
+    /// `InputWatcher` already echoed the typed line as the user typed it
+    /// (see `input_watcher::STEERING_PROMPT`) -- that only confirms it was
+    /// heard, not that it's actually taken effect, which can be a long wait
+    /// away if the current tool call is still running. This fires at the
+    /// moment it's actually spliced in, closing that gap.
+    async fn on_steering_message(&self, text: &str) {
+        if !self.print_assistant_text {
+            return;
+        }
+        let line = self.paint(DIM, &format!("↪ steering in: {text}"));
+        self.print_guarded(|| println!("{line}")).await;
+    }
 }
 
 /// Picks out the argument most useful for a one-line "what is this tool call
@@ -415,6 +540,76 @@ pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use minder_core::{HookDecision, Message, ToolCallDecision, ToolResultInfo};
+
+    fn describe(segments: &[StreamSegment]) -> Vec<(&'static str, &str)> {
+        segments
+            .iter()
+            .map(|s| match s {
+                StreamSegment::Prose(t) => ("prose", t.as_str()),
+                StreamSegment::CodeBlock(t) => ("code", t.as_str()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prose_lines_are_ready_as_soon_as_a_newline_completes_them() {
+        let mut seg = StreamSegmenter::default();
+        assert!(seg.push("no newline yet").is_empty());
+        let ready = seg.push(" now\nand more");
+        assert_eq!(describe(&ready), vec![("prose", "no newline yet now\n")]);
+    }
+
+    #[test]
+    fn a_single_delta_spanning_several_lines_yields_one_segment_per_line() {
+        let mut seg = StreamSegmenter::default();
+        let ready = seg.push("line one\nline two\n");
+        assert_eq!(describe(&ready), vec![("prose", "line one\n"), ("prose", "line two\n")]);
+    }
+
+    #[test]
+    fn a_fenced_code_block_is_buffered_whole_instead_of_line_by_line() {
+        let mut seg = StreamSegmenter::default();
+        // "before" is a complete prose line and is ready immediately; the
+        // fence opener on the same push is not (it's not closed yet).
+        let ready = seg.push("before\n```rust\n");
+        assert_eq!(describe(&ready), vec![("prose", "before\n")]);
+
+        assert!(seg.push("let x = 1;\n").is_empty(), "still inside the open fence");
+
+        let ready = seg.push("```\nafter\n");
+        assert_eq!(
+            describe(&ready),
+            vec![("code", "```rust\nlet x = 1;\n```\n"), ("prose", "after\n")]
+        );
+    }
+
+    #[test]
+    fn finish_flushes_a_trailing_partial_line() {
+        let mut seg = StreamSegmenter::default();
+        seg.push("complete line\npartial tail");
+        match seg.finish() {
+            Some(StreamSegment::Prose(t)) => assert_eq!(t, "partial tail"),
+            other => panic!("expected a trailing Prose segment, got {other:?}"),
+        }
+        assert!(seg.finish().is_none(), "state should reset after finish");
+    }
+
+    #[test]
+    fn finish_flushes_an_unterminated_code_fence_best_effort() {
+        let mut seg = StreamSegmenter::default();
+        seg.push("```rust\nlet x = 1;");
+        match seg.finish() {
+            Some(StreamSegment::CodeBlock(t)) => assert_eq!(t, "```rust\nlet x = 1;"),
+            other => panic!("expected a CodeBlock segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_on_a_clean_boundary_returns_nothing() {
+        let mut seg = StreamSegmenter::default();
+        seg.push("a complete line\n");
+        assert!(seg.finish().is_none());
+    }
 
     #[test]
     fn summarizes_path_argument() {
@@ -471,6 +666,7 @@ mod tests {
             })),
             print_assistant_text: true,
             show_thinking: Arc::new(AtomicBool::new(true)),
+            stream: Mutex::new(StreamSegmenter::default()),
         }
     }
 

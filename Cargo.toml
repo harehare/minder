@@ -34,7 +34,7 @@ tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 thiserror = "2"
-reqwest = { version = "0.13", features = ["json", "query"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 glob = "0.3"

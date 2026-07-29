@@ -18,6 +18,8 @@ serde_json.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

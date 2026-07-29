@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use minder_core::{
-    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall, ToolResultContent,
-    ToolSpec, Usage,
+    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Reporter, Role, StopReason, ToolCall,
+    ToolResultContent, ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +100,126 @@ impl LlmProvider for OllamaProvider {
 
         let parsed: OlResponse = serde_json::from_str(&text).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
         Ok(from_ollama_response(parsed))
+    }
+
+    async fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        system_prompt: Option<&str>,
+        reporter: &dyn Reporter,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut ol_messages = Vec::new();
+        if let Some(sp) = system_prompt {
+            ol_messages.push(OlMessage {
+                role: "system".to_string(),
+                content: sp.to_string(),
+                tool_calls: vec![],
+            });
+        }
+        ol_messages.extend(to_ollama_messages(messages));
+
+        let body = OlRequest {
+            model: self.model.clone(),
+            messages: ol_messages,
+            tools: to_ollama_tools(tools),
+            stream: true,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        // Ollama's native API streams newline-delimited JSON objects, not
+        // SSE -- no `data: ` prefix, just one complete object per line, each
+        // carrying the newly generated fragment of `content`/`thinking`.
+        let mut stream = resp.bytes_stream();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let mut accum = OlStreamAccumulator::default();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            line_buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                accum.handle_line(line, reporter).await?;
+            }
+        }
+
+        Ok(from_ollama_response(accum.into_response()))
+    }
+}
+
+/// Assembles Ollama's NDJSON stream into the same shape `from_ollama_response`
+/// maps from a single non-streaming response. Tool calls are sent whole
+/// (Ollama doesn't stream partial arguments the way Anthropic/OpenAI do), so
+/// they're just collected as they arrive rather than accumulated piecewise.
+#[derive(Default)]
+struct OlStreamAccumulator {
+    thinking: String,
+    text: String,
+    tool_calls: Vec<OlToolCall>,
+    done: bool,
+    done_reason: Option<String>,
+    prompt_eval_count: Option<u32>,
+    eval_count: Option<u32>,
+}
+
+impl OlStreamAccumulator {
+    async fn handle_line(&mut self, line: &str, reporter: &dyn Reporter) -> Result<(), ProviderError> {
+        let chunk: OlResponse = serde_json::from_str(line).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        if !chunk.message.content.is_empty() {
+            reporter.on_assistant_text_delta(&chunk.message.content).await;
+            self.text.push_str(&chunk.message.content);
+        }
+        if !chunk.message.thinking.is_empty() {
+            self.thinking.push_str(&chunk.message.thinking);
+        }
+        self.tool_calls.extend(chunk.message.tool_calls);
+        self.done = chunk.done;
+        if chunk.done_reason.is_some() {
+            self.done_reason = chunk.done_reason;
+        }
+        if chunk.prompt_eval_count.is_some() {
+            self.prompt_eval_count = chunk.prompt_eval_count;
+        }
+        if chunk.eval_count.is_some() {
+            self.eval_count = chunk.eval_count;
+        }
+        Ok(())
+    }
+
+    fn into_response(self) -> OlResponse {
+        OlResponse {
+            message: OlResponseMessage {
+                content: self.text,
+                thinking: self.thinking,
+                tool_calls: self.tool_calls,
+            },
+            done: self.done,
+            done_reason: self.done_reason,
+            prompt_eval_count: self.prompt_eval_count,
+            eval_count: self.eval_count,
+        }
     }
 }
 
@@ -373,6 +494,98 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].content, "output");
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        deltas: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Reporter for RecordingReporter {
+        async fn on_assistant_text_delta(&self, delta: &str) {
+            self.deltas.lock().unwrap().push(delta.to_string());
+        }
+    }
+
+    async fn accumulate(lines: &[&str], reporter: &dyn Reporter) -> OlResponse {
+        let mut accum = OlStreamAccumulator::default();
+        for line in lines {
+            accum.handle_line(line, reporter).await.unwrap();
+        }
+        accum.into_response()
+    }
+
+    #[tokio::test]
+    async fn streaming_text_deltas_are_reported_live_and_assembled_in_order() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"{"message": {"role": "assistant", "content": "Hello, "}, "done": false}"#,
+                r#"{"message": {"role": "assistant", "content": "world!"}, "done": false}"#,
+                r#"{"message": {"role": "assistant", "content": ""}, "done": true, "prompt_eval_count": 10, "eval_count": 3}"#,
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["Hello, ", "world!"]);
+        let resp = from_ollama_response(resp);
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 3);
+        match &resp.message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "Hello, world!"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_call_and_truncation_are_carried_through() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"{"message": {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "ls"}}}]}, "done": false}"#,
+                r#"{"message": {"role": "assistant", "content": ""}, "done": true, "done_reason": "length"}"#,
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert!(reporter.deltas.lock().unwrap().is_empty());
+        let resp = from_ollama_response(resp);
+        // Ollama's own quirk (see `from_ollama_response`): a tool call, if
+        // present, always wins the stop reason over a truncation reason.
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+        let calls: Vec<_> = resp.message.tool_calls().collect();
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_parses_a_real_ndjson_response_over_http() {
+        let server = wiremock::MockServer::start().await;
+        let body = concat!(
+            "{\"message\": {\"role\": \"assistant\", \"content\": \"hi\"}, \"done\": false}\n",
+            "{\"message\": {\"role\": \"assistant\", \"content\": \"\"}, \"done\": true, \"prompt_eval_count\": 2, \"eval_count\": 1}\n",
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("llama3.2").with_base_url(server.uri());
+
+        let reporter = RecordingReporter::default();
+        let resp = provider
+            .complete_streaming(&[Message::user_text("hi")], &[], None, &reporter)
+            .await
+            .unwrap();
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["hi"]);
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
     }
 
     #[tokio::test]

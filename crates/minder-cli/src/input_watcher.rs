@@ -29,6 +29,19 @@ pub struct InputWatcher {
     raw_mode_enabled: bool,
 }
 
+/// Checked once at REPL startup so it can warn instead of silently falling
+/// back to signal-only Ctrl-C every turn. Round-trips raw mode rather than
+/// just checking `is_terminal()` -- a real TTY can still fail to enable it.
+pub fn supports_key_watching() -> bool {
+    std::io::stdin().is_terminal() && {
+        let enabled = crossterm::terminal::enable_raw_mode().is_ok();
+        if enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        enabled
+    }
+}
+
 impl InputWatcher {
     pub fn spawn(cancel: CancellationToken, steering_tx: mpsc::UnboundedSender<String>) -> Self {
         let raw_mode_enabled = std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();

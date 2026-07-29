@@ -19,6 +19,11 @@ pub trait Reporter: Send + Sync {
     /// Assistant text seen on any turn, including turns that also request a
     /// tool call (previously dropped silently -- see `AgentSession::run_turn`).
     async fn on_assistant_text(&self, _text: &str) {}
+    /// A chunk of assistant text as the provider streams it in, fired zero
+    /// or more times before the same text's single `on_assistant_text` call
+    /// -- lets a live reporter print as the response is generated instead of
+    /// only once it's complete. See `LlmProvider::complete_streaming`.
+    async fn on_assistant_text_delta(&self, _delta: &str) {}
     /// Extended-thinking content seen on a turn (only fired when the
     /// provider actually returns a `Thinking` block, e.g. Anthropic with a
     /// thinking budget configured -- see `AnthropicProvider::with_thinking_budget`).

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use minder_core::{
-    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall, ToolResultContent,
-    ToolSpec, Usage,
+    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Reporter, Role, StopReason, ToolCall,
+    ToolResultContent, ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,8 @@ impl LlmProvider for OpenAiProvider {
             max_completion_tokens: DEFAULT_MAX_TOKENS,
             messages: oa_messages,
             tools: to_openai_tools(tools),
+            stream: false,
+            stream_options: None,
         };
 
         let resp = self
@@ -85,6 +88,202 @@ impl LlmProvider for OpenAiProvider {
         let parsed: OaResponse = serde_json::from_str(&text).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
         from_openai_response(parsed)
     }
+
+    async fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        system_prompt: Option<&str>,
+        reporter: &dyn Reporter,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut oa_messages = Vec::new();
+        if let Some(sp) = system_prompt {
+            oa_messages.push(OaMessage {
+                role: "system".to_string(),
+                content: Some(sp.to_string()),
+                tool_calls: vec![],
+                tool_call_id: None,
+            });
+        }
+        oa_messages.extend(to_openai_messages(messages));
+
+        let body = OaRequest {
+            model: self.model.clone(),
+            max_completion_tokens: DEFAULT_MAX_TOKENS,
+            messages: oa_messages,
+            tools: to_openai_tools(tools),
+            stream: true,
+            stream_options: Some(OaStreamOptions { include_usage: true }),
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ProviderError::RateLimited { retry_after_secs: None });
+        }
+        if !status.is_success() {
+            let text = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let mut accum = OaStreamAccumulator::default();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            line_buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim_end().strip_prefix("data: ") else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    return from_openai_response(accum.into_response());
+                }
+                accum.handle_chunk(data, reporter).await?;
+            }
+        }
+
+        from_openai_response(accum.into_response())
+    }
+}
+
+/// Mirrors `chat.completions`' SSE chunk shape -- separate from `OaResponse`
+/// since streaming has no top-level `choices[].message`, only a per-chunk
+/// `delta`, and usage arrives in its own final chunk (via `stream_options`).
+#[derive(Deserialize)]
+struct OaChunk {
+    #[serde(default)]
+    choices: Vec<OaChunkChoice>,
+    usage: Option<OaUsage>,
+}
+
+#[derive(Deserialize)]
+struct OaChunkChoice {
+    delta: OaDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OaDelta {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OaToolCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct OaToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<OaFunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct OaFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Assembles chunks into the same shape `from_openai_response` maps from a
+/// single non-streaming response, so both paths share that logic. Tool
+/// calls are keyed by their `index` within `delta.tool_calls` (which model
+/// slot they belong to, not the SSE event's position) -- growing a `Vec`
+/// indexed directly by it keeps out-of-order delivery from mixing calls up.
+#[derive(Default)]
+struct OaStreamAccumulator {
+    text: String,
+    saw_text: bool,
+    tool_calls: Vec<Option<PendingToolCall>>,
+    finish_reason: Option<String>,
+    usage: Option<OaUsage>,
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl OaStreamAccumulator {
+    async fn handle_chunk(&mut self, data: &str, reporter: &dyn Reporter) -> Result<(), ProviderError> {
+        let chunk: OaChunk = serde_json::from_str(data).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return Ok(());
+        };
+        if let Some(reason) = choice.finish_reason {
+            self.finish_reason = Some(reason);
+        }
+        if let Some(text) = choice.delta.content
+            && !text.is_empty()
+        {
+            self.saw_text = true;
+            self.text.push_str(&text);
+            reporter.on_assistant_text_delta(&text).await;
+        }
+        for tc in choice.delta.tool_calls {
+            if self.tool_calls.len() <= tc.index {
+                self.tool_calls.resize_with(tc.index + 1, || None);
+            }
+            let entry = self.tool_calls[tc.index].get_or_insert_with(PendingToolCall::default);
+            if let Some(id) = tc.id {
+                entry.id = id;
+            }
+            if let Some(function) = tc.function {
+                if let Some(name) = function.name {
+                    entry.name = name;
+                }
+                if let Some(args) = function.arguments {
+                    entry.arguments.push_str(&args);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_response(self) -> OaResponse {
+        let tool_calls: Vec<OaToolCall> = self
+            .tool_calls
+            .into_iter()
+            .flatten()
+            .map(|t| OaToolCall {
+                id: t.id,
+                kind: "function".to_string(),
+                function: OaFunctionCall {
+                    name: t.name,
+                    arguments: t.arguments,
+                },
+            })
+            .collect();
+
+        OaResponse {
+            choices: vec![OaChoice {
+                message: OaResponseMessage {
+                    content: self.saw_text.then_some(self.text),
+                    tool_calls,
+                },
+                finish_reason: self.finish_reason,
+            }],
+            usage: self.usage,
+        }
+    }
 }
 
 // -- wire format --
@@ -96,6 +295,15 @@ struct OaRequest {
     messages: Vec<OaMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OaTool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OaStreamOptions>,
+}
+
+#[derive(Serialize)]
+struct OaStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -355,6 +563,115 @@ mod tests {
         }];
         let mapped = to_openai_messages(&messages);
         assert_eq!(mapped[0].tool_calls[0].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        deltas: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Reporter for RecordingReporter {
+        async fn on_assistant_text_delta(&self, delta: &str) {
+            self.deltas.lock().unwrap().push(delta.to_string());
+        }
+    }
+
+    async fn accumulate(sse_lines: &[&str], reporter: &dyn Reporter) -> OaResponse {
+        let mut accum = OaStreamAccumulator::default();
+        for line in sse_lines {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            accum.handle_chunk(data, reporter).await.unwrap();
+        }
+        accum.into_response()
+    }
+
+    #[tokio::test]
+    async fn streaming_text_deltas_are_reported_live_and_assembled_in_order() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"data: {"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"Hello, "},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"world!"},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#,
+                "data: [DONE]",
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["Hello, ", "world!"]);
+        let resp = from_openai_response(resp).unwrap();
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 3);
+        match &resp.message.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "Hello, world!"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_calls_accumulate_by_index_across_deltas() {
+        let reporter = RecordingReporter::default();
+        let resp = accumulate(
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "data: [DONE]",
+            ],
+            &reporter,
+        )
+        .await;
+
+        assert!(reporter.deltas.lock().unwrap().is_empty());
+        let resp = from_openai_response(resp).unwrap();
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+        let calls: Vec<_> = resp.message.tool_calls().collect();
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_parses_a_real_sse_response_over_http() {
+        let server = wiremock::MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider {
+            api_key: "test".to_string(),
+            base_url: server.uri(),
+            model: "gpt-5.4-mini".to_string(),
+            client: reqwest::Client::new(),
+        };
+
+        let reporter = RecordingReporter::default();
+        let resp = provider
+            .complete_streaming(&[Message::user_text("hi")], &[], None, &reporter)
+            .await
+            .unwrap();
+
+        assert_eq!(*reporter.deltas.lock().unwrap(), vec!["hi"]);
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
     }
 
     #[tokio::test]
