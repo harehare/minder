@@ -27,6 +27,7 @@ pub struct InputWatcher {
     handle: tokio::task::JoinHandle<()>,
     cancel_rx: mpsc::UnboundedReceiver<()>,
     raw_mode_enabled: bool,
+    shutdown: CancellationToken,
 }
 
 /// Checked once at REPL startup so it can warn instead of silently falling
@@ -46,12 +47,16 @@ impl InputWatcher {
     pub fn spawn(cancel: CancellationToken, steering_tx: mpsc::UnboundedSender<String>) -> Self {
         let raw_mode_enabled = std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
 
-        let handle = tokio::spawn(async move {
-            if raw_mode_enabled {
-                watch_keys(cancel, steering_tx, cancel_tx).await;
-            } else {
-                watch_sigint_only(cancel, cancel_tx).await;
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                if raw_mode_enabled {
+                    watch_keys(cancel, steering_tx, cancel_tx, shutdown).await;
+                } else {
+                    watch_sigint_only(cancel, cancel_tx, shutdown).await;
+                }
             }
         });
 
@@ -59,6 +64,7 @@ impl InputWatcher {
             handle,
             cancel_rx,
             raw_mode_enabled,
+            shutdown,
         }
     }
 
@@ -70,11 +76,19 @@ impl InputWatcher {
     }
 
     /// Stops watching and restores the terminal (a no-op off a real TTY).
-    /// Awaits the task rather than just aborting it so raw mode is back off
-    /// before this returns -- the REPL's next `readline()` call needs a
-    /// normal, cooked terminal.
+    /// Signals the task to return on its own next `select!` turn rather than
+    /// `abort()`-ing it -- this runs at the end of *every* turn, including
+    /// the vast majority that were never interrupted, while the task is
+    /// almost always parked inside `EventStream::next()`. Force-aborting a
+    /// task mid-poll there left crossterm's raw-fd reader in a state that
+    /// occasionally broke the *next* turn's key watching or left the
+    /// terminal in raw mode -- exactly the "Esc stopped canceling" / "the
+    /// prompt didn't show" reports this was written to fix. Awaiting the
+    /// task after a cooperative exit guarantees raw mode is back off before
+    /// this returns -- the REPL's next `readline()` call needs a normal,
+    /// cooked terminal.
     pub async fn stop(self) {
-        self.handle.abort();
+        self.shutdown.cancel();
         let _ = self.handle.await;
         if self.raw_mode_enabled {
             let _ = crossterm::terminal::disable_raw_mode();
@@ -86,11 +100,25 @@ async fn watch_keys(
     cancel: CancellationToken,
     steering_tx: mpsc::UnboundedSender<String>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
 ) {
     let mut events = EventStream::new();
     let mut buffer = String::new();
 
-    while let Some(Ok(event)) = events.next().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            event = events.next() => event,
+        };
+        // `None` means the stream itself ended (e.g. stdin closed) -- stop
+        // rather than spin. A transient `Err` from a single read is not the
+        // same thing and used to fall through this same arm, silently
+        // ending the whole watcher (and Esc/steering with it) for the rest
+        // of the turn the first time crossterm hiccuped -- keep polling
+        // instead.
+        let Some(event) = event else { return };
+        let Ok(event) = event else { continue };
         let Event::Key(key) = event else { continue };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue; // ignore key-release events crossterm reports on some platforms
@@ -132,10 +160,20 @@ async fn watch_keys(
     }
 }
 
-async fn watch_sigint_only(cancel: CancellationToken, cancel_tx: mpsc::UnboundedSender<()>) {
+async fn watch_sigint_only(
+    cancel: CancellationToken,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
+) {
     loop {
-        if tokio::signal::ctrl_c().await.is_err() {
-            return;
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            result = tokio::signal::ctrl_c() => {
+                if result.is_err() {
+                    return;
+                }
+            }
         }
         cancel.cancel();
         if cancel_tx.send(()).is_err() {
