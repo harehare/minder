@@ -155,6 +155,8 @@ enum CliCommand {
 struct BuiltSession {
     session: AgentSession,
     provider: Arc<dyn LlmProvider>,
+    /// Kept so `/model <provider> [model]` can rebuild a provider via `build_provider`.
+    cfg: config::ProjectConfig,
     /// Every tool the main session has, including `agent` -- `/plan` filters
     /// this down to `PLAN_READ_ONLY_TOOLS` itself.
     tools: Vec<Arc<dyn Tool>>,
@@ -166,6 +168,8 @@ struct BuiltSession {
     /// the session. See `config::ProjectConfig::thinking_budget` for the
     /// initial value.
     show_thinking: Arc<AtomicBool>,
+    /// Shared with `TerminalReporter`'s spinner status suffix -- toggled by `/status`.
+    show_status: Arc<AtomicBool>,
     /// Also present in `tools` as a type-erased `Arc<dyn Tool>` (that's what
     /// the model actually calls); kept here too, concretely typed, so
     /// `/todo` can read the current list without downcasting.
@@ -291,7 +295,14 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
     }
 
     let show_thinking = Arc::new(AtomicBool::new(cfg.thinking_budget.is_some()));
-    let mut terminal_reporter_impl = TerminalReporter::new(hooks.clone(), show_thinking.clone());
+    let show_status = Arc::new(AtomicBool::new(
+        std::env::var("MINDER_SHOW_STATUS_BAR")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .or(cfg.show_status_bar)
+            .unwrap_or(true),
+    ));
+    let mut terminal_reporter_impl = TerminalReporter::new(hooks.clone(), show_thinking.clone(), show_status.clone());
     if output == OutputFormat::Json {
         terminal_reporter_impl = terminal_reporter_impl.silence_stdout();
     }
@@ -364,15 +375,20 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
         tool_ctx.clone(),
     )
     .with_reporter(reporter.clone());
+    // Populates the spinner's provider label from the start, not just after
+    // the first `/model` switch.
+    reporter.on_provider_changed(provider.id(), provider.model()).await;
 
     BuiltSession {
         session,
         provider,
+        cfg,
         tools,
         hooks,
         reporter,
         tool_ctx,
         show_thinking,
+        show_status,
         todo,
         checkpoint,
     }
@@ -775,20 +791,22 @@ fn hint_line(color: bool, key_watching_supported: bool) -> String {
 
 const SLASH_HELP: &str = "\
 Available commands:
-  /help          Show this list
-  /model         Show the active provider and model
-  /clear         Clear the conversation history (keeps the session file, starts fresh)
-  /plan <task>   Investigate read-only and propose a plan for <task> before touching anything
-  /thinking      Toggle showing the model's extended-thinking output (Anthropic only)
-  /todo          Show the model's current todo list
-  /undo          Revert the file changes from the most recently completed turn
-  exit, quit     Leave (Ctrl-D also works)
+  /help                      Show this list
+  /model                     Show the active provider and model
+  /model <provider> [model]  Switch the active provider/model mid-session (keeps history)
+  /clear                     Clear the conversation history (keeps the session file, starts fresh)
+  /plan <task>               Investigate read-only and propose a plan for <task> before touching anything
+  /status                    Toggle showing the active provider/model in the spinner while a turn runs
+  /thinking                  Toggle showing the model's extended-thinking output (Anthropic only)
+  /todo                      Show the model's current todo list
+  /undo                      Revert the file changes from the most recently completed turn
+  exit, quit                 Leave (Ctrl-D also works)
 
 Type @path (Tab to complete) to attach a file or directory's contents, e.g. @src/main.rs or @src/.";
 
 /// Names accepted by `handle_slash_command`, kept in sync with `SLASH_HELP`
 /// above; also drives completion/hinting in `SlashCommandHelper`.
-const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "plan", "thinking", "todo", "undo"];
+const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "plan", "status", "thinking", "todo", "undo"];
 
 /// Commands still matching what's typed after `/`, or `None` if `line`/`pos`
 /// isn't in "typing a command name" position at all (no leading `/`, cursor
@@ -930,6 +948,7 @@ async fn handle_slash_command(
 
     match cmd {
         "help" => println!("{SLASH_HELP}"),
+        "model" if !rest.is_empty() => run_model_command(rest, built).await,
         "model" => println!("{} · {}", built.session.provider_id(), built.session.model()),
         "clear" => {
             let system_prompt = built.session.system_prompt().to_string();
@@ -939,6 +958,10 @@ async fn handle_slash_command(
         }
         "plan" if !rest.is_empty() => run_plan_command(rest, built, dir, record, editor).await,
         "plan" => println!("Usage: /plan <task>"),
+        "status" => {
+            let shown = !built.show_status.fetch_xor(true, Ordering::Relaxed);
+            println!("Spinner status bar is now {}.", if shown { "on" } else { "off" });
+        }
         "thinking" => {
             let shown = !built.show_thinking.fetch_xor(true, Ordering::Relaxed);
             println!("Extended-thinking display is now {}.", if shown { "on" } else { "off" });
@@ -1043,6 +1066,26 @@ async fn run_plan_command(
         print_turn_error(&e, &built.checkpoint);
     }
     persist(dir, record, &built.session);
+}
+
+/// `/model <provider> [model]`: swaps the live provider, keeping history.
+/// Doesn't affect the `agent` tool's own default provider for subagents.
+async fn run_model_command(rest: &str, built: &mut BuiltSession) {
+    let (provider_name, model) = rest.split_once(' ').unwrap_or((rest, ""));
+    let model = (!model.trim().is_empty()).then(|| model.trim().to_string());
+
+    match provider_select::build_provider(provider_name, model, &built.cfg) {
+        Ok(provider) => {
+            built.session.set_provider(provider.clone()).await;
+            built.provider = provider;
+            println!(
+                "Switched to {} · {}",
+                built.session.provider_id(),
+                built.session.model()
+            );
+        }
+        Err(e) => println!("error: {e}"),
+    }
 }
 
 /// `/undo`: reverts every file the most recently completed turn's
@@ -1289,6 +1332,45 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
         }
+    }
+
+    fn test_built_session() -> BuiltSession {
+        let provider: Arc<dyn LlmProvider> = Arc::new(FixedTextProvider("all done"));
+        let session = AgentSession::new(provider.clone(), Vec::new(), None, "test agent", test_tool_ctx())
+            .with_reporter(Arc::new(minder_core::NoopReporter));
+        BuiltSession {
+            session,
+            provider,
+            cfg: config::ProjectConfig::default(),
+            tools: Vec::new(),
+            hooks: None,
+            reporter: Arc::new(minder_core::NoopReporter),
+            tool_ctx: test_tool_ctx(),
+            show_thinking: Arc::new(AtomicBool::new(false)),
+            show_status: Arc::new(AtomicBool::new(true)),
+            todo: Arc::new(TodoWriteTool::new()),
+            checkpoint: Arc::new(Checkpoint::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_command_switches_the_live_session_to_a_key_free_provider() {
+        let mut built = test_built_session();
+        assert_eq!(built.session.provider_id(), "fixed");
+
+        run_model_command("ollama llama3.2", &mut built).await;
+
+        assert_eq!(built.session.provider_id(), "ollama");
+        assert_eq!(built.session.model(), "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn model_command_leaves_the_session_untouched_on_an_unknown_provider() {
+        let mut built = test_built_session();
+
+        run_model_command("not-a-real-provider", &mut built).await;
+
+        assert_eq!(built.session.provider_id(), "fixed");
     }
 
     #[tokio::test]

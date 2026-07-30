@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::hooks::{HookDecision, HookPort, ToolCallDecision, ToolResultInfo};
 use crate::mailbox::Mailbox;
 use crate::message::{
-    ContentBlock, Message, ProviderResponse, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
+    ContentBlock, Message, ProviderResponse, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec, Usage,
 };
 use crate::provider::{LlmProvider, ProviderError};
 use crate::reporter::{NoopReporter, Reporter};
@@ -126,6 +126,7 @@ impl AgentSession {
         let injected_at = self.messages.len() - 1;
         self.drain_steering(injected_at).await;
 
+        let mut turn_usage = Usage::default();
         loop {
             self.maybe_compact().await?;
 
@@ -146,6 +147,8 @@ impl AgentSession {
             self.reporter.on_turn_end().await;
             let response = result?;
             self.last_input_tokens = Some(response.usage.input_tokens);
+            turn_usage.input_tokens += response.usage.input_tokens;
+            turn_usage.output_tokens += response.usage.output_tokens;
             self.messages.push(response.message.clone());
 
             for block in &response.message.content {
@@ -158,6 +161,7 @@ impl AgentSession {
 
             let tool_calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             if tool_calls.is_empty() || response.stop_reason != StopReason::ToolUse {
+                self.reporter.on_usage(&turn_usage).await;
                 return Ok(response.message);
             }
 
@@ -390,6 +394,13 @@ impl AgentSession {
         self.provider.model()
     }
 
+    /// Swaps the active provider in place; the transcript is untouched.
+    pub async fn set_provider(&mut self, provider: Arc<dyn LlmProvider>) {
+        let (id, model) = (provider.id(), provider.model().to_string());
+        self.provider = provider;
+        self.reporter.on_provider_changed(id, &model).await;
+    }
+
     /// Loads a saved transcript and marks the session started, so
     /// `before_agent_start` won't re-run. Used to resume a prior session.
     pub fn restore(&mut self, system_prompt: String, messages: Vec<Message>) {
@@ -560,6 +571,33 @@ mod tests {
         }
     }
 
+    /// Distinct id/model from `ScriptedProvider`, for `set_provider` tests.
+    struct AltProvider(StdMutex<std::collections::VecDeque<ProviderResponse>>);
+
+    impl AltProvider {
+        fn new(responses: Vec<ProviderResponse>) -> Self {
+            Self(StdMutex::new(responses.into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for AltProvider {
+        fn id(&self) -> &'static str {
+            "alt"
+        }
+        fn model(&self) -> &str {
+            "alt-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Ok(self.0.lock().unwrap().pop_front().expect("script exhausted"))
+        }
+    }
+
     struct EchoTool;
 
     #[async_trait::async_trait]
@@ -633,6 +671,18 @@ mod tests {
         async fn on_steering_message(&self, text: &str) {
             self.0.lock().unwrap().push(format!("steering:{text}"));
         }
+        async fn on_usage(&self, usage: &Usage) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("usage:{}/{}", usage.input_tokens, usage.output_tokens));
+        }
+        async fn on_provider_changed(&self, provider_id: &str, model: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("provider_changed:{provider_id}/{model}"));
+        }
     }
 
     fn thinking_then_text_response(thinking: &str, text: &str) -> ProviderResponse {
@@ -670,7 +720,47 @@ mod tests {
             [
                 "thinking:working through the problem".to_string(),
                 "text:here's the answer".to_string(),
+                "usage:0/0".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn on_usage_sums_tokens_across_every_round_trip_in_the_turn() {
+        let provider = ScriptedProvider::new(vec![
+            ProviderResponse {
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                },
+                ..tool_use_response("call_1", "echo", serde_json::json!({"text": "hi"}))
+            },
+            ProviderResponse {
+                usage: Usage {
+                    input_tokens: 150,
+                    output_tokens: 20,
+                },
+                ..text_response("done")
+            },
+        ]);
+        let spy = Arc::new(SpyReporter::default());
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(EchoTool)],
+            None,
+            "you are a test agent",
+            test_ctx(),
+        )
+        .with_reporter(spy.clone());
+
+        session.run_turn("do it").await.unwrap();
+
+        // 100+150 input, 10+20 output -- summed across both round-trips, not
+        // just the final one.
+        assert!(
+            spy.0.lock().unwrap().iter().any(|line| line == "usage:250/30"),
+            "usage not summed correctly: {:?}",
+            spy.0.lock().unwrap()
         );
     }
 
@@ -704,6 +794,41 @@ mod tests {
             other => panic!("expected final Text response, got {other:?}"),
         }
         // user input, assistant tool_use, tool results, assistant final text
+        assert_eq!(session.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn set_provider_swaps_the_provider_used_by_the_next_turn() {
+        let spy = Arc::new(SpyReporter::default());
+        let mut session = AgentSession::new(
+            Arc::new(ScriptedProvider::new(vec![text_response("from scripted")])),
+            vec![],
+            None,
+            "you are a test agent",
+            test_ctx(),
+        )
+        .with_reporter(spy.clone());
+
+        let first = session.run_turn("hi").await.unwrap();
+        assert_eq!(first.text(), "from scripted");
+        assert_eq!(session.provider_id(), "scripted");
+        assert_eq!(session.model(), "scripted-model");
+
+        session
+            .set_provider(Arc::new(AltProvider::new(vec![text_response("from alt")])))
+            .await;
+        assert_eq!(session.provider_id(), "alt");
+        assert_eq!(session.model(), "alt-model");
+        assert!(
+            spy.0
+                .lock()
+                .unwrap()
+                .contains(&"provider_changed:alt/alt-model".to_string())
+        );
+
+        // History survives the swap.
+        let second = session.run_turn("hi again").await.unwrap();
+        assert_eq!(second.text(), "from alt");
         assert_eq!(session.messages.len(), 4);
     }
 

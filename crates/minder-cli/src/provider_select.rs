@@ -15,6 +15,11 @@ pub fn build_provider(
     model_override: Option<String>,
     cfg: &ProjectConfig,
 ) -> Result<Arc<dyn LlmProvider>, String> {
+    let request_timeout_secs = std::env::var("MINDER_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(cfg.request_timeout_secs);
+
     match provider {
         "anthropic" => {
             let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| "set ANTHROPIC_API_KEY".to_string())?;
@@ -27,17 +32,28 @@ pub fn build_provider(
             if let Some(budget) = thinking_budget {
                 provider = provider.with_thinking_budget(budget);
             }
+            if let Some(secs) = request_timeout_secs {
+                provider = provider.with_request_timeout_secs(secs);
+            }
             Ok(Arc::new(provider))
         }
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").map_err(|_| "set OPENAI_API_KEY".to_string())?;
             let model = model_override.unwrap_or_else(|| "gpt-5.4-mini".to_string());
-            Ok(Arc::new(OpenAiProvider::new(key, model)))
+            let mut provider = OpenAiProvider::new(key, model);
+            if let Some(secs) = request_timeout_secs {
+                provider = provider.with_request_timeout_secs(secs);
+            }
+            Ok(Arc::new(provider))
         }
         "gemini" => {
             let key = std::env::var("GEMINI_API_KEY").map_err(|_| "set GEMINI_API_KEY".to_string())?;
             let model = model_override.unwrap_or_else(|| "gemini-3.5-flash".to_string());
-            Ok(Arc::new(GeminiProvider::new(key, model)))
+            let mut provider = GeminiProvider::new(key, model);
+            if let Some(secs) = request_timeout_secs {
+                provider = provider.with_request_timeout_secs(secs);
+            }
+            Ok(Arc::new(provider))
         }
         "ollama" => {
             let model = model_override.unwrap_or_else(|| "llama3.2".to_string());
@@ -47,6 +63,9 @@ pub fn build_provider(
                 .or_else(|| cfg.ollama_base_url.clone());
             if let Some(base_url) = base_url {
                 provider = provider.with_base_url(base_url);
+            }
+            if let Some(secs) = request_timeout_secs {
+                provider = provider.with_request_timeout_secs(secs);
             }
             Ok(Arc::new(provider))
         }

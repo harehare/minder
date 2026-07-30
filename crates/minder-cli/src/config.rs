@@ -7,8 +7,9 @@ use serde::Deserialize;
 /// resolves to all-`None`, same as every other `.agent/` input.
 ///
 /// Precedence when both are set: the matching env var (`MINDER_PROVIDER`,
-/// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_THINKING_BUDGET`) always wins
-/// over this file, so a one-off override never requires editing the project
+/// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_THINKING_BUDGET`,
+/// `MINDER_REQUEST_TIMEOUT_SECS`, `MINDER_SHOW_STATUS_BAR`) always wins over
+/// this file, so a one-off override never requires editing the project
 /// config back and forth -- see `provider_select::select_provider`.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,11 @@ pub struct ProjectConfig {
     /// Whether the resulting `Thinking` blocks are actually shown is a
     /// separate, runtime-toggleable question -- see `/thinking` in the REPL.
     pub thinking_budget: Option<u32>,
+    /// Overrides every provider's default request timeout (900s).
+    pub request_timeout_secs: Option<u64>,
+    /// Whether the spinner shows the active provider/model while a turn
+    /// runs. Defaults to `true`; runtime-toggleable via `/status`.
+    pub show_status_bar: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +69,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
-            "provider = \"openai\"\nmodel = \"gpt-5.4\"\nollama_base_url = \"http://localhost:11434\"\nthinking_budget = 4000\n",
+            "provider = \"openai\"\nmodel = \"gpt-5.4\"\nollama_base_url = \"http://localhost:11434\"\nthinking_budget = 4000\nrequest_timeout_secs = 1800\nshow_status_bar = false\n",
         )
         .unwrap();
 
@@ -74,6 +80,8 @@ mod tests {
         assert_eq!(cfg.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(cfg.ollama_base_url.as_deref(), Some("http://localhost:11434"));
         assert_eq!(cfg.thinking_budget, Some(4000));
+        assert_eq!(cfg.request_timeout_secs, Some(1800));
+        assert_eq!(cfg.show_status_bar, Some(false));
     }
 
     #[test]

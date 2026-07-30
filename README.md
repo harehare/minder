@@ -169,8 +169,15 @@ Fixed the off-by-one: `end` was one past the last valid index.
 
 Colors turn off automatically when stderr isn't a terminal or `NO_COLOR` is set. Every line here is
 overridable per-project from `.agent/hooks/*.mq` — see [Customizing the display](#hooks). A spinner
-runs while the model is thinking or a tool call is executing (`⠋ Thinking (2.3s)`), replaced by the
-normal `✓`/`✗` line as soon as that step finishes.
+runs while the model is thinking or a tool call is executing (`⠋ Thinking (2.3s) · anthropic
+(claude-sonnet-5)`), replaced by the normal `✓`/`✗` line as soon as that step finishes. The trailing
+`· provider (model)` part shows which provider is actually about to answer — handy after a `/model`
+switch — and can be turned off with `show_status_bar = false` in `.agent/config.toml` (or
+`MINDER_SHOW_STATUS_BAR=false`), or toggled for the rest of the session with `/status`. Once a turn's
+final answer is in, a trailing `↑1024 ↓256 tokens` line shows that turn's real token cost, summed
+across every provider round-trip it took (a multi-tool-call turn resends the whole conversation on
+each round-trip, so this is what it actually cost, not just the last call's numbers) — also written
+to `MINDER_LOG_FILE` if set.
 
 ### Interrupting or steering a turn
 
@@ -219,11 +226,19 @@ instead of a task:
 |---|---|
 | `/help` | Lists these commands |
 | `/model` | Shows the active provider and model |
+| `/model <provider> [model]` | Switches the active provider/model mid-session, keeping conversation history (e.g. `/model openai gpt-5.4`) |
 | `/clear` | Clears the conversation history (the session file stays, so `--continue` still works, just with nothing to continue) |
 | `/plan <task>` | Investigates read-only and proposes a plan for `<task>` before touching anything — see below |
+| `/status` | Toggles showing the active provider/model in the spinner while a turn runs — see above |
 | `/thinking` | Toggles showing the model's extended-thinking output (Anthropic only, once `thinking_budget` is configured — see below) |
 | `/todo` | Shows the model's current todo list (from `todo_write`) |
 | `/undo` | Reverts the `write_file`/`edit_file` changes from the most recently completed turn — see above |
+
+`/model <provider> [model]` rebuilds a provider (`anthropic`, `openai`, `gemini`, or `ollama`, same
+env-var/`.agent/config.toml` precedence as startup) and swaps it into the running session — useful
+for dropping to a cheaper model mid-task, or switching providers without losing context. It doesn't
+change the `agent` tool's own default provider, so a subagent delegated afterward still uses
+whichever provider the session started with unless its `AGENT.md` (or the call itself) overrides it.
 
 `/plan` runs `<task>` through a throwaway session that shares the real session's provider and
 [hooks](#hooks) but is only given read-only tools (`read_file`, `grep`, `glob`, `ls`, `git_diff`,
@@ -312,6 +327,8 @@ provider = "openai"
 model = "gpt-5.4"
 # ollama_base_url = "http://localhost:11434"  # only read when provider = "ollama"
 # thinking_budget = 4000                      # Anthropic only, see below
+# request_timeout_secs = 1800                 # overrides the 900s default, see below
+# show_status_bar = false                     # hide the spinner's provider/model suffix, see above
 ```
 
 Every field is optional and the file itself is optional. Precedence is env var (a one-off override)
@@ -324,6 +341,15 @@ Every field is optional and the file itself is optional. Precedence is env var (
 many tokens as the budget. Unset by default — no thinking requested, no extra cost or latency. Once
 set, thinking is shown live (dimmed, above the final answer); toggle it per-session with `/thinking`
 without losing the budget setting.
+
+### Request timeout
+
+Every provider (Anthropic, OpenAI, Gemini, Ollama) applies a 900-second request timeout by
+default — generous enough for a reasoning model to sit quietly producing hidden thinking tokens
+before its first byte back, but still guaranteed to fail a connection that's gone quiet forever
+(dead proxy, dropped connection) instead of hanging the session indefinitely. Override it with
+`request_timeout_secs` (or `MINDER_REQUEST_TIMEOUT_SECS`, same precedence as above) if an unusually
+large `thinking_budget` needs longer than that to produce anything.
 
 ### Running with gpt-oss
 

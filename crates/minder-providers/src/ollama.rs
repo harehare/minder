@@ -10,14 +10,6 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
-/// Reasoning models (gpt-oss and friends) can legitimately spend minutes
-/// generating hidden `thinking` tokens before any content comes back, so
-/// this needs to be generous -- but a remote/tunneled Ollama host that goes
-/// quiet mid-response (dead proxy, dropped connection) must still fail
-/// eventually instead of hanging the session forever with no output.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
 pub struct OllamaProvider {
     base_url: String,
     model: String,
@@ -29,21 +21,29 @@ impl OllamaProvider {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
-            client: reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .connect_timeout(CONNECT_TIMEOUT)
-                // Detects a connection that's silently gone dead (common
-                // through proxies/tunnels) instead of waiting the full
-                // REQUEST_TIMEOUT to notice.
-                .tcp_keepalive(Duration::from_secs(60))
-                .build()
-                .expect("reqwest client config is static and valid"),
+            client: Self::build_client(None),
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Overrides the default request timeout -- see `crate::http`.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.client = Self::build_client(Some(secs));
+        self
+    }
+
+    fn build_client(request_timeout_secs: Option<u64>) -> reqwest::Client {
+        crate::http::client_builder(request_timeout_secs)
+            // Detects a connection that's silently gone dead (common through
+            // proxies/tunnels) instead of waiting the full request timeout to
+            // notice.
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .expect("reqwest client config is static and valid")
     }
 }
 

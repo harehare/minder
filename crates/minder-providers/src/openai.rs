@@ -22,8 +22,18 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: crate::http::client_builder(None)
+                .build()
+                .expect("reqwest client config is static and valid"),
         }
+    }
+
+    /// Overrides the default request timeout -- see `crate::http`.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.client = crate::http::client_builder(Some(secs))
+            .build()
+            .expect("reqwest client config is static and valid");
+        self
     }
 }
 

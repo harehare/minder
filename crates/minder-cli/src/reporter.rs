@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use minder_core::{HookPort, RenderDecision, Reporter, ToolCall, ToolExecOutcome};
+use minder_core::{HookPort, RenderDecision, Reporter, ToolCall, ToolExecOutcome, Usage};
 use tokio::sync::Mutex;
 
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -30,6 +30,9 @@ const TURN_LABEL_KEY: &str = "__turn__";
 struct SpinnerState {
     labels: HashMap<String, (String, Instant)>,
     frame: usize,
+    /// "provider (model)", set by `on_provider_changed`; empty until the
+    /// first call, e.g. in a non-interactive `--output json` run.
+    provider_label: String,
 }
 
 /// A piece of streamed assistant text ready to print.
@@ -144,12 +147,17 @@ pub struct TerminalReporter {
 }
 
 impl TerminalReporter {
-    pub fn new(hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>, show_thinking: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+        show_thinking: Arc<AtomicBool>,
+        show_status: Arc<AtomicBool>,
+    ) -> Self {
         let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         let interactive = std::io::stderr().is_terminal();
         let spinner = Arc::new(Mutex::new(SpinnerState {
             labels: HashMap::new(),
             frame: 0,
+            provider_label: String::new(),
         }));
 
         if interactive {
@@ -171,8 +179,13 @@ impl TerminalReporter {
                         .unwrap_or_default();
                     let mut names: Vec<&str> = state.labels.values().map(|(l, _)| l.as_str()).collect();
                     names.sort_unstable();
+                    let status = if show_status.load(Ordering::Relaxed) && !state.provider_label.is_empty() {
+                        format!(" · {}", state.provider_label)
+                    } else {
+                        String::new()
+                    };
                     eprint!(
-                        "\r\x1b[2K{DIM}{frame} {} ({:.1}s){RESET}",
+                        "\r\x1b[2K{DIM}{frame} {} ({:.1}s){status}{RESET}",
                         names.join(", "),
                         elapsed.as_secs_f32()
                     );
@@ -269,6 +282,10 @@ impl TerminalReporter {
             return RenderDecision::Default;
         };
         hooks.lock().await.render_tool_result(call, outcome).await
+    }
+
+    fn format_usage(&self, usage: &Usage) -> String {
+        self.paint(DIM, &format!("↑{} ↓{} tokens", usage.input_tokens, usage.output_tokens))
     }
 
     /// Dim, indented rendering for a `Thinking` block -- deliberately
@@ -502,6 +519,18 @@ impl Reporter for TerminalReporter {
         let line = self.paint(DIM, &format!("↪ steering in: {text}"));
         self.print_guarded(|| println!("{line}")).await;
     }
+
+    async fn on_usage(&self, usage: &Usage) {
+        if !self.print_assistant_text {
+            return;
+        }
+        let line = self.format_usage(usage);
+        self.print_guarded(|| eprintln!("{line}")).await;
+    }
+
+    async fn on_provider_changed(&self, provider_id: &str, model: &str) {
+        self.spinner.lock().await.provider_label = format!("{provider_id} ({model})");
+    }
 }
 
 /// Picks out the argument most useful for a one-line "what is this tool call
@@ -663,6 +692,7 @@ mod tests {
             spinner: Arc::new(Mutex::new(SpinnerState {
                 labels: HashMap::new(),
                 frame: 0,
+                provider_label: String::new(),
             })),
             print_assistant_text: true,
             show_thinking: Arc::new(AtomicBool::new(true)),
@@ -835,6 +865,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_usage_shows_input_and_output_token_counts() {
+        let reporter = no_color_reporter(None);
+        let usage = Usage {
+            input_tokens: 1234,
+            output_tokens: 56,
+        };
+        assert_eq!(reporter.format_usage(&usage), "↑1234 ↓56 tokens");
+    }
+
     #[tokio::test]
     async fn on_thinking_is_a_noop_when_the_toggle_is_off() {
         let mut reporter = no_color_reporter(None);
@@ -844,5 +884,12 @@ mod tests {
         // module (see other tests, which only check pure formatting), so
         // this exercises the same early-return path other reporters rely on.
         reporter.on_thinking("should not print").await;
+    }
+
+    #[tokio::test]
+    async fn on_provider_changed_updates_the_spinner_label() {
+        let reporter = no_color_reporter(None);
+        reporter.on_provider_changed("openai", "gpt-5.4").await;
+        assert_eq!(reporter.spinner.lock().await.provider_label, "openai (gpt-5.4)");
     }
 }

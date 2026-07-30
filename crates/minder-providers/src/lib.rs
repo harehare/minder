@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod gemini;
+mod http;
 pub mod ollama;
 pub mod openai;
 

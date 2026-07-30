@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::message::ToolCall;
+use crate::message::{ToolCall, Usage};
 use crate::tool::ToolExecOutcome;
 
 /// Live progress callbacks fired while a turn runs, so a CLI/TUI can render
@@ -38,6 +38,15 @@ pub trait Reporter: Send + Sync {
     /// Fired when text queued via `AgentSession::enable_steering` (typed
     /// while a turn was already running) gets spliced into the transcript.
     async fn on_steering_message(&self, _text: &str) {}
+    /// Fired once `run_turn` has its final answer, with tokens summed across
+    /// every provider round-trip the turn took (each round-trip resends the
+    /// whole conversation, so this is the turn's real token cost, not just
+    /// the last call's).
+    async fn on_usage(&self, _usage: &Usage) {}
+    /// Fired once the active provider is set or changed (initial setup, or
+    /// `AgentSession::set_provider` mid-session), so a live display can show
+    /// which provider is actually about to answer.
+    async fn on_provider_changed(&self, _provider_id: &str, _model: &str) {}
 }
 
 /// Default reporter: observes nothing, prints nothing.

@@ -29,13 +29,23 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: crate::http::client_builder(None)
+                .build()
+                .expect("reqwest client config is static and valid"),
             thinking_budget: None,
         }
     }
 
     pub fn with_thinking_budget(mut self, budget_tokens: u32) -> Self {
         self.thinking_budget = Some(budget_tokens);
+        self
+    }
+
+    /// Overrides the default request timeout -- see `crate::http`.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.client = crate::http::client_builder(Some(secs))
+            .build()
+            .expect("reqwest client config is static and valid");
         self
     }
 }
@@ -791,6 +801,33 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    }
+
+    /// Response is delayed past the override, so this exercises the actual
+    /// timeout rather than just checking the builder stores the value.
+    #[tokio::test]
+    async fn request_timeout_override_fails_a_response_that_never_arrives_in_time() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_raw("data: {\"type\":\"message_stop\"}\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut provider = AnthropicProvider::new("test", "claude-sonnet-5").with_request_timeout_secs(1);
+        provider.base_url = server.uri();
+
+        let reporter = RecordingReporter::default();
+        let err = provider
+            .complete_streaming(&[Message::user_text("hi")], &[], None, &reporter)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProviderError::Transport(_)));
     }
 
     /// Live smoke test against the real API. Requires ANTHROPIC_API_KEY;

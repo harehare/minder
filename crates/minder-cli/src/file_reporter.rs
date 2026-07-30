@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use minder_core::{Reporter, ToolCall, ToolExecOutcome};
+use minder_core::{Reporter, ToolCall, ToolExecOutcome, Usage};
 
 use crate::reporter::truncate;
 
@@ -72,6 +72,13 @@ impl Reporter for FileReporter {
     async fn on_retry(&self, attempt: usize, max_attempts: usize, delay: Duration, reason: &str) {
         self.write_line(&format!("retry {attempt}/{max_attempts} in {delay:?}: {reason}"));
     }
+
+    async fn on_usage(&self, usage: &Usage) {
+        self.write_line(&format!(
+            "usage: input={} output={}",
+            usage.input_tokens, usage.output_tokens
+        ));
+    }
 }
 
 /// Fans every event out to all inner reporters, in order -- used to run the
@@ -128,6 +135,12 @@ impl Reporter for CompositeReporter {
             r.on_retry(attempt, max_attempts, delay, reason).await;
         }
     }
+
+    async fn on_usage(&self, usage: &Usage) {
+        for r in &self.0 {
+            r.on_usage(usage).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +180,12 @@ mod tests {
                 },
             )
             .await;
+        reporter
+            .on_usage(&Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            })
+            .await;
 
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -176,6 +195,7 @@ mod tests {
         assert!(contents.contains("thinking: mulling it over"));
         assert!(contents.contains("tool_call: bash"));
         assert!(contents.contains("tool_result: bash [ok] a.txt"));
+        assert!(contents.contains("usage: input=100 output=20"));
     }
 
     #[tokio::test]
@@ -201,6 +221,12 @@ mod tests {
         async fn on_thinking(&self, text: &str) {
             self.0.lock().unwrap().push(format!("thinking:{text}"));
         }
+        async fn on_usage(&self, usage: &Usage) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("usage:{}/{}", usage.input_tokens, usage.output_tokens));
+        }
     }
 
     #[tokio::test]
@@ -211,8 +237,14 @@ mod tests {
 
         composite.on_assistant_text("hi").await;
         composite.on_thinking("hmm").await;
+        composite
+            .on_usage(&Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+            })
+            .await;
 
-        assert_eq!(a.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm"]);
-        assert_eq!(b.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm"]);
+        assert_eq!(a.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm", "usage:5/1"]);
+        assert_eq!(b.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm", "usage:5/1"]);
     }
 }
