@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -6,14 +7,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::sink::PinnedInputSnapshot;
 use crate::mentions;
+
+/// How long a second idle Ctrl-C has to follow the first one to quit -- see
+/// `InputOutcome::CtrlCHint`. Matches the "press again to exit" convention
+/// most shells/REPLs use instead of a bare Ctrl-C silently doing nothing.
+const CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Whether a turn is currently running -- changes both what Enter/Esc do
 /// and how the box renders (see `InputBoxState::render`), so a user can
 /// tell at a glance whether they're about to submit a new turn or steer a
 /// running one.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum InputMode {
+    #[default]
     Idle,
     Running,
 }
@@ -30,8 +38,13 @@ pub(crate) enum InputOutcome {
     Submit(String),
     /// Esc or Ctrl-C while a turn is running.
     CancelTurn,
-    /// Ctrl-D (or `exit`/`quit`, checked by the caller) on an empty buffer.
+    /// Ctrl-D (or `exit`/`quit`, checked by the caller) on an empty buffer,
+    /// or a second idle Ctrl-C following `CtrlCHint` within the window.
     Quit,
+    /// First idle Ctrl-C on an empty buffer -- doesn't quit yet, but the
+    /// caller should show a "press Ctrl-C again to exit" hint so the next
+    /// one (within `CTRL_C_QUIT_WINDOW`) does.
+    CtrlCHint,
 }
 
 /// The always-visible input box's state: text buffer, cursor, and a simple
@@ -49,6 +62,9 @@ pub(crate) struct InputBoxState {
     /// What was being typed before Up first moved into history, restored
     /// on Down past the most recent entry.
     draft: String,
+    /// When the last idle Ctrl-C on an empty buffer landed -- `None` once
+    /// any other key resets it. See `CTRL_C_QUIT_WINDOW`.
+    last_idle_ctrl_c: Option<Instant>,
 }
 
 impl InputBoxState {
@@ -59,6 +75,7 @@ impl InputBoxState {
             history,
             history_index: None,
             draft: String::new(),
+            last_idle_ctrl_c: None,
         }
     }
 
@@ -79,6 +96,15 @@ impl InputBoxState {
     pub(crate) fn handle_key(&mut self, key: KeyEvent, mode: InputMode, working_dir: &Path) -> InputOutcome {
         let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         let is_ctrl_d = key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
+        // Only an idle Ctrl-C on an already-empty buffer is a quit candidate
+        // -- one with text to clear, or Esc, or anything mid-turn, takes its
+        // own branch below and never arms/consumes the quit window.
+        let is_idle_empty_ctrl_c = is_ctrl_c && mode == InputMode::Idle && self.buffer.is_empty();
+        let ctrl_c_armed =
+            is_idle_empty_ctrl_c && self.last_idle_ctrl_c.is_some_and(|t| t.elapsed() < CTRL_C_QUIT_WINDOW);
+        if !is_idle_empty_ctrl_c {
+            self.last_idle_ctrl_c = None;
+        }
 
         if is_ctrl_d {
             return if self.buffer.is_empty() {
@@ -90,6 +116,13 @@ impl InputBoxState {
         if key.code == KeyCode::Esc || is_ctrl_c {
             if mode == InputMode::Running {
                 return InputOutcome::CancelTurn;
+            }
+            if is_idle_empty_ctrl_c {
+                if ctrl_c_armed {
+                    return InputOutcome::Quit;
+                }
+                self.last_idle_ctrl_c = Some(Instant::now());
+                return InputOutcome::CtrlCHint;
             }
             self.buffer.clear();
             self.cursor = 0;
@@ -218,58 +251,90 @@ impl InputBoxState {
     /// and a status line built by the caller (spinner/provider while
     /// running, keyboard hints while idle).
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, mode: InputMode, status: &str, color: bool) {
-        if area.height == 0 {
-            return;
-        }
-        let rows = split_rows(area);
-
-        if let Some(rule_area) = rows.0 {
-            let rule = "-".repeat(rule_area.width as usize);
-            let style = if color {
-                Style::default().add_modifier(Modifier::DIM)
-            } else {
-                Style::default()
-            };
-            frame.render_widget(Paragraph::new(Line::styled(rule, style)), rule_area);
-        }
-
-        if let Some(input_area) = rows.1 {
-            let glyph = match mode {
-                InputMode::Idle => "❯",
-                InputMode::Running => "»",
-            };
-            let glyph_style = if !color {
-                Style::default()
-            } else if mode == InputMode::Running {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            };
-            let line = Line::from(vec![
-                Span::styled(format!("{glyph} "), glyph_style),
-                Span::raw(self.buffer.clone()),
-            ]);
-            frame.render_widget(Paragraph::new(line), input_area);
-        }
-
-        if let Some(status_area) = rows.2 {
-            let style = if color {
-                Style::default().add_modifier(Modifier::DIM)
-            } else {
-                Style::default()
-            };
-            frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
-        }
+        render_pinned(frame, area, &self.buffer, self.cursor, mode, status, color);
     }
 
     /// Cursor column within `area` (the input row specifically), for
     /// `Frame::set_cursor_position` -- accounts for the `"❯ "`/`"» "` glyph
     /// prefix both prompt styles share.
     pub(crate) fn cursor_column(&self, area: Rect) -> u16 {
-        let prefix_width = 2u16; // glyph + one space, both single-column
-        let col = self.buffer[..char_boundary(&self.buffer, self.cursor)].chars().count() as u16;
-        area.x + prefix_width + col
+        cursor_column_for(area, &self.buffer, self.cursor)
     }
+
+    /// A cheap, `Send`-able copy of just what `sink::InlineViewportSink`
+    /// needs to redraw the box on its own -- see `PinnedInputSnapshot`.
+    pub(crate) fn snapshot(&self, mode: InputMode) -> PinnedInputSnapshot {
+        PinnedInputSnapshot {
+            buffer: self.buffer.clone(),
+            cursor: self.cursor,
+            mode,
+        }
+    }
+}
+
+/// Free-function core of `InputBoxState::render`, taking just the buffer and
+/// cursor instead of a whole `&InputBoxState` -- lets `tui::sink` redraw the
+/// box from its own cheap snapshot (see `sink::PinnedInputSnapshot`) right
+/// after `insert_before` clears it, without needing a live `InputBoxState`
+/// (which only the REPL loop owns).
+pub(crate) fn render_pinned(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    buffer: &str,
+    _cursor: usize,
+    mode: InputMode,
+    status: &str,
+    color: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let rows = split_rows(area);
+
+    if let Some(rule_area) = rows.0 {
+        let rule = "-".repeat(rule_area.width as usize);
+        let style = if color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::styled(rule, style)), rule_area);
+    }
+
+    if let Some(input_area) = rows.1 {
+        let glyph = match mode {
+            InputMode::Idle => "❯",
+            InputMode::Running => "»",
+        };
+        let glyph_style = if !color {
+            Style::default()
+        } else if mode == InputMode::Running {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{glyph} "), glyph_style),
+            Span::raw(buffer.to_string()),
+        ]);
+        frame.render_widget(Paragraph::new(line), input_area);
+    }
+
+    if let Some(status_area) = rows.2 {
+        let style = if color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
+    }
+}
+
+/// Free-function core of `InputBoxState::cursor_column` -- see `render_pinned`.
+pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 {
+    let prefix_width = 2u16; // glyph + one space, both single-column
+    let col = buffer[..char_boundary(buffer, cursor)].chars().count() as u16;
+    area.x + prefix_width + col
 }
 
 /// Splits a 3-row area into (rule, input, status); any row beyond the first
@@ -352,6 +417,60 @@ mod tests {
         assert!(matches!(
             box_state.handle_key(key(KeyCode::Esc), InputMode::Running, &dir()),
             InputOutcome::CancelTurn
+        ));
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_c_on_a_non_empty_idle_buffer_clears_it_instead_of_arming_quit() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        box_state.handle_key(key(KeyCode::Char('x')), InputMode::Idle, &dir());
+        assert!(matches!(
+            box_state.handle_key(ctrl_c(), InputMode::Idle, &dir()),
+            InputOutcome::Handled
+        ));
+        assert!(box_state.buffer.is_empty());
+        // Buffer's empty now, but this Ctrl-C was the "clear" one, not a
+        // quit candidate -- a following Ctrl-C should only arm, not quit.
+        assert!(matches!(
+            box_state.handle_key(ctrl_c(), InputMode::Idle, &dir()),
+            InputOutcome::CtrlCHint
+        ));
+    }
+
+    #[test]
+    fn first_idle_ctrl_c_on_an_empty_buffer_only_hints() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        assert!(matches!(
+            box_state.handle_key(ctrl_c(), InputMode::Idle, &dir()),
+            InputOutcome::CtrlCHint
+        ));
+    }
+
+    #[test]
+    fn a_second_immediate_idle_ctrl_c_quits() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        box_state.handle_key(ctrl_c(), InputMode::Idle, &dir());
+        assert!(matches!(
+            box_state.handle_key(ctrl_c(), InputMode::Idle, &dir()),
+            InputOutcome::Quit
+        ));
+    }
+
+    #[test]
+    fn typing_between_two_idle_ctrl_cs_disarms_the_quit_window() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        box_state.handle_key(ctrl_c(), InputMode::Idle, &dir());
+        box_state.handle_key(key(KeyCode::Char('x')), InputMode::Idle, &dir());
+        box_state.handle_key(key(KeyCode::Backspace), InputMode::Idle, &dir());
+        // Buffer's empty again, but the intervening keystrokes should have
+        // reset the armed state -- this Ctrl-C hints again rather than quitting.
+        assert!(matches!(
+            box_state.handle_key(ctrl_c(), InputMode::Idle, &dir()),
+            InputOutcome::CtrlCHint
         ));
     }
 

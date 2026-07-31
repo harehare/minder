@@ -1,11 +1,14 @@
 use std::io::{Stdout, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
+
+use super::input_box::InputMode;
 
 /// Where a `TerminalReporter`'s formatted output actually goes -- lets it
 /// share all its formatting/color logic between the plain-print fallback
@@ -45,29 +48,54 @@ impl OutputSink for DirectPrintSink {
 
 pub(crate) type InlineTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+/// The pinned box's latest known contents, cheap to clone/lock -- kept in
+/// sync by `tui::run_tui_repl` on every keystroke/mode change so
+/// `InlineViewportSink` can redraw the box on its own right after clearing
+/// it (see `insert_text`), without needing the REPL loop's actual
+/// `InputBoxState` (which it never has direct access to).
+#[derive(Clone, Default)]
+pub(crate) struct PinnedInputSnapshot {
+    pub(crate) buffer: String,
+    pub(crate) cursor: usize,
+    pub(crate) mode: InputMode,
+}
+
 /// Pushes formatted lines permanently into the terminal's real scrollback
 /// (above the pinned input box) via `Terminal::insert_before`, instead of
 /// printing directly -- see `tui::run_tui_repl`. Status/spinner text is
 /// captured into `status` instead, for the input box's own render pass to
 /// pick up on its next redraw rather than clobbering a terminal row itself.
 pub(crate) struct InlineViewportSink {
-    terminal: std::sync::Arc<Mutex<InlineTerminal>>,
-    status: std::sync::Arc<Mutex<String>>,
+    terminal: Arc<Mutex<InlineTerminal>>,
+    status: Arc<Mutex<String>>,
+    /// See `PinnedInputSnapshot`. Read (never written) by this sink.
+    input: Arc<Mutex<PinnedInputSnapshot>>,
+    color: bool,
 }
 
 impl InlineViewportSink {
-    pub(crate) fn new(terminal: std::sync::Arc<Mutex<InlineTerminal>>, status: std::sync::Arc<Mutex<String>>) -> Self {
-        Self { terminal, status }
+    pub(crate) fn new(
+        terminal: Arc<Mutex<InlineTerminal>>,
+        status: Arc<Mutex<String>>,
+        input: Arc<Mutex<PinnedInputSnapshot>>,
+        color: bool,
+    ) -> Self {
+        Self {
+            terminal,
+            status,
+            input,
+            color,
+        }
     }
 }
 
 impl OutputSink for InlineViewportSink {
     fn print_stdout(&self, text: &str) {
-        insert_text(&self.terminal, text);
+        insert_text(&self.terminal, &self.input, &self.status, self.color, text);
     }
 
     fn print_stderr(&self, text: &str) {
-        insert_text(&self.terminal, text);
+        insert_text(&self.terminal, &self.input, &self.status, self.color, text);
     }
 
     fn redraw_status(&self, text: &str) {
@@ -80,7 +108,26 @@ impl OutputSink for InlineViewportSink {
 /// never arbitrary terminal input) into a styled `Line`, and inserts the
 /// whole block above the pinned viewport. A no-op on empty text so a
 /// guard-only call (no actual line) doesn't push a blank row.
-fn insert_text(terminal: &Mutex<InlineTerminal>, text: &str) {
+///
+/// Without ratatui's `scrolling-regions` feature (not enabled here --
+/// terminal-support is inconsistent enough across emulators/multiplexers
+/// that the plain fallback is safer), `Terminal::insert_before` clears the
+/// viewport it's inserting above and relies on the *next* `Terminal::draw`
+/// to repaint it. Left alone, that next repaint was whatever the 90ms
+/// ticker or the next keystroke happened to trigger in `tui::run_tui_repl`
+/// -- during a burst of streamed tokens or fast tool output, each
+/// `insert_before` clears the box again before that redraw lands, so the
+/// pinned box (and the spinner/status line riding along with it) reads as
+/// blank or stuck the whole time nothing is typed. Redrawing right here,
+/// immediately after every insert, closes that window instead of waiting
+/// on the next unrelated tick.
+fn insert_text(
+    terminal: &Mutex<InlineTerminal>,
+    input: &Mutex<PinnedInputSnapshot>,
+    status: &Mutex<String>,
+    color: bool,
+    text: &str,
+) {
     if text.is_empty() {
         return;
     }
@@ -100,6 +147,32 @@ fn insert_text(terminal: &Mutex<InlineTerminal>, text: &str) {
     let paragraph = Paragraph::new(Text::from(rendered)).wrap(Wrap { trim: false });
     let height = paragraph.line_count(width) as u16;
     let _ = term.insert_before(height, |buf| paragraph.render(buf.area, buf));
+
+    let snapshot = input.lock().unwrap().clone();
+    let status_text = status.lock().unwrap().clone();
+    let _ = term.draw(|frame| {
+        let area = frame.area();
+        super::input_box::render_pinned(
+            frame,
+            area,
+            &snapshot.buffer,
+            snapshot.cursor,
+            snapshot.mode,
+            &status_text,
+            color,
+        );
+        if area.height >= 2 {
+            let input_row = Rect {
+                y: area.y + 1,
+                height: 1,
+                ..area
+            };
+            frame.set_cursor_position((
+                super::input_box::cursor_column_for(input_row, &snapshot.buffer, snapshot.cursor),
+                input_row.y,
+            ));
+        }
+    });
 }
 
 /// Parses the handful of SGR codes `reporter.rs`'s `paint`/format helpers

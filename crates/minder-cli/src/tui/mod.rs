@@ -22,8 +22,8 @@ use minder_core::{AgentError, AgentSession, Message, Reporter};
 use ratatui::layout::Rect;
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
-use sink::InlineTerminal;
 pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink};
+use sink::{InlineTerminal, PinnedInputSnapshot};
 
 /// How often the pinned box redraws on its own while a turn is running (so
 /// the spinner's elapsed-seconds counter advances even with no keystrokes)
@@ -45,11 +45,19 @@ const VIEWPORT_HEIGHT: u16 = 3;
 /// handle. Returns `Err` (never panics) if raw mode / terminal init fails
 /// even though `input_watcher::supports_key_watching()` said it should
 /// work -- callers fall back to the plain REPL in that case.
-pub(crate) fn init() -> std::io::Result<(Arc<Mutex<InlineTerminal>>, Arc<Mutex<String>>)> {
+pub(crate) fn init() -> std::io::Result<(
+    Arc<Mutex<InlineTerminal>>,
+    Arc<Mutex<String>>,
+    Arc<Mutex<PinnedInputSnapshot>>,
+)> {
     let terminal = ratatui::try_init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
     })?;
-    Ok((Arc::new(Mutex::new(terminal)), Arc::new(Mutex::new(String::new()))))
+    Ok((
+        Arc::new(Mutex::new(terminal)),
+        Arc::new(Mutex::new(String::new())),
+        Arc::new(Mutex::new(PinnedInputSnapshot::default())),
+    ))
 }
 
 /// Drives one interactive session end-to-end -- same shape as
@@ -67,6 +75,7 @@ pub(crate) async fn run_tui_repl(
     record: &mut crate::session_store::SessionRecord,
     terminal: Arc<Mutex<InlineTerminal>>,
     status: Arc<Mutex<String>>,
+    input: Arc<Mutex<PinnedInputSnapshot>>,
 ) {
     let color = crate::color_enabled(std::io::stdout().is_terminal());
     let history_path = crate::session_store::history_path(dir).ok();
@@ -76,7 +85,8 @@ pub(crate) async fn run_tui_repl(
 
     loop {
         let idle_status = idle_status_text(&built.session, dir);
-        let Some(line) = read_line(&terminal, &mut box_state, &mut events, dir, &idle_status, color).await else {
+        let Some(line) = read_line(&terminal, &input, &mut box_state, &mut events, dir, &idle_status, color).await
+        else {
             break;
         };
         let line = line.trim().to_string();
@@ -110,6 +120,7 @@ pub(crate) async fn run_tui_repl(
             &expanded,
             &terminal,
             &status,
+            &input,
             &mut box_state,
             &mut events,
             dir,
@@ -128,7 +139,7 @@ pub(crate) async fn run_tui_repl(
 
 fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
     format!(
-        "{} ({}) · {} · Ctrl-D/exit quits · Tab completes",
+        "{} ({}) · {} · Ctrl-D/exit/Ctrl-C twice quits · Tab completes",
         session.provider_id(),
         session.model(),
         dir.display()
@@ -140,13 +151,14 @@ fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
 /// caller treats that like `rustyline`'s `ReadlineError::Eof`).
 async fn read_line(
     terminal: &Arc<Mutex<InlineTerminal>>,
+    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
     box_state: &mut InputBoxState,
     events: &mut EventStream,
     dir: &Path,
     status_text: &str,
     color: bool,
 ) -> Option<String> {
-    redraw(terminal, box_state, InputMode::Idle, status_text, color);
+    redraw(terminal, pinned_input, box_state, InputMode::Idle, status_text, color);
     loop {
         let event = match events.next().await {
             None => return None,
@@ -157,12 +169,23 @@ async fn read_line(
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
-        match box_state.handle_key(key, InputMode::Idle, dir) {
+        // Shows a "press again to exit" hint for exactly the one redraw
+        // right after a first idle Ctrl-C, in place of the usual idle
+        // status text -- the actual quit window is timed by
+        // `InputBoxState` itself (see `CTRL_C_QUIT_WINDOW`); this is purely
+        // what the box displays in the meantime.
+        let show_ctrl_c_hint = match box_state.handle_key(key, InputMode::Idle, dir) {
             InputOutcome::Submit(line) => return Some(line),
             InputOutcome::Quit => return None,
-            InputOutcome::Handled | InputOutcome::CancelTurn => {}
-        }
-        redraw(terminal, box_state, InputMode::Idle, status_text, color);
+            InputOutcome::CtrlCHint => true,
+            InputOutcome::Handled | InputOutcome::CancelTurn => false,
+        };
+        let text = if show_ctrl_c_hint {
+            "Ctrl-C again to exit"
+        } else {
+            status_text
+        };
+        redraw(terminal, pinned_input, box_state, InputMode::Idle, text, color);
     }
 }
 
@@ -174,9 +197,10 @@ async fn read_line(
 /// never disappears or hands off to a different input mechanism.
 async fn run_turn_pinned(
     session: &mut AgentSession,
-    input: &str,
+    task: &str,
     terminal: &Arc<Mutex<InlineTerminal>>,
     status: &Arc<Mutex<String>>,
+    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
     box_state: &mut InputBoxState,
     events: &mut EventStream,
     dir: &Path,
@@ -188,6 +212,7 @@ async fn run_turn_pinned(
 
     redraw(
         terminal,
+        pinned_input,
         box_state,
         InputMode::Running,
         &status.lock().unwrap().clone(),
@@ -199,7 +224,7 @@ async fn run_turn_pinned(
     // shape `run_turn_interruptible` uses in `main.rs` and for the same
     // reason.
     let result = {
-        let turn = session.run_turn(input);
+        let turn = session.run_turn(task);
         tokio::pin!(turn);
 
         let mut cancelled = false;
@@ -220,7 +245,7 @@ async fn run_turn_pinned(
                 result = &mut turn => break result,
                 () = wait_for_deadline => break Err(AgentError::Interrupted),
                 _ = ticker.tick() => {
-                    redraw(terminal, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
+                    redraw(terminal, pinned_input, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
                 }
                 event = events.next() => {
                     let event = match event {
@@ -244,9 +269,11 @@ async fn run_turn_pinned(
                         InputOutcome::Submit(text) => {
                             let _ = steering_tx.send(text);
                         }
-                        InputOutcome::Quit | InputOutcome::Handled => {}
+                        // `handle_key` never returns `Quit`/`CtrlCHint` while
+                        // `mode == Running` -- those are idle-only outcomes.
+                        InputOutcome::Quit | InputOutcome::CtrlCHint | InputOutcome::Handled => {}
                     }
-                    redraw(terminal, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
+                    redraw(terminal, pinned_input, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
                 }
             }
         }
@@ -258,13 +285,22 @@ async fn run_turn_pinned(
     result
 }
 
+/// Draws the pinned box and, first, publishes its current contents into
+/// `pinned_input` -- the shared snapshot `InlineViewportSink::insert_text`
+/// reads from to redraw the box itself right after scrollback output clears
+/// it (see `sink::PinnedInputSnapshot`). Updating it here, right before every
+/// draw this module does directly, keeps it correct without a second place
+/// that has to remember to touch it.
 fn redraw(
     terminal: &Arc<Mutex<InlineTerminal>>,
+    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
     box_state: &InputBoxState,
     mode: InputMode,
     status_text: &str,
     color: bool,
 ) {
+    *pinned_input.lock().unwrap() = box_state.snapshot(mode);
+
     let mut term = terminal.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();

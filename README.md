@@ -138,7 +138,7 @@ unrestricted by default — see [Hooks](#hooks) to add more policy before pointi
 work.
 
 <details>
-<summary>Live execution display, undo, interrupting a turn, @path attachments, REPL commands</summary>
+<summary>Live execution display, undo, interrupting a turn, Markdown output, @path attachments, REPL commands</summary>
 
 ### Live execution display
 
@@ -191,6 +191,22 @@ You don't have to wait for a turn to finish (or interrupt it) to say something e
 typing while it's running and press Enter. That line doesn't start a new turn — it's spliced into
 the *current* one at the next safe point (typically right after the in-flight tool call finishes),
 so the model sees it alongside whatever it was already doing instead of losing that progress.
+
+At the idle prompt (no turn running), Ctrl-C doesn't quit immediately: with text typed, it clears
+the line first; on an already-empty line, it shows a `Ctrl-C again to exit` hint, and a second
+Ctrl-C within two seconds actually quits — the same "press again" convention most shells use. Ctrl-D
+or `exit`/`quit` always quits immediately, no confirmation needed.
+
+### Markdown in, Markdown out
+
+Assistant replies stream as plain Markdown text, not rendered styling — headings/bold/lists show up
+as literal `#`/`**`/`-` characters, since re-rendering lines already printed to the terminal isn't
+supported. The one exception is fenced code blocks, which get real syntax highlighting once the
+closing ` ``` ` arrives. Pipe stdout (or `--output json`'s `answer` field) through a Markdown
+renderer of your own (`glow`, `mdcat`, a browser, ...) if you want it rendered instead. The same
+format flows the other way too: [skills](#skills) (`SKILL.md`), [subagents](#subagents)
+(`AGENT.md`), and [`minder loop`](#autonomous-loop-mode)'s checklists are themselves Markdown files
+under `.agent/`, so extending minder is largely just writing Markdown.
 
 ### Undoing a turn's file changes
 

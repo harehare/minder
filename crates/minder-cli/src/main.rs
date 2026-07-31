@@ -13,7 +13,7 @@ use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
@@ -537,6 +537,11 @@ fn working_dir() -> PathBuf {
 /// it's force-aborted regardless -- see `run_turn_interruptible`.
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
 
+/// How long a second idle Ctrl-C has to follow the first one to quit the
+/// fallback REPL -- see `run_repl_fallback`. Matches
+/// `input_box::CTRL_C_QUIT_WINDOW`, the pinned-box TUI's equivalent.
+const IDLE_CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
+
 /// Runs `session.run_turn(input)` the same as calling it directly, except
 /// Esc or Ctrl-C during the turn interrupts it instead of killing the whole
 /// process (see `InputWatcher`), and any other line typed + Enter is
@@ -680,6 +685,7 @@ enum ReplBackend {
     Tui(
         Arc<std::sync::Mutex<tui::sink::InlineTerminal>>,
         Arc<std::sync::Mutex<String>>,
+        Arc<std::sync::Mutex<tui::sink::PinnedInputSnapshot>>,
     ),
     Fallback,
 }
@@ -693,11 +699,17 @@ enum ReplBackend {
 /// put in the shape ratatui wants is rare, but shouldn't be fatal).
 async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend) {
     if input_watcher::supports_key_watching()
-        && let Ok((terminal, status)) = tui::init()
+        && let Ok((terminal, status, pinned_input)) = tui::init()
     {
-        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(terminal.clone(), status.clone()));
+        let color = color_enabled(std::io::stdout().is_terminal());
+        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(
+            terminal.clone(),
+            status.clone(),
+            pinned_input.clone(),
+            color,
+        ));
         let built = build_session_with_sink(output, sink).await;
-        return (built, ReplBackend::Tui(terminal, status));
+        return (built, ReplBackend::Tui(terminal, status, pinned_input));
     }
     (build_session(output).await, ReplBackend::Fallback)
 }
@@ -828,11 +840,11 @@ fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
 /// `input_watcher::supports_key_watching`), not just Ctrl-C.
 fn hint_line(color: bool, key_watching_supported: bool) -> String {
     let text = if key_watching_supported {
-        "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D or 'exit'/'quit' to leave \
+        "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D, 'exit'/'quit', or Ctrl-C twice to leave \
          · /help for commands · @path attaches a file/dir"
     } else {
-        "Ctrl-C cancels a running turn · Ctrl-D or 'exit'/'quit' to leave · /help for commands \
-         · @path attaches a file/dir"
+        "Ctrl-C cancels a running turn (press twice at the prompt to quit) · Ctrl-D or 'exit'/'quit' to leave \
+         · /help for commands · @path attaches a file/dir"
     };
     if color {
         format!("{DIM}{text}{RESET}")
@@ -1207,7 +1219,9 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
 async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord, backend: ReplBackend) {
     print_banner(&built.session, record);
     match backend {
-        ReplBackend::Tui(terminal, status) => tui::run_tui_repl(built, dir, record, terminal, status).await,
+        ReplBackend::Tui(terminal, status, pinned_input) => {
+            tui::run_tui_repl(built, dir, record, terminal, status, pinned_input).await
+        }
         ReplBackend::Fallback => run_repl_fallback(built, dir, record).await,
     }
 }
@@ -1260,6 +1274,13 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
         let _ = editor.load_history(path);
     }
 
+    // Tracks the last idle Ctrl-C so a second one within
+    // `IDLE_CTRL_C_QUIT_WINDOW` quits instead of just re-prompting forever
+    // -- matches `tui::run_tui_repl`'s pinned-box behavior (see
+    // `input_box::InputOutcome::CtrlCHint`) so Ctrl-C isn't a dead end in
+    // whichever REPL a given terminal happens to fall back to.
+    let mut last_idle_interrupt: Option<Instant> = None;
+
     loop {
         println!("{}", status_line(&built.session, dir, color));
         println!("{}", rule_line(color));
@@ -1267,6 +1288,11 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
         let line = match editor.readline(&prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
+                if last_idle_interrupt.is_some_and(|t| t.elapsed() < IDLE_CTRL_C_QUIT_WINDOW) {
+                    break;
+                }
+                last_idle_interrupt = Some(Instant::now());
+                println!("(Ctrl-C again to exit)");
                 println!("{}", rule_line(color));
                 continue;
             }
@@ -1276,6 +1302,7 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
                 break;
             }
         };
+        last_idle_interrupt = None;
         println!("{}", rule_line(color));
         println!("{}", hint_line(color, key_watching_supported));
         println!();
