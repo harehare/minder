@@ -7,6 +7,7 @@ mod mentions;
 mod provider_select;
 mod reporter;
 mod session_store;
+mod tui;
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -200,6 +201,17 @@ fn load_project_config(agent_dir: &Path) -> config::ProjectConfig {
 /// sensible choice for `chat`/`loop`) or is held back so a caller can print
 /// one JSON object instead (`Json`, one-shot only -- see `run_one_shot`).
 async fn build_session(output: OutputFormat) -> BuiltSession {
+    build_session_with_sink(output, Arc::new(tui::DirectPrintSink)).await
+}
+
+/// Same as `build_session`, but lets the caller choose where `TerminalReporter`'s
+/// output actually goes -- `run_chat`/`run_resume`'s interactive branches pass
+/// an `InlineViewportSink` once they've decided to use the pinned-input-box
+/// REPL (see `tui::run_tui_repl`), so every reporter this builds -- including
+/// the one handed to the `agent` tool for subagents -- renders through the
+/// same pinned viewport instead of a subagent's tool trace printing straight
+/// to stdout underneath it.
+async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::OutputSink>) -> BuiltSession {
     let working_dir = std::env::current_dir().expect("cwd");
     let agent_dir = working_dir.join(".agent");
     let cfg = load_project_config(&agent_dir);
@@ -302,7 +314,8 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
             .or(cfg.show_status_bar)
             .unwrap_or(true),
     ));
-    let mut terminal_reporter_impl = TerminalReporter::new(hooks.clone(), show_thinking.clone(), show_status.clone());
+    let mut terminal_reporter_impl =
+        TerminalReporter::with_sink(hooks.clone(), show_thinking.clone(), show_status.clone(), sink);
     if output == OutputFormat::Json {
         terminal_reporter_impl = terminal_reporter_impl.silence_stdout();
     }
@@ -655,11 +668,45 @@ async fn run_one_shot(task: &str, output: OutputFormat) {
     }
 }
 
+/// Where an interactive REPL's live turn output/input actually goes --
+/// `Tui` when the terminal supports raw-mode key watching (a `ratatui`
+/// inline viewport with a pinned input box, see `tui::run_tui_repl`),
+/// `Fallback` otherwise (today's `rustyline` + per-turn `InputWatcher`
+/// split, unchanged). Decided once, before `build_session_with_sink` picks
+/// the reporter's `OutputSink` to match, so every reporter it builds --
+/// including the one shared with the `agent` tool for subagents -- renders
+/// through the same place `run_repl` ends up reading/writing.
+enum ReplBackend {
+    Tui(
+        Arc<std::sync::Mutex<tui::sink::InlineTerminal>>,
+        Arc<std::sync::Mutex<String>>,
+    ),
+    Fallback,
+}
+
+/// Builds a session for one of the REPL entry points (`run_chat`, the
+/// task-less branch of `run_resume`) -- the only two places that ever
+/// reach `run_repl`. Tries the pinned-box TUI first when the terminal can
+/// do raw-mode key watching at all (same check `InputWatcher` has always
+/// required); falls back to the plain `DirectPrintSink`-backed session,
+/// silently, on any terminal-init failure (a real TTY that still can't be
+/// put in the shape ratatui wants is rare, but shouldn't be fatal).
+async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend) {
+    if input_watcher::supports_key_watching()
+        && let Ok((terminal, status)) = tui::init()
+    {
+        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(terminal.clone(), status.clone()));
+        let built = build_session_with_sink(output, sink).await;
+        return (built, ReplBackend::Tui(terminal, status));
+    }
+    (build_session(output).await, ReplBackend::Fallback)
+}
+
 async fn run_chat() {
     let dir = working_dir();
-    let mut built = build_session(OutputFormat::Text).await;
+    let (mut built, backend) = build_repl_session(OutputFormat::Text).await;
     let mut record = SessionRecord::new();
-    run_repl(&mut built, &dir, &mut record).await;
+    run_repl(&mut built, &dir, &mut record, backend).await;
 }
 
 /// Resumes a saved session (latest if `id` is `None`) and either runs one
@@ -686,29 +733,34 @@ async fn run_resume(id: Option<String>, task: Option<String>, output: OutputForm
         }
     };
 
-    let effective_output = if task.is_some() { output } else { OutputFormat::Text };
-    let mut built = build_session(effective_output).await;
-    built
-        .session
-        .restore(record.system_prompt.clone(), record.messages.clone());
-
     match task {
         Some(task) => {
+            let mut built = build_session(output).await;
+            built
+                .session
+                .restore(record.system_prompt.clone(), record.messages.clone());
+
             let result = built.session.run_turn(&task).await;
             persist(&dir, &mut record, &built.session);
 
-            if effective_output == OutputFormat::Json {
+            if output == OutputFormat::Json {
                 print_json_result(&built.session, &result);
             }
 
             if let Err(e) = result {
-                if effective_output == OutputFormat::Text {
+                if output == OutputFormat::Text {
                     eprintln!("error: {e}");
                 }
                 std::process::exit(1);
             }
         }
-        None => run_repl(&mut built, &dir, &mut record).await,
+        None => {
+            let (mut built, backend) = build_repl_session(OutputFormat::Text).await;
+            built
+                .session
+                .restore(record.system_prompt.clone(), record.messages.clone());
+            run_repl(&mut built, &dir, &mut record, backend).await;
+        }
     }
 }
 
@@ -812,7 +864,7 @@ const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "plan", "status", "t
 /// isn't in "typing a command name" position at all (no leading `/`, cursor
 /// not at the end, or a space already reached -- i.e. past the command name
 /// into its arguments).
-fn matching_slash_commands(line: &str, pos: usize) -> Option<Vec<&'static str>> {
+pub(crate) fn matching_slash_commands(line: &str, pos: usize) -> Option<Vec<&'static str>> {
     if pos != line.len() {
         return None;
     }
@@ -1149,6 +1201,17 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
     eprintln!();
 }
 
+/// Dispatches to whichever REPL implementation `backend` selected (see
+/// `build_repl_session`): the `ratatui` pinned-input-box loop, or today's
+/// `rustyline` + per-turn `InputWatcher` split, completely unchanged.
+async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord, backend: ReplBackend) {
+    print_banner(&built.session, record);
+    match backend {
+        ReplBackend::Tui(terminal, status) => tui::run_tui_repl(built, dir, record, terminal, status).await,
+        ReplBackend::Fallback => run_repl_fallback(built, dir, record).await,
+    }
+}
+
 /// Reads tasks from a line editor in a loop, feeding each into the same
 /// session so context carries over between them; saves after every turn so
 /// Ctrl-C or a crash mid-conversation loses at most the in-flight turn.
@@ -1166,9 +1229,13 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
 /// A line starting with `/` is a REPL command (`/help`, `/model`, `/clear`,
 /// `/plan <task>`) handled by `handle_slash_command` instead of being sent
 /// to the model.
-async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord) {
-    print_banner(&built.session, record);
-
+///
+/// Only reached when raw-mode key watching isn't available at all (see
+/// `build_repl_session`) -- otherwise `run_repl` uses `tui::run_tui_repl`,
+/// which keeps a single input box pinned on screen at all times instead of
+/// this function's split between idle `rustyline` input and mid-turn
+/// `InputWatcher` steering.
+async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord) {
     // Decided once (a terminal doesn't change tty-ness mid-session) and
     // shared by every rule/status/hint line drawn below -- and the slash
     // command hinter -- so they never disagree with the prompt itself about

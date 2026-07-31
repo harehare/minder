@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -8,11 +8,15 @@ use async_trait::async_trait;
 use minder_core::{HookPort, RenderDecision, Reporter, ToolCall, ToolExecOutcome, Usage};
 use tokio::sync::Mutex;
 
+use crate::tui::sink::OutputSink;
+#[cfg(test)]
+use crate::tui::sink::DirectPrintSink;
+
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const BOLD: &str = "\x1b[1m";
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const RED: &str = "\x1b[31m";
 pub(crate) const YELLOW: &str = "\x1b[33m";
 pub(crate) const CYAN: &str = "\x1b[36m";
 
@@ -144,13 +148,19 @@ pub struct TerminalReporter {
     /// Incremental state for `on_assistant_text_delta`'s current text block,
     /// reset each time `on_assistant_text` flushes it -- see `StreamSegmenter`.
     stream: Mutex<StreamSegmenter>,
+    /// Where formatted lines actually go -- `DirectPrintSink` (today's raw
+    /// `print!`/`eprint!`) by default, or an `InlineViewportSink` when
+    /// `tui::run_tui_repl` builds this reporter for the pinned-input-box
+    /// REPL. See `tui::sink`.
+    sink: Arc<dyn OutputSink>,
 }
 
 impl TerminalReporter {
-    pub fn new(
+    pub(crate) fn with_sink(
         hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
         show_thinking: Arc<AtomicBool>,
         show_status: Arc<AtomicBool>,
+        sink: Arc<dyn OutputSink>,
     ) -> Self {
         let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         let interactive = std::io::stderr().is_terminal();
@@ -162,6 +172,7 @@ impl TerminalReporter {
 
         if interactive {
             let spinner = spinner.clone();
+            let sink = sink.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(SPINNER_INTERVAL).await;
@@ -184,12 +195,11 @@ impl TerminalReporter {
                     } else {
                         String::new()
                     };
-                    eprint!(
-                        "\r\x1b[2K{DIM}{frame} {} ({:.1}s){status}{RESET}",
+                    sink.redraw_status(&format!(
+                        "{DIM}{frame} {} ({:.1}s){status}{RESET}",
                         names.join(", "),
                         elapsed.as_secs_f32()
-                    );
-                    let _ = std::io::stderr().flush();
+                    ));
                 }
             });
         }
@@ -202,6 +212,7 @@ impl TerminalReporter {
             print_assistant_text: true,
             show_thinking,
             stream: Mutex::new(StreamSegmenter::default()),
+            sink,
         }
     }
 
@@ -387,22 +398,34 @@ impl TerminalReporter {
         let mut state = self.spinner.lock().await;
         let (_, started) = state.labels.remove(key)?;
         if state.labels.is_empty() {
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
+            self.sink.redraw_status("");
         }
         Some(started.elapsed())
     }
 
     /// Prints a line while holding the spinner lock, so the ticker task
     /// can't redraw mid-print and the spinner's current line gets cleared
-    /// first (stdout and stderr share one terminal row when both are ttys).
-    async fn print_guarded(&self, f: impl FnOnce()) {
+    /// first (stdout and stderr share one terminal row when both are ttys;
+    /// under `InlineViewportSink` the clear is a harmless no-op since the
+    /// input box and scrollback never share a row, but the lock still
+    /// serializes concurrent tool-call reporter events, e.g. from the
+    /// `agent` tool's concurrent branch in `AgentSession`).
+    async fn print_guarded(&self, to_stderr: bool, line: &str) {
+        let text = format!("{line}\n");
         if self.interactive {
             let _guard = self.spinner.lock().await;
-            eprint!("\r\x1b[2K");
-            f();
+            self.sink.redraw_status("");
+            self.write(to_stderr, &text);
         } else {
-            f();
+            self.write(to_stderr, &text);
+        }
+    }
+
+    fn write(&self, to_stderr: bool, text: &str) {
+        if to_stderr {
+            self.sink.print_stderr(text);
+        } else {
+            self.sink.print_stdout(text);
         }
     }
 
@@ -411,10 +434,9 @@ impl TerminalReporter {
     /// syntax-highlighting pass a complete response would get.
     fn print_segment(&self, segment: StreamSegment) {
         match segment {
-            StreamSegment::Prose(line) => print!("{line}"),
-            StreamSegment::CodeBlock(block) => print!("{}", crate::markdown::render(&block, self.color)),
+            StreamSegment::Prose(line) => self.sink.print_stdout(&line),
+            StreamSegment::CodeBlock(block) => self.sink.print_stdout(&crate::markdown::render(&block, self.color)),
         }
-        let _ = std::io::stdout().flush();
     }
 }
 
@@ -452,7 +474,7 @@ impl Reporter for TerminalReporter {
         if let Some(segment) = self.stream.lock().await.finish() {
             self.print_segment(segment);
         }
-        println!();
+        self.sink.print_stdout("\n");
     }
 
     async fn on_thinking(&self, text: &str) {
@@ -460,7 +482,7 @@ impl Reporter for TerminalReporter {
             return;
         }
         let line = self.format_thinking(text);
-        self.print_guarded(|| eprintln!("{line}")).await;
+        self.print_guarded(true, &line).await;
     }
 
     async fn on_tool_call(&self, call: &ToolCall) {
@@ -469,12 +491,12 @@ impl Reporter for TerminalReporter {
             RenderDecision::Text { value, style } => {
                 let line = self.painted_by_name(style.as_deref(), &value);
                 let block = self.format_tool_call_block(&line);
-                self.print_guarded(|| eprintln!("{block}")).await;
+                self.print_guarded(true, &block).await;
             }
             RenderDecision::Default => {
                 let line = self.format_default_call(call);
                 let block = self.format_tool_call_block(&line);
-                self.print_guarded(|| eprintln!("{block}")).await;
+                self.print_guarded(true, &block).await;
             }
         }
         let label = format!("Running {}", call.name);
@@ -487,11 +509,11 @@ impl Reporter for TerminalReporter {
             RenderDecision::Hide => {}
             RenderDecision::Text { value, style } => {
                 let line = self.painted_by_name(style.as_deref(), &value);
-                self.print_guarded(|| eprintln!("{line}")).await;
+                self.print_guarded(true, &line).await;
             }
             RenderDecision::Default => {
                 let line = self.format_default_result(outcome, elapsed);
-                self.print_guarded(|| eprintln!("{line}")).await;
+                self.print_guarded(true, &line).await;
             }
         }
     }
@@ -504,7 +526,7 @@ impl Reporter for TerminalReporter {
                 delay.as_secs_f32()
             ),
         );
-        self.print_guarded(|| eprintln!("{line}")).await;
+        self.print_guarded(true, &line).await;
     }
 
     /// `InputWatcher` already echoed the typed line as the user typed it
@@ -517,7 +539,7 @@ impl Reporter for TerminalReporter {
             return;
         }
         let line = self.paint(DIM, &format!("↪ steering in: {text}"));
-        self.print_guarded(|| println!("{line}")).await;
+        self.print_guarded(false, &line).await;
     }
 
     async fn on_usage(&self, usage: &Usage) {
@@ -525,11 +547,15 @@ impl Reporter for TerminalReporter {
             return;
         }
         let line = self.format_usage(usage);
-        self.print_guarded(|| eprintln!("{line}")).await;
+        self.print_guarded(true, &line).await;
     }
 
     async fn on_provider_changed(&self, provider_id: &str, model: &str) {
         self.spinner.lock().await.provider_label = format!("{provider_id} ({model})");
+    }
+
+    async fn on_notice(&self, text: &str) {
+        self.print_guarded(false, text).await;
     }
 }
 
@@ -697,6 +723,7 @@ mod tests {
             print_assistant_text: true,
             show_thinking: Arc::new(AtomicBool::new(true)),
             stream: Mutex::new(StreamSegmenter::default()),
+            sink: Arc::new(DirectPrintSink),
         }
     }
 

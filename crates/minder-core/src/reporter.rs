@@ -47,6 +47,11 @@ pub trait Reporter: Send + Sync {
     /// `AgentSession::set_provider` mid-session), so a live display can show
     /// which provider is actually about to answer.
     async fn on_provider_changed(&self, _provider_id: &str, _model: &str) {}
+    /// REPL-local informational text that isn't part of the conversation
+    /// (e.g. `/help`, `/status` output) -- routed through the reporter so a
+    /// live display renders it the same way as everything else instead of
+    /// a caller writing straight to stdout underneath it.
+    async fn on_notice(&self, _text: &str) {}
 }
 
 /// Default reporter: observes nothing, prints nothing.

@@ -112,6 +112,12 @@ impl Reporter for CompositeReporter {
         }
     }
 
+    async fn on_assistant_text_delta(&self, delta: &str) {
+        for r in &self.0 {
+            r.on_assistant_text_delta(delta).await;
+        }
+    }
+
     async fn on_thinking(&self, text: &str) {
         for r in &self.0 {
             r.on_thinking(text).await;
@@ -139,6 +145,24 @@ impl Reporter for CompositeReporter {
     async fn on_usage(&self, usage: &Usage) {
         for r in &self.0 {
             r.on_usage(usage).await;
+        }
+    }
+
+    async fn on_steering_message(&self, text: &str) {
+        for r in &self.0 {
+            r.on_steering_message(text).await;
+        }
+    }
+
+    async fn on_provider_changed(&self, provider_id: &str, model: &str) {
+        for r in &self.0 {
+            r.on_provider_changed(provider_id, model).await;
+        }
+    }
+
+    async fn on_notice(&self, text: &str) {
+        for r in &self.0 {
+            r.on_notice(text).await;
         }
     }
 }
@@ -227,6 +251,15 @@ mod tests {
                 .unwrap()
                 .push(format!("usage:{}/{}", usage.input_tokens, usage.output_tokens));
         }
+        async fn on_assistant_text_delta(&self, delta: &str) {
+            self.0.lock().unwrap().push(format!("delta:{delta}"));
+        }
+        async fn on_steering_message(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("steering:{text}"));
+        }
+        async fn on_provider_changed(&self, provider_id: &str, model: &str) {
+            self.0.lock().unwrap().push(format!("provider:{provider_id}/{model}"));
+        }
     }
 
     #[tokio::test]
@@ -236,7 +269,10 @@ mod tests {
         let composite = CompositeReporter::new(vec![a.clone(), b.clone()]);
 
         composite.on_assistant_text("hi").await;
+        composite.on_assistant_text_delta("h").await;
         composite.on_thinking("hmm").await;
+        composite.on_steering_message("wait").await;
+        composite.on_provider_changed("anthropic", "claude").await;
         composite
             .on_usage(&Usage {
                 input_tokens: 5,
@@ -244,7 +280,15 @@ mod tests {
             })
             .await;
 
-        assert_eq!(a.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm", "usage:5/1"]);
-        assert_eq!(b.0.lock().unwrap().as_slice(), ["text:hi", "thinking:hmm", "usage:5/1"]);
+        let expected = [
+            "text:hi",
+            "delta:h",
+            "thinking:hmm",
+            "steering:wait",
+            "provider:anthropic/claude",
+            "usage:5/1",
+        ];
+        assert_eq!(a.0.lock().unwrap().as_slice(), expected);
+        assert_eq!(b.0.lock().unwrap().as_slice(), expected);
     }
 }
