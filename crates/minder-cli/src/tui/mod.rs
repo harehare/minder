@@ -22,8 +22,8 @@ use minder_core::{AgentError, AgentSession, Message, Reporter};
 use ratatui::layout::Rect;
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
-pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink};
 use sink::InlineTerminal;
+pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink};
 
 /// How often the pinned box redraws on its own while a turn is running (so
 /// the spinner's elapsed-seconds counter advances even with no keystrokes)
@@ -186,7 +186,13 @@ async fn run_turn_pinned(
     let cancel = session.reset_cancel_token();
     let steering_tx = session.enable_steering();
 
-    redraw(terminal, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
+    redraw(
+        terminal,
+        box_state,
+        InputMode::Running,
+        &status.lock().unwrap().clone(),
+        color,
+    );
 
     // Scoped so `turn` (and the mutable borrow of `session` it holds) ends
     // before `discard_interrupted_turn` below needs its own borrow -- same
@@ -252,7 +258,13 @@ async fn run_turn_pinned(
     result
 }
 
-fn redraw(terminal: &Arc<Mutex<InlineTerminal>>, box_state: &InputBoxState, mode: InputMode, status_text: &str, color: bool) {
+fn redraw(
+    terminal: &Arc<Mutex<InlineTerminal>>,
+    box_state: &InputBoxState,
+    mode: InputMode,
+    status_text: &str,
+    color: bool,
+) {
     let mut term = terminal.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();
@@ -271,7 +283,11 @@ fn redraw(terminal: &Arc<Mutex<InlineTerminal>>, box_state: &InputBoxState, mode
 /// Same wording as `print_turn_error` in `main.rs`, but routed through the
 /// reporter (`on_notice`) instead of raw `println!`/`eprintln!`, so it
 /// lands above the pinned box via `insert_before` instead of corrupting it.
-async fn print_turn_error_pinned(reporter: &Arc<dyn Reporter>, err: &AgentError, checkpoint: &minder_tools::Checkpoint) {
+async fn print_turn_error_pinned(
+    reporter: &Arc<dyn Reporter>,
+    err: &AgentError,
+    checkpoint: &minder_tools::Checkpoint,
+) {
     if matches!(err, AgentError::Interrupted) {
         reporter.on_notice("Interrupted.").await;
         if !checkpoint.is_empty() {

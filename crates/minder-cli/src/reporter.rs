@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use minder_core::{HookPort, RenderDecision, Reporter, ToolCall, ToolExecOutcome, Usage};
 use tokio::sync::Mutex;
 
-use crate::tui::sink::OutputSink;
 #[cfg(test)]
 use crate::tui::sink::DirectPrintSink;
+use crate::tui::sink::OutputSink;
 
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const DIM: &str = "\x1b[2m";

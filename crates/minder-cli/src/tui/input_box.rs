@@ -291,10 +291,7 @@ fn split_rows(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
 }
 
 fn char_boundary(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 #[cfg(test)]

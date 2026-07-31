@@ -4,8 +4,7 @@ use std::time::Duration;
 use crate::hooks::{HookDecision, HookPort, ToolCallDecision, ToolResultInfo};
 use crate::mailbox::Mailbox;
 use crate::message::{
-    ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
-    Usage,
+    ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec, Usage,
 };
 use crate::provider::{LlmProvider, ProviderError};
 use crate::reporter::{NoopReporter, Reporter};
@@ -1132,7 +1131,10 @@ mod tests {
             .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("also check the changelog")));
         assert!(has_steering_text, "got: {last_message:?}");
 
-        assert!(!session.drain_steering_into_new_turn().await, "an empty queue must not start another turn");
+        assert!(
+            !session.drain_steering_into_new_turn().await,
+            "an empty queue must not start another turn"
+        );
     }
 
     #[tokio::test]
