@@ -1175,7 +1175,16 @@ async fn run_undo_command(built: &BuiltSession, dir: &Path) {
 /// render identically whether or not the terminal's font covers box-drawing
 /// or emoji beyond basic Unicode. Colored only when stderr is a tty and
 /// `NO_COLOR` isn't set, matching `TerminalReporter`'s own rule.
-fn print_banner(session: &AgentSession, record: &SessionRecord) {
+///
+/// Routed through `reporter.on_notice` -- exactly the "REPL-local
+/// informational text" case its doc comment calls out -- instead of raw
+/// `eprintln!`. `run_repl`'s `ReplBackend::Tui` path has already called
+/// `tui::init()` by the time this runs, which reserves the pinned box's
+/// rows and takes over cursor placement; writing straight to stderr here
+/// bypassed that bookkeeping entirely and scrambled the banner into the
+/// reserved viewport instead of scrolling above it like `insert_before`
+/// does for every other line.
+async fn print_banner(session: &AgentSession, record: &SessionRecord, reporter: &Arc<dyn Reporter>) {
     let color = color_enabled(std::io::stderr().is_terminal());
     let paint = |code: &str, text: &str| {
         if color {
@@ -1198,26 +1207,36 @@ fn print_banner(session: &AgentSession, record: &SessionRecord) {
     // spreading it across a few rows instead, the same trick figlet-style
     // banners use.
     let accent = format!("{YELLOW}{BOLD}");
-    eprintln!();
-    eprintln!("  {}   {}", paint(&accent, " ◆ "), paint(BOLD, &format!("v{version}")));
-    eprintln!(
-        "  {}   {}",
-        paint(&accent, "◆ ◆"),
-        paint(DIM, &format!("{} · {status}", session.provider_id()))
-    );
-    eprintln!(
-        "  {}   {}",
-        paint(&accent, " ◆ "),
-        paint(DIM, &working_dir().display().to_string())
-    );
-    eprintln!();
+    reporter.on_notice("").await;
+    reporter
+        .on_notice(&format!(
+            "  {}   {}",
+            paint(&accent, " ◆ "),
+            paint(BOLD, &format!("v{version}"))
+        ))
+        .await;
+    reporter
+        .on_notice(&format!(
+            "  {}   {}",
+            paint(&accent, "◆ ◆"),
+            paint(DIM, &format!("{} · {status}", session.provider_id()))
+        ))
+        .await;
+    reporter
+        .on_notice(&format!(
+            "  {}   {}",
+            paint(&accent, " ◆ "),
+            paint(DIM, &working_dir().display().to_string())
+        ))
+        .await;
+    reporter.on_notice("").await;
 }
 
 /// Dispatches to whichever REPL implementation `backend` selected (see
 /// `build_repl_session`): the `ratatui` pinned-input-box loop, or today's
 /// `rustyline` + per-turn `InputWatcher` split, completely unchanged.
 async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord, backend: ReplBackend) {
-    print_banner(&built.session, record);
+    print_banner(&built.session, record, &built.reporter).await;
     match backend {
         ReplBackend::Tui(terminal, status, pinned_input) => {
             tui::run_tui_repl(built, dir, record, terminal, status, pinned_input).await
