@@ -4,7 +4,8 @@ use std::time::Duration;
 use crate::hooks::{HookDecision, HookPort, ToolCallDecision, ToolResultInfo};
 use crate::mailbox::Mailbox;
 use crate::message::{
-    ContentBlock, Message, ProviderResponse, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec, Usage,
+    ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec,
+    Usage,
 };
 use crate::provider::{LlmProvider, ProviderError};
 use crate::reporter::{NoopReporter, Reporter};
@@ -161,6 +162,14 @@ impl AgentSession {
 
             let tool_calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             if tool_calls.is_empty() || response.stop_reason != StopReason::ToolUse {
+                // A text-only response never reaches the tool-results drain
+                // point below, so without this, text typed while this turn
+                // was running would sit unconsumed in `steering_rx` until
+                // the *next* `run_turn` call silently tacked it onto that
+                // unrelated message instead. Treat it as the next turn now.
+                if self.drain_steering_into_new_turn().await {
+                    continue;
+                }
                 self.reporter.on_usage(&turn_usage).await;
                 return Ok(response.message);
             }
@@ -449,6 +458,35 @@ impl AgentSession {
                 "[User, while you were working on this]: {text}"
             )));
         }
+    }
+
+    /// Like `drain_steering`, but for a turn whose response had no tool
+    /// calls -- there's no tool-results message at that point to append
+    /// onto, and the message just before it is the assistant's own reply,
+    /// so appending there would put steered text in the assistant's mouth.
+    /// Pushes a plain new user message instead: the last message pushed is
+    /// always the assistant's (never `Role::Tool`), so this can't create
+    /// the consecutive-"user"-turn problem `drain_steering`'s doc warns
+    /// about. Returns `true` (and the caller should loop for one more
+    /// round-trip) only if there was anything queued.
+    async fn drain_steering_into_new_turn(&mut self) -> bool {
+        let Some(rx) = &mut self.steering_rx else { return false };
+        let mut drained = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            drained.push(text);
+        }
+        if drained.is_empty() {
+            return false;
+        }
+        for text in &drained {
+            self.reporter.on_steering_message(text).await;
+        }
+        self.messages.push(Message {
+            role: Role::User,
+            content: drained.into_iter().map(ContentBlock::Text).collect(),
+            metadata: serde_json::Value::Null,
+        });
+        true
     }
 }
 
@@ -1065,6 +1103,36 @@ mod tests {
                 .unwrap()
                 .contains(&"steering:also check the licensing".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn steering_text_arriving_during_a_toolless_turn_becomes_a_follow_up_turn() {
+        // Exercises `drain_steering_into_new_turn` directly for the same
+        // reason `drain_steering_appends_onto_the_existing_message_at_that_index`
+        // does: a genuine mid-turn arrival is a race between the terminal
+        // and the running turn, so this pins down deterministically what a
+        // text-only turn does with it instead of losing it until the next
+        // `run_turn` call (the bug this covers).
+        let provider = ScriptedProvider::new(vec![text_response("first reply")]);
+        let reporter = Arc::new(SpyReporter::default());
+        let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test agent", test_ctx())
+            .with_reporter(reporter.clone());
+        session.run_turn("first").await.unwrap();
+
+        let steering_tx = session.enable_steering();
+        steering_tx.send("also check the changelog".to_string()).unwrap();
+        let queued = session.drain_steering_into_new_turn().await;
+        assert!(queued, "expected queued steering text to start a follow-up turn");
+
+        let last_message = session.messages().last().expect("a message was pushed");
+        assert_eq!(last_message.role, Role::User);
+        let has_steering_text = last_message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("also check the changelog")));
+        assert!(has_steering_text, "got: {last_message:?}");
+
+        assert!(!session.drain_steering_into_new_turn().await, "an empty queue must not start another turn");
     }
 
     #[tokio::test]
