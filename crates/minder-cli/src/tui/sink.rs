@@ -60,46 +60,57 @@ pub(crate) struct PinnedInputSnapshot {
     pub(crate) mode: InputMode,
 }
 
+/// The three `Arc`s every pinned-box-aware function needs, bundled together
+/// since none of them are ever useful without the other two -- threading
+/// them as separate parameters was what tripped clippy's
+/// `too_many_arguments` on `tui::run_turn_pinned`.
+#[derive(Clone)]
+pub(crate) struct PinnedHandles {
+    pub(crate) terminal: Arc<Mutex<InlineTerminal>>,
+    pub(crate) status: Arc<Mutex<String>>,
+    /// See `PinnedInputSnapshot`.
+    pub(crate) input: Arc<Mutex<PinnedInputSnapshot>>,
+}
+
 /// Pushes formatted lines permanently into the terminal's real scrollback
 /// (above the pinned input box) via `Terminal::insert_before`, instead of
 /// printing directly -- see `tui::run_tui_repl`. Status/spinner text is
 /// captured into `status` instead, for the input box's own render pass to
 /// pick up on its next redraw rather than clobbering a terminal row itself.
 pub(crate) struct InlineViewportSink {
-    terminal: Arc<Mutex<InlineTerminal>>,
-    status: Arc<Mutex<String>>,
-    /// See `PinnedInputSnapshot`. Read (never written) by this sink.
-    input: Arc<Mutex<PinnedInputSnapshot>>,
+    handles: PinnedHandles,
     color: bool,
 }
 
 impl InlineViewportSink {
-    pub(crate) fn new(
-        terminal: Arc<Mutex<InlineTerminal>>,
-        status: Arc<Mutex<String>>,
-        input: Arc<Mutex<PinnedInputSnapshot>>,
-        color: bool,
-    ) -> Self {
-        Self {
-            terminal,
-            status,
-            input,
-            color,
-        }
+    pub(crate) fn new(handles: PinnedHandles, color: bool) -> Self {
+        Self { handles, color }
     }
 }
 
 impl OutputSink for InlineViewportSink {
     fn print_stdout(&self, text: &str) {
-        insert_text(&self.terminal, &self.input, &self.status, self.color, text);
+        insert_text(
+            &self.handles.terminal,
+            &self.handles.input,
+            &self.handles.status,
+            self.color,
+            text,
+        );
     }
 
     fn print_stderr(&self, text: &str) {
-        insert_text(&self.terminal, &self.input, &self.status, self.color, text);
+        insert_text(
+            &self.handles.terminal,
+            &self.handles.input,
+            &self.handles.status,
+            self.color,
+            text,
+        );
     }
 
     fn redraw_status(&self, text: &str) {
-        *self.status.lock().unwrap() = strip_ansi(text);
+        *self.handles.status.lock().unwrap() = strip_ansi(text);
     }
 }
 

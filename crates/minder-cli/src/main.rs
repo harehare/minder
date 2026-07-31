@@ -682,11 +682,7 @@ async fn run_one_shot(task: &str, output: OutputFormat) {
 /// including the one shared with the `agent` tool for subagents -- renders
 /// through the same place `run_repl` ends up reading/writing.
 enum ReplBackend {
-    Tui(
-        Arc<std::sync::Mutex<tui::sink::InlineTerminal>>,
-        Arc<std::sync::Mutex<String>>,
-        Arc<std::sync::Mutex<tui::sink::PinnedInputSnapshot>>,
-    ),
+    Tui(tui::PinnedHandles),
     Fallback,
 }
 
@@ -699,17 +695,12 @@ enum ReplBackend {
 /// put in the shape ratatui wants is rare, but shouldn't be fatal).
 async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend) {
     if input_watcher::supports_key_watching()
-        && let Ok((terminal, status, pinned_input)) = tui::init()
+        && let Ok(handles) = tui::init()
     {
         let color = color_enabled(std::io::stdout().is_terminal());
-        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(
-            terminal.clone(),
-            status.clone(),
-            pinned_input.clone(),
-            color,
-        ));
+        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(handles.clone(), color));
         let built = build_session_with_sink(output, sink).await;
-        return (built, ReplBackend::Tui(terminal, status, pinned_input));
+        return (built, ReplBackend::Tui(handles));
     }
     (build_session(output).await, ReplBackend::Fallback)
 }
@@ -1238,9 +1229,7 @@ async fn print_banner(session: &AgentSession, record: &SessionRecord, reporter: 
 async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord, backend: ReplBackend) {
     print_banner(&built.session, record, &built.reporter).await;
     match backend {
-        ReplBackend::Tui(terminal, status, pinned_input) => {
-            tui::run_tui_repl(built, dir, record, terminal, status, pinned_input).await
-        }
+        ReplBackend::Tui(handles) => tui::run_tui_repl(built, dir, record, handles).await,
         ReplBackend::Fallback => run_repl_fallback(built, dir, record).await,
     }
 }

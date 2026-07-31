@@ -341,7 +341,7 @@ pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 
 /// is `None` if `area` is shorter than expected (defensive -- a 1-row
 /// terminal shouldn't panic, just draw what fits).
 fn split_rows(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
-    let rule = (area.height >= 1).then(|| Rect { height: 1, ..area });
+    let rule = (area.height >= 1).then_some(Rect { height: 1, ..area });
     let input = (area.height >= 2).then(|| Rect {
         y: area.y + 1,
         height: 1,

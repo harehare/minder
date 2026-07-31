@@ -22,8 +22,8 @@ use minder_core::{AgentError, AgentSession, Message, Reporter};
 use ratatui::layout::Rect;
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
-pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink};
-use sink::{InlineTerminal, PinnedInputSnapshot};
+use sink::PinnedInputSnapshot;
+pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink, PinnedHandles};
 
 /// How often the pinned box redraws on its own while a turn is running (so
 /// the spinner's elapsed-seconds counter advances even with no keystrokes)
@@ -45,19 +45,15 @@ const VIEWPORT_HEIGHT: u16 = 3;
 /// handle. Returns `Err` (never panics) if raw mode / terminal init fails
 /// even though `input_watcher::supports_key_watching()` said it should
 /// work -- callers fall back to the plain REPL in that case.
-pub(crate) fn init() -> std::io::Result<(
-    Arc<Mutex<InlineTerminal>>,
-    Arc<Mutex<String>>,
-    Arc<Mutex<PinnedInputSnapshot>>,
-)> {
+pub(crate) fn init() -> std::io::Result<PinnedHandles> {
     let terminal = ratatui::try_init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
     })?;
-    Ok((
-        Arc::new(Mutex::new(terminal)),
-        Arc::new(Mutex::new(String::new())),
-        Arc::new(Mutex::new(PinnedInputSnapshot::default())),
-    ))
+    Ok(PinnedHandles {
+        terminal: Arc::new(Mutex::new(terminal)),
+        status: Arc::new(Mutex::new(String::new())),
+        input: Arc::new(Mutex::new(PinnedInputSnapshot::default())),
+    })
 }
 
 /// Drives one interactive session end-to-end -- same shape as
@@ -73,9 +69,7 @@ pub(crate) async fn run_tui_repl(
     built: &mut crate::BuiltSession,
     dir: &Path,
     record: &mut crate::session_store::SessionRecord,
-    terminal: Arc<Mutex<InlineTerminal>>,
-    status: Arc<Mutex<String>>,
-    input: Arc<Mutex<PinnedInputSnapshot>>,
+    handles: PinnedHandles,
 ) {
     let color = crate::color_enabled(std::io::stdout().is_terminal());
     let history_path = crate::session_store::history_path(dir).ok();
@@ -85,8 +79,7 @@ pub(crate) async fn run_tui_repl(
 
     loop {
         let idle_status = idle_status_text(&built.session, dir);
-        let Some(line) = read_line(&terminal, &input, &mut box_state, &mut events, dir, &idle_status, color).await
-        else {
+        let Some(line) = read_line(&handles, &mut box_state, &mut events, dir, &idle_status, color).await else {
             break;
         };
         let line = line.trim().to_string();
@@ -109,7 +102,7 @@ pub(crate) async fn run_tui_repl(
             // assumptions so the next redraw repaints cleanly instead of
             // corrupting whatever `rustyline`/`InputWatcher` left on screen.
             let _ = crossterm::terminal::enable_raw_mode();
-            let _ = terminal.lock().unwrap().clear();
+            let _ = handles.terminal.lock().unwrap().clear();
             continue;
         }
 
@@ -118,9 +111,7 @@ pub(crate) async fn run_tui_repl(
         let result = run_turn_pinned(
             &mut built.session,
             &expanded,
-            &terminal,
-            &status,
-            &input,
+            &handles,
             &mut box_state,
             &mut events,
             dir,
@@ -133,7 +124,7 @@ pub(crate) async fn run_tui_repl(
         crate::persist(dir, record, &built.session);
     }
 
-    let _ = terminal.lock().unwrap().clear();
+    let _ = handles.terminal.lock().unwrap().clear();
     let _ = ratatui::try_restore();
 }
 
@@ -150,15 +141,14 @@ fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
 /// redraws on every keystroke, returns `None` on Ctrl-D/stream end (the
 /// caller treats that like `rustyline`'s `ReadlineError::Eof`).
 async fn read_line(
-    terminal: &Arc<Mutex<InlineTerminal>>,
-    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
+    handles: &PinnedHandles,
     box_state: &mut InputBoxState,
     events: &mut EventStream,
     dir: &Path,
     status_text: &str,
     color: bool,
 ) -> Option<String> {
-    redraw(terminal, pinned_input, box_state, InputMode::Idle, status_text, color);
+    redraw(handles, box_state, InputMode::Idle, status_text, color);
     loop {
         let event = match events.next().await {
             None => return None,
@@ -185,7 +175,7 @@ async fn read_line(
         } else {
             status_text
         };
-        redraw(terminal, pinned_input, box_state, InputMode::Idle, text, color);
+        redraw(handles, box_state, InputMode::Idle, text, color);
     }
 }
 
@@ -198,9 +188,7 @@ async fn read_line(
 async fn run_turn_pinned(
     session: &mut AgentSession,
     task: &str,
-    terminal: &Arc<Mutex<InlineTerminal>>,
-    status: &Arc<Mutex<String>>,
-    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
+    handles: &PinnedHandles,
     box_state: &mut InputBoxState,
     events: &mut EventStream,
     dir: &Path,
@@ -211,11 +199,10 @@ async fn run_turn_pinned(
     let steering_tx = session.enable_steering();
 
     redraw(
-        terminal,
-        pinned_input,
+        handles,
         box_state,
         InputMode::Running,
-        &status.lock().unwrap().clone(),
+        &handles.status.lock().unwrap().clone(),
         color,
     );
 
@@ -245,7 +232,7 @@ async fn run_turn_pinned(
                 result = &mut turn => break result,
                 () = wait_for_deadline => break Err(AgentError::Interrupted),
                 _ = ticker.tick() => {
-                    redraw(terminal, pinned_input, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
+                    redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
                 }
                 event = events.next() => {
                     let event = match event {
@@ -273,7 +260,7 @@ async fn run_turn_pinned(
                         // `mode == Running` -- those are idle-only outcomes.
                         InputOutcome::Quit | InputOutcome::CtrlCHint | InputOutcome::Handled => {}
                     }
-                    redraw(terminal, pinned_input, box_state, InputMode::Running, &status.lock().unwrap().clone(), color);
+                    redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
                 }
             }
         }
@@ -286,22 +273,15 @@ async fn run_turn_pinned(
 }
 
 /// Draws the pinned box and, first, publishes its current contents into
-/// `pinned_input` -- the shared snapshot `InlineViewportSink::insert_text`
+/// `handles.input` -- the shared snapshot `InlineViewportSink::insert_text`
 /// reads from to redraw the box itself right after scrollback output clears
 /// it (see `sink::PinnedInputSnapshot`). Updating it here, right before every
 /// draw this module does directly, keeps it correct without a second place
 /// that has to remember to touch it.
-fn redraw(
-    terminal: &Arc<Mutex<InlineTerminal>>,
-    pinned_input: &Arc<Mutex<PinnedInputSnapshot>>,
-    box_state: &InputBoxState,
-    mode: InputMode,
-    status_text: &str,
-    color: bool,
-) {
-    *pinned_input.lock().unwrap() = box_state.snapshot(mode);
+fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, status_text: &str, color: bool) {
+    *handles.input.lock().unwrap() = box_state.snapshot(mode);
 
-    let mut term = terminal.lock().unwrap();
+    let mut term = handles.terminal.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();
         box_state.render(frame, area, mode, status_text, color);
