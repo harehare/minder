@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-mq-lang = "0.6"
+mq-lang = "0.7"
 serde_json = "1"
 
 [[bin]]
