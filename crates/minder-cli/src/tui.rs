@@ -21,6 +21,8 @@ use futures_util::StreamExt;
 use minder_core::{AgentError, AgentSession, Message, Reporter};
 use ratatui::layout::Rect;
 
+use crate::reporter::{BOLD, CYAN, RESET, YELLOW};
+
 use input_box::{InputBoxState, InputMode, InputOutcome};
 use sink::PinnedInputSnapshot;
 pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink, PinnedHandles};
@@ -86,6 +88,7 @@ pub(crate) async fn run_tui_repl(
         if line.is_empty() {
             continue;
         }
+        echo_submitted(&built.reporter, InputMode::Idle, &line, color).await;
         if line == "exit" || line == "quit" {
             break;
         }
@@ -116,6 +119,7 @@ pub(crate) async fn run_tui_repl(
             &mut events,
             dir,
             color,
+            &built.reporter,
         )
         .await;
         if let Err(e) = &result {
@@ -126,6 +130,27 @@ pub(crate) async fn run_tui_repl(
 
     let _ = handles.terminal.lock().unwrap().clear();
     let _ = ratatui::try_restore();
+}
+
+/// Echoes what the user just submitted into the permanent scrollback.
+/// `InputBoxState::commit` (see its doc comment) clears the pinned box's own
+/// owned region on submit, unlike the old `rustyline`/`InputWatcher` split
+/// this replaced -- there, the typed line stayed on screen as a side effect
+/// of normal terminal echo. Without this, a submitted line (especially
+/// mid-turn steering text) vanishes with no record it was ever sent.
+/// `TerminalReporter::on_steering_message`'s doc comment already assumes
+/// this echo happened upstream -- this is what makes that assumption true.
+async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &str, color: bool) {
+    let (glyph, glyph_color) = match mode {
+        InputMode::Idle => ("❯", CYAN),
+        InputMode::Running => ("»", YELLOW),
+    };
+    let line = if color {
+        format!("{BOLD}{glyph_color}{glyph}{RESET} {text}")
+    } else {
+        format!("{glyph} {text}")
+    };
+    reporter.on_notice(&line).await;
 }
 
 fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
@@ -185,6 +210,7 @@ async fn read_line(
 /// or the grace period elapsing force-aborts), but driven by this module's
 /// own `EventStream` poll instead of a per-turn `InputWatcher`, so the box
 /// never disappears or hands off to a different input mechanism.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_pinned(
     session: &mut AgentSession,
     task: &str,
@@ -193,6 +219,7 @@ async fn run_turn_pinned(
     events: &mut EventStream,
     dir: &Path,
     color: bool,
+    reporter: &Arc<dyn Reporter>,
 ) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
@@ -254,6 +281,7 @@ async fn run_turn_pinned(
                             deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE_PERIOD);
                         }
                         InputOutcome::Submit(text) => {
+                            echo_submitted(reporter, InputMode::Running, &text, color).await;
                             let _ = steering_tx.send(text);
                         }
                         // `handle_key` never returns `Quit`/`CtrlCHint` while
