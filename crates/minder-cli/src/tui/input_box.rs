@@ -245,11 +245,12 @@ impl InputBoxState {
     }
 
     /// Renders the box into `area` (expected to be the bottom 3 rows of the
-    /// inline viewport: rule / input / status): a dim rule, the prompt glyph
-    /// (different in `Running` mode so idle vs. mid-turn is visually
-    /// distinct -- see the plan's open design questions) plus the buffer,
-    /// and a status line built by the caller (spinner/provider while
-    /// running, keyboard hints while idle).
+    /// inline viewport: rule / status / input): a dim rule, a status line
+    /// built by the caller (spinner/provider while running, keyboard hints
+    /// while idle), and -- pinned to the very last row, so it's never the
+    /// one that scrolls out of view under a burst of tool output -- the
+    /// prompt glyph (different in `Running` mode so idle vs. mid-turn is
+    /// visually distinct) plus the buffer.
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, mode: InputMode, status: &str, color: bool) {
         render_pinned(frame, area, &self.buffer, self.cursor, mode, status, color);
     }
@@ -301,6 +302,15 @@ pub(crate) fn render_pinned(
         frame.render_widget(Paragraph::new(Line::styled(rule, style)), rule_area);
     }
 
+    if let Some(status_area) = rows.2 {
+        let style = if color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
+    }
+
     if let Some(input_area) = rows.1 {
         let glyph = match mode {
             InputMode::Idle => "❯",
@@ -319,15 +329,6 @@ pub(crate) fn render_pinned(
         ]);
         frame.render_widget(Paragraph::new(line), input_area);
     }
-
-    if let Some(status_area) = rows.2 {
-        let style = if color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
-        frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
-    }
 }
 
 /// Free-function core of `InputBoxState::cursor_column` -- see `render_pinned`.
@@ -337,18 +338,32 @@ pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 
     area.x + prefix_width + col
 }
 
-/// Splits a 3-row area into (rule, input, status); any row beyond the first
-/// is `None` if `area` is shorter than expected (defensive -- a 1-row
-/// terminal shouldn't panic, just draw what fits).
+/// The input row within `area` -- the bottom-most row when there's room for
+/// all 3 (rule/status/input), or the second row if the terminal is too
+/// short to fit a status line at all. Shared by `tui::redraw` and
+/// `sink::insert_text`'s cursor placement so both always agree with
+/// `render_pinned`/`split_rows` on where the box actually drew the buffer.
+pub(crate) fn input_row(area: Rect) -> Option<Rect> {
+    split_rows(area).1
+}
+
+/// Splits a 3-row area into (rule, input, status), with the input row
+/// pinned to the *last* row (so it's the one row a burst of scrollback
+/// output can never appear to shove offscreen or overlap) and status
+/// directly above it. Any row beyond the first is `None` if `area` is
+/// shorter than expected (defensive -- a 1-row terminal shouldn't panic,
+/// just draw what fits); when there's only room for 2 rows, input still
+/// wins over status since it's the one row that must stay visible.
 fn split_rows(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
     let rule = (area.height >= 1).then_some(Rect { height: 1, ..area });
-    let input = (area.height >= 2).then(|| Rect {
+    let status = (area.height >= 3).then(|| Rect {
         y: area.y + 1,
         height: 1,
         ..area
     });
-    let status = (area.height >= 3).then(|| Rect {
-        y: area.y + 2,
+    let input_y = if area.height >= 3 { area.y + 2 } else { area.y + 1 };
+    let input = (area.height >= 2).then_some(Rect {
+        y: input_y,
         height: 1,
         ..area
     });

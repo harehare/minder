@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -172,12 +171,7 @@ fn insert_text(
             &status_text,
             color,
         );
-        if area.height >= 2 {
-            let input_row = Rect {
-                y: area.y + 1,
-                height: 1,
-                ..area
-            };
+        if let Some(input_row) = super::input_box::input_row(area) {
             frame.set_cursor_position((
                 super::input_box::cursor_column_for(input_row, &snapshot.buffer, snapshot.cursor),
                 input_row.y,

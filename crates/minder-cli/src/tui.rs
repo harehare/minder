@@ -19,7 +19,6 @@ use std::time::Duration;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use minder_core::{AgentError, AgentSession, Message, Reporter};
-use ratatui::layout::Rect;
 
 use crate::reporter::{BOLD, CYAN, RESET, YELLOW};
 
@@ -313,12 +312,7 @@ fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, s
     let _ = term.draw(|frame| {
         let area = frame.area();
         box_state.render(frame, area, mode, status_text, color);
-        if area.height >= 2 {
-            let input_row = Rect {
-                y: area.y + 1,
-                height: 1,
-                ..area
-            };
+        if let Some(input_row) = input_box::input_row(area) {
             frame.set_cursor_position((box_state.cursor_column(input_row), input_row.y));
         }
     });
