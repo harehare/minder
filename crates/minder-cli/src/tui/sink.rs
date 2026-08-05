@@ -180,11 +180,12 @@ fn insert_text(
     });
 }
 
-/// Parses the handful of SGR codes `reporter.rs`'s `paint`/format helpers
-/// ever emit (`RESET`/`DIM`/`BOLD`/`GREEN`/`RED`/`YELLOW`/`CYAN`) into a
-/// styled `Line`, since a ratatui `Buffer` renders `Style`d spans, not raw
-/// escape bytes. Unrecognized bytes (there shouldn't be any, given the
-/// closed set of codes this codebase produces) pass through as plain text.
+/// Parses embedded ANSI SGR sequences -- both `reporter.rs`'s own fixed
+/// palette and `crate::markdown`'s syntect-highlighted code blocks (24-bit
+/// and 256-color codes) -- into a styled `Line`, since a ratatui `Buffer`
+/// renders `Style`d spans, not raw escape bytes. A malformed sequence with
+/// no closing `m` (shouldn't happen given what this codebase emits) skips
+/// just the escape byte rather than looping forever on it.
 fn ansi_to_line(line: &str) -> Line<'static> {
     let mut spans = Vec::new();
     let mut style = Style::default();
@@ -211,25 +212,58 @@ fn ansi_to_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Recognizes exactly the escape sequences in `reporter.rs`'s color consts
-/// (`\x1b[0m`, `\x1b[1m`, `\x1b[2m`, `\x1b[3Xm`) at the start of `s`,
-/// returning the numeric code and the remainder past it.
-fn split_sgr_code(s: &str) -> Option<(u8, &str)> {
+/// Recognizes any `\x1b[<params>m` SGR sequence at the start of `s`
+/// (`params` is the raw `;`-separated body, not just `reporter.rs`'s closed
+/// set of single-number codes) and returns it alongside the remainder past
+/// it. Deliberately doesn't validate/parse `params` here -- `crate::markdown`
+/// renders syntax-highlighted code blocks through `syntect`, which emits
+/// multi-parameter 24-bit-color codes like `38;2;249;38;114` (see
+/// `apply_sgr`); this used to reject those and fall through to the
+/// "unrecognized" path, which only skips the escape *byte* and leaves the
+/// rest of the sequence (`[38;2;249;38;114m`) to leak into the visible
+/// output as literal text.
+fn split_sgr_code(s: &str) -> Option<(&str, &str)> {
     let body = s.strip_prefix("\x1b[")?;
     let end = body.find('m')?;
-    let code: u8 = body[..end].parse().ok()?;
-    Some((code, &body[end + 1..]))
+    Some((&body[..end], &body[end + 1..]))
 }
 
-fn apply_sgr(style: Style, code: u8) -> Style {
-    match code {
-        0 => Style::default(),
-        1 => style.add_modifier(Modifier::BOLD),
-        2 => style.add_modifier(Modifier::DIM),
-        31 => style.fg(ratatui::style::Color::Red),
-        32 => style.fg(ratatui::style::Color::Green),
-        33 => style.fg(ratatui::style::Color::Yellow),
-        36 => style.fg(ratatui::style::Color::Cyan),
+/// Applies one SGR sequence's `;`-separated parameters to `style`, covering
+/// both `reporter.rs`'s own fixed palette and the 24-bit/256-color codes
+/// `syntect` emits for highlighted code blocks (see `split_sgr_code`).
+/// Parameters this doesn't recognize are no-ops, same as before.
+fn apply_sgr(style: Style, params: &str) -> Style {
+    use ratatui::style::Color;
+
+    let mut parts = params.split(';').map(|p| p.parse::<u32>().unwrap_or(u32::MAX));
+    match parts.next() {
+        None | Some(0) => Style::default(),
+        Some(1) => style.add_modifier(Modifier::BOLD),
+        Some(2) => style.add_modifier(Modifier::DIM),
+        Some(3) => style.add_modifier(Modifier::ITALIC),
+        Some(4) => style.add_modifier(Modifier::UNDERLINED),
+        Some(31) => style.fg(Color::Red),
+        Some(32) => style.fg(Color::Green),
+        Some(33) => style.fg(Color::Yellow),
+        Some(34) => style.fg(Color::Blue),
+        Some(35) => style.fg(Color::Magenta),
+        Some(36) => style.fg(Color::Cyan),
+        Some(39) => style.fg(Color::Reset),
+        Some(38) => match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(2), Some(r), Some(g), Some(b)) if [r, g, b].iter().all(|c| *c <= 255) => {
+                style.fg(Color::Rgb(r as u8, g as u8, b as u8))
+            }
+            (Some(5), Some(n), _, _) if n <= 255 => style.fg(Color::Indexed(n as u8)),
+            _ => style,
+        },
+        Some(48) => match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(2), Some(r), Some(g), Some(b)) if [r, g, b].iter().all(|c| *c <= 255) => {
+                style.bg(Color::Rgb(r as u8, g as u8, b as u8))
+            }
+            (Some(5), Some(n), _, _) if n <= 255 => style.bg(Color::Indexed(n as u8)),
+            _ => style,
+        },
+        Some(49) => style.bg(Color::Reset),
         _ => style,
     }
 }
@@ -253,4 +287,60 @@ fn strip_ansi(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Regression test for the bug this fix addresses: `crate::markdown`
+    /// renders syntax-highlighted code blocks with syntect's 24-bit
+    /// truecolor SGR codes (`\x1b[38;2;R;G;Bm`), which the old
+    /// single-number `split_sgr_code` couldn't parse -- it fell through to
+    /// the "unrecognized sequence" path, which only skipped the escape byte
+    /// and left the rest of the code (`[38;2;249;38;114m`) as literal
+    /// visible text, garbling both the content and the width `insert_text`
+    /// wraps/scrolls by.
+    #[test]
+    fn truecolor_sgr_codes_do_not_leak_into_the_rendered_text() {
+        let line = ansi_to_line("\x1b[38;2;249;38;114mfn\x1b[0m main() {}");
+        assert_eq!(plain_text(&line), "fn main() {}");
+    }
+
+    #[test]
+    fn truecolor_foreground_sets_an_rgb_style() {
+        let line = ansi_to_line("\x1b[38;2;249;38;114mfn\x1b[0m");
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Rgb(249, 38, 114)));
+    }
+
+    #[test]
+    fn indexed_256_color_codes_do_not_leak_either() {
+        let line = ansi_to_line("\x1b[38;5;208morange\x1b[0m");
+        assert_eq!(plain_text(&line), "orange");
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Indexed(208)));
+    }
+
+    #[test]
+    fn background_truecolor_codes_are_applied_and_not_leaked() {
+        let line = ansi_to_line("\x1b[48;2;1;2;3mtext\x1b[0m");
+        assert_eq!(plain_text(&line), "text");
+        assert_eq!(line.spans[0].style.bg, Some(ratatui::style::Color::Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn reporters_own_fixed_palette_still_works() {
+        let line = ansi_to_line("\x1b[1m\x1b[36mheading\x1b[0m plain");
+        assert_eq!(plain_text(&line), "heading plain");
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Cyan));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn strip_ansi_removes_truecolor_codes_too() {
+        assert_eq!(strip_ansi("\x1b[38;2;249;38;114mfn\x1b[0m"), "fn");
+    }
 }
