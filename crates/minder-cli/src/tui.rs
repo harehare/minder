@@ -46,15 +46,40 @@ const VIEWPORT_HEIGHT: u16 = 3;
 /// handle. Returns `Err` (never panics) if raw mode / terminal init fails
 /// even though `input_watcher::supports_key_watching()` said it should
 /// work -- callers fall back to the plain REPL in that case.
+///
+/// Builds the backend on a `BufWriter` instead of going through
+/// `ratatui::try_init_with_options` (which uses raw `stdout()`) --
+/// `CrosstermBackend::draw` issues one `write()` per changed cell, and
+/// unbuffered `Stdout` turns each of those into its own locking syscall.
+/// `Terminal::draw` already flushes the backend once at the end of every
+/// draw, so buffering here just batches those writes without changing when
+/// anything actually reaches the terminal.
 pub(crate) fn init() -> std::io::Result<PinnedHandles> {
-    let terminal = ratatui::try_init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
-    })?;
+    set_panic_hook();
+    crossterm::terminal::enable_raw_mode()?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::BufWriter::new(std::io::stdout()));
+    let terminal = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
+        },
+    )?;
     Ok(PinnedHandles {
         terminal: Arc::new(Mutex::new(terminal)),
         status: Arc::new(Mutex::new(String::new())),
         input: Arc::new(Mutex::new(PinnedInputSnapshot::default())),
     })
+}
+
+/// Same panic hook `ratatui::try_init`/`try_init_with_options` installs
+/// internally, replicated here since switching to our own buffered backend
+/// means we no longer call those.
+fn set_panic_hook() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        hook(info);
+    }));
 }
 
 /// Drives one interactive session end-to-end -- same shape as
@@ -179,6 +204,14 @@ async fn read_line(
             Some(Err(_)) => continue,
             Some(Ok(e)) => e,
         };
+        if matches!(event, Event::Resize(_, _)) {
+            // Nothing but a keystroke redraws while idle -- without this,
+            // ratatui's autoresize (which only runs inside `Terminal::draw`)
+            // never sees the new size and the pinned box goes stale until
+            // the next key press.
+            redraw(handles, box_state, InputMode::Idle, status_text, color);
+            continue;
+        }
         let Event::Key(key) = event else { continue };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;

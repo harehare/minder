@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthChar;
 
 use super::sink::PinnedInputSnapshot;
 use crate::mentions;
@@ -332,9 +333,14 @@ pub(crate) fn render_pinned(
 }
 
 /// Free-function core of `InputBoxState::cursor_column` -- see `render_pinned`.
+/// Sums display width, not char count, so double-width (CJK/emoji) chars don't
+/// throw off the on-screen cursor position.
 pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 {
     let prefix_width = 2u16; // glyph + one space, both single-column
-    let col = buffer[..char_boundary(buffer, cursor)].chars().count() as u16;
+    let col: u16 = buffer[..char_boundary(buffer, cursor)]
+        .chars()
+        .map(|c| c.width().unwrap_or(0) as u16)
+        .sum();
     area.x + prefix_width + col
 }
 
@@ -548,6 +554,15 @@ mod tests {
             box_state.handle_key(key(KeyCode::Enter), InputMode::Idle, &dir());
         }
         assert_eq!(box_state.history, ["hi"]);
+    }
+
+    #[test]
+    fn cursor_column_accounts_for_double_width_chars_before_the_cursor() {
+        let area = Rect::new(0, 0, 20, 1);
+        // "あ" is one char but two display columns -- the column after it
+        // should advance by 2, not 1.
+        assert_eq!(cursor_column_for(area, "あ", 1), area.x + 2 + 2);
+        assert_eq!(cursor_column_for(area, "あい", 2), area.x + 2 + 4);
     }
 
     #[test]

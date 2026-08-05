@@ -1,4 +1,4 @@
-use std::io::{Stdout, Write};
+use std::io::{BufWriter, Stdout, Write};
 use std::sync::{Arc, Mutex};
 
 use ratatui::Terminal;
@@ -45,7 +45,7 @@ impl OutputSink for DirectPrintSink {
     }
 }
 
-pub(crate) type InlineTerminal = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type InlineTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
 /// The pinned box's latest known contents, cheap to clone/lock -- kept in
 /// sync by `tui::run_tui_repl` on every keystroke/mode change so
