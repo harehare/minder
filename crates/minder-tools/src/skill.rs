@@ -33,20 +33,43 @@ pub enum SkillLoadError {
 /// skills directory doesn't exist -- skills are fully optional, like hooks
 /// and wasm tool plugins.
 pub fn discover_skills(agent_dir: &Path) -> Result<Vec<Skill>, SkillLoadError> {
-    let skills_dir = agent_dir.join("skills");
+    let mut skills = Vec::new();
+    let mut sources = Vec::new();
+    collect_skills(&agent_dir.join("skills"), &mut skills, &mut sources)?;
+    Ok(skills)
+}
+
+/// Same as [`discover_skills`], but merges `skills/*/SKILL.md` from several
+/// roots into one list -- used to combine the project's `.agent/skills`
+/// with every discovered plugin's `skills/` directory (see
+/// `crate::discover_plugins`), so a name collision between a project skill
+/// and a plugin skill (or between two plugins) is still caught rather than
+/// silently shadowed.
+pub fn discover_all_skills<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Result<Vec<Skill>, SkillLoadError> {
+    let mut skills = Vec::new();
+    let mut sources = Vec::new();
+    for root in roots {
+        collect_skills(&root.join("skills"), &mut skills, &mut sources)?;
+    }
+    Ok(skills)
+}
+
+fn collect_skills(
+    skills_dir: &Path,
+    skills: &mut Vec<Skill>,
+    sources: &mut Vec<PathBuf>,
+) -> Result<(), SkillLoadError> {
     if !skills_dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&skills_dir)
-        .map_err(|e| SkillLoadError::Io(skills_dir.clone(), e))?
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(skills_dir)
+        .map_err(|e| SkillLoadError::Io(skills_dir.to_path_buf(), e))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.is_dir())
         .collect();
     entries.sort();
 
-    let mut skills: Vec<Skill> = Vec::new();
-    let mut sources: Vec<PathBuf> = Vec::new(); // parallel to `skills`, for error messages
     for dir in entries {
         let skill_md = dir.join("SKILL.md");
         if !skill_md.is_file() {
@@ -66,7 +89,7 @@ pub fn discover_skills(agent_dir: &Path) -> Result<Vec<Skill>, SkillLoadError> {
         skills.push(skill);
     }
 
-    Ok(skills)
+    Ok(())
 }
 
 fn parse_skill(path: &Path, raw: &str) -> Result<Skill, SkillLoadError> {
@@ -265,6 +288,38 @@ mod tests {
         write_skill(&agent_dir, "a", "---\nname: dup\ndescription: first\n---\nbody\n");
         write_skill(&agent_dir, "b", "---\nname: dup\ndescription: second\n---\nbody\n");
         let err = discover_skills(&agent_dir).unwrap_err();
+        assert!(matches!(err, SkillLoadError::DuplicateName { name, .. } if name == "dup"));
+    }
+
+    #[test]
+    fn discover_all_skills_merges_multiple_roots() {
+        let agent_dir = scratch_dir();
+        let plugin_dir = scratch_dir();
+        write_skill(
+            &agent_dir,
+            "commit-messages",
+            "---\nname: commit-messages\ndescription: project skill\n---\nbody\n",
+        );
+        write_skill(
+            &plugin_dir,
+            "plugin-skill",
+            "---\nname: plugin-skill\ndescription: from a plugin\n---\nbody\n",
+        );
+
+        let skills = discover_all_skills([agent_dir.as_path(), plugin_dir.as_path()]).unwrap();
+        let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["commit-messages", "plugin-skill"]);
+    }
+
+    #[test]
+    fn discover_all_skills_rejects_cross_root_duplicate_names() {
+        let agent_dir = scratch_dir();
+        let plugin_dir = scratch_dir();
+        write_skill(&agent_dir, "a", "---\nname: dup\ndescription: project\n---\nbody\n");
+        write_skill(&plugin_dir, "b", "---\nname: dup\ndescription: plugin\n---\nbody\n");
+
+        let err = discover_all_skills([agent_dir.as_path(), plugin_dir.as_path()]).unwrap_err();
         assert!(matches!(err, SkillLoadError::DuplicateName { name, .. } if name == "dup"));
     }
 

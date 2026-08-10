@@ -2269,7 +2269,9 @@ name = "minder-tools-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
  "minder-core",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
@@ -3110,10 +3112,13 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "http",
  "pin-project-lite",
  "process-wrap",
+ "reqwest",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3580,6 +3585,19 @@ checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c123f296ade4ec4b8b0f6162116e6629f5146922ca5ab40ca9d3c2e73ab4761e"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

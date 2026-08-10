@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "example-plugin",
+  "version": "0.1.0",
+  "description": "Example Agent Plugin bundling one skill -- copy plugins/ to .agent/plugins/ to try it",
+  "author": { "name": "minder" },
+  "keywords": ["example"]
+}

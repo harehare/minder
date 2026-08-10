@@ -22,8 +22,8 @@ use minder_tools::{
     AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool,
     EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool, ListAgentsTool, LsTool,
     ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WorktreeAddTool,
-    WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_skills, discover_subagents,
-    format_checklist,
+    WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_all_skills, discover_plugins,
+    discover_subagents, format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -223,6 +223,28 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         mailbox: None,
     };
 
+    // Agent Plugins (https://agent-plugins.org) bundle skills and MCP servers
+    // together under .agent/plugins/<name>/{plugin.json,skills/,mcp.json};
+    // discovered up front so skill loading below can merge project + plugin
+    // skills into one duplicate-checked list.
+    let plugins = match discover_plugins(&agent_dir) {
+        Ok(plugins) => {
+            if !plugins.is_empty() {
+                let names: Vec<&str> = plugins.iter().map(|p| p.manifest.name.as_str()).collect();
+                eprintln!(
+                    "loaded {} plugin(s) from .agent/plugins/: {}",
+                    plugins.len(),
+                    names.join(", ")
+                );
+            }
+            plugins
+        }
+        Err(e) => {
+            eprintln!("failed to load plugins: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let has_project_hooks = agent_dir.join("hooks").is_dir() || agent_dir.join("hooks.mq").is_file();
     let hooks = match HookEngine::load(&agent_dir) {
         Ok(engine) => {
@@ -266,10 +288,11 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         tools.push(Arc::new(WebSearchTool::new(key)));
     }
 
-    match discover_skills(&working_dir.join(".agent")) {
+    let skill_roots = std::iter::once(agent_dir.as_path()).chain(plugins.iter().map(|p| p.root.as_path()));
+    match discover_all_skills(skill_roots) {
         Ok(skills) => {
             if !skills.is_empty() {
-                eprintln!("loaded {} skill(s) from .agent/skills/", skills.len());
+                eprintln!("loaded {} skill(s) from .agent/skills/ and plugins/", skills.len());
                 tools.push(Arc::new(SkillTool::new(skills)));
             }
         }
@@ -303,6 +326,26 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         Err(e) => {
             eprintln!("failed to load mcp servers: {e}");
             std::process::exit(1);
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    for plugin in &plugins {
+        match minder_tools_mcp::load_plugin_mcp_tools(&plugin.root).await {
+            Ok(mcp_tools) => {
+                if !mcp_tools.is_empty() {
+                    eprintln!(
+                        "loaded {} mcp tool(s) from plugin '{}'",
+                        mcp_tools.len(),
+                        plugin.manifest.name
+                    );
+                }
+                tools.extend(mcp_tools.into_iter().map(Arc::from));
+            }
+            Err(e) => {
+                eprintln!("failed to load mcp servers for plugin '{}': {e}", plugin.manifest.name);
+                std::process::exit(1);
+            }
         }
     }
 

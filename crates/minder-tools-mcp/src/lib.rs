@@ -1,11 +1,14 @@
 mod manifest;
+mod plugin_manifest;
 
 use async_trait::async_trait;
 pub use manifest::{Manifest, ManifestError, ServerConfig};
 use minder_core::{Tool, ToolContext, ToolExecOutcome};
+pub use plugin_manifest::{PluginMcpManifest, PluginMcpManifestError, PluginServerConfig};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{ClientInitializeError, RunningService};
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +17,8 @@ use std::sync::Arc;
 pub enum McpToolError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error(transparent)]
+    PluginManifest(#[from] PluginMcpManifestError),
     #[error("mcp server \"{name}\" failed to start `{command}`: {source}")]
     Spawn {
         name: String,
@@ -33,6 +38,14 @@ pub enum McpToolError {
         #[source]
         source: rmcp::ServiceError,
     },
+    #[error("mcp server \"{name}\" has an invalid header {header:?}")]
+    InvalidHeader { name: String, header: String },
+    // rmcp has no client-side transport for the legacy HTTP+SSE protocol
+    // (only stdio and streamable-http) -- see connect_sse's doc comment.
+    #[error(
+        "mcp server \"{name}\" uses the \"sse\" transport, which minder doesn't support yet -- use \"streamable-http\" instead"
+    )]
+    UnsupportedTransport { name: String },
 }
 
 type McpClient = RunningService<RoleClient, ()>;
@@ -122,9 +135,21 @@ async fn connect_server(server: ServerConfig) -> Result<Vec<Box<dyn Tool>>, McpT
         args,
         env,
     } = server;
+    connect_stdio(name, command, args, env, None).await
+}
 
+async fn connect_stdio(
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    cwd: Option<String>,
+) -> Result<Vec<Box<dyn Tool>>, McpToolError> {
     let mut cmd = tokio::process::Command::new(&command);
     cmd.envs(&env);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     let transport = TokioChildProcess::new(cmd.configure(|c| {
         c.args(&args);
     }))
@@ -138,8 +163,41 @@ async fn connect_server(server: ServerConfig) -> Result<Vec<Box<dyn Tool>>, McpT
         name: name.clone(),
         source: Box::new(e),
     })?;
-    let client = Arc::new(client);
+    wrap_client_tools(name, client).await
+}
 
+/// Connects to a `streamable-http` MCP server over HTTPS/HTTP via `reqwest`,
+/// the successor to the legacy HTTP+SSE transport in the MCP spec.
+async fn connect_streamable_http(
+    name: String,
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<Vec<Box<dyn Tool>>, McpToolError> {
+    let mut custom_headers = std::collections::HashMap::new();
+    for (key, value) in headers {
+        let header_name = http::HeaderName::from_bytes(key.as_bytes()).map_err(|_| McpToolError::InvalidHeader {
+            name: name.clone(),
+            header: key.clone(),
+        })?;
+        let header_value = http::HeaderValue::from_str(&value).map_err(|_| McpToolError::InvalidHeader {
+            name: name.clone(),
+            header: key,
+        })?;
+        custom_headers.insert(header_name, header_value);
+    }
+
+    let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
+    let transport = StreamableHttpClientTransport::with_client(reqwest::Client::default(), config);
+
+    let client: McpClient = ().serve(transport).await.map_err(|e| McpToolError::Initialize {
+        name: name.clone(),
+        source: Box::new(e),
+    })?;
+    wrap_client_tools(name, client).await
+}
+
+async fn wrap_client_tools(name: String, client: McpClient) -> Result<Vec<Box<dyn Tool>>, McpToolError> {
+    let client = Arc::new(client);
     let remote_tools = client.list_all_tools().await.map_err(|e| McpToolError::ListTools {
         name: name.clone(),
         source: e,
@@ -157,4 +215,33 @@ async fn connect_server(server: ServerConfig) -> Result<Vec<Box<dyn Tool>>, McpT
             })
         })
         .collect())
+}
+
+/// Discovers a plugin's `mcp.json` (Agent Plugins spec) at
+/// `plugin_root/mcp.json` and connects every configured server, the same
+/// way [`load_mcp_tools`] does for the project's `.agent/mcp.toml`. Missing
+/// file -> `Ok(vec![])`; `sse`-transport servers are a hard error since rmcp
+/// has no client-side legacy-SSE transport (only stdio and streamable-http).
+pub async fn load_plugin_mcp_tools(plugin_root: &Path) -> Result<Vec<Box<dyn Tool>>, McpToolError> {
+    let manifest_path = plugin_root.join("mcp.json");
+    if !manifest_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let manifest = PluginMcpManifest::load(&manifest_path).await?;
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    for (name, server) in manifest.servers {
+        let server_tools = match server {
+            PluginServerConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => connect_stdio(name, command, args, env, cwd).await?,
+            PluginServerConfig::StreamableHttp { url, headers } => connect_streamable_http(name, url, headers).await?,
+            PluginServerConfig::Sse { .. } => return Err(McpToolError::UnsupportedTransport { name }),
+        };
+        tools.extend(server_tools);
+    }
+    Ok(tools)
 }

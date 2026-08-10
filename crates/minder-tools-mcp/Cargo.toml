@@ -19,7 +19,14 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "process"] }
 async-trait.workspace = true
 toml = "1"
-rmcp = { version = "2", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+reqwest.workspace = true
+http = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

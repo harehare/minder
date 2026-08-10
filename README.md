@@ -55,6 +55,7 @@ interception points and never drive the loop itself.
 - [Hooks](#hooks)
 - [Tool plugins (WASM)](#tool-plugins-wasm)
 - [MCP servers (optional)](#mcp-servers-optional)
+- [Plugins](#plugins)
 - [Autonomous loop mode](#autonomous-loop-mode)
 - [Development](#development)
 - [Support](#support)
@@ -730,6 +731,69 @@ Built without `--features mcp`, minder ignores `.agent/mcp.toml` entirely (the `
 fails to start, initialize, or list its tools is a hard error at startup, same as a broken wasm
 plugin or hook file. Remote tool calls go through `on_tool_call`/`on_tool_result` hooks exactly like
 built-in and wasm tool calls.
+
+## Plugins
+
+minder supports [Agent Plugins](https://agent-plugins.org), the open, vendor-neutral format
+[introduced by Vercel](https://vercel.com/blog/introducing-agent-plugins) for packaging skills and
+MCP servers into one distributable directory instead of hand-copying `SKILL.md` files and editing
+`.agent/mcp.toml` for every project:
+
+```
+.agent/plugins/<plugin-name>/
+├── plugin.json   # required: {"$schema": "...", "name": "..."}, everything else optional
+├── skills/       # same SKILL.md layout as .agent/skills -- see Skills above
+│   └── <skill-name>/SKILL.md
+└── mcp.json      # same idea as .agent/mcp.toml, JSON instead of TOML -- see MCP servers above
+```
+
+```json
+// .agent/plugins/my-plugin/plugin.json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "What this plugin adds"
+}
+```
+
+minder discovers every `.agent/plugins/*/plugin.json` at startup (missing `plugins/` is not an
+error, same as `skills/`), then treats each plugin's `skills/` directory exactly like
+`.agent/skills`: all skills from the project and every plugin are merged into one list, and a name
+collision anywhere in that merged set -- project vs. plugin, or plugin vs. plugin -- is a startup
+error, not a silent override. Plugin names themselves must be unique and follow the spec's `name`
+pattern (lowercase alphanumeric, `.`/`-`, 1-64 characters).
+
+A plugin's `mcp.json` is loaded the same way `.agent/mcp.toml` is (behind the `mcp` feature — see
+[MCP servers](#mcp-servers-optional)), and supports `stdio` and `streamable-http` servers:
+
+```json
+// .agent/plugins/my-plugin/mcp.json
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    },
+    "remote": {
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." }
+    }
+  }
+}
+```
+
+The legacy `"sse"` transport type parses but fails at connect time with a clear error -- `rmcp` (the
+MCP client library minder uses) doesn't implement an HTTP+SSE client, only stdio and
+streamable-http, and the MCP spec itself has since superseded SSE with streamable-http. Use
+`streamable-http` instead.
+
+Only the two portable component types from the spec (skills, MCP servers) are wired in; a plugin's
+client-specific `extensions` (e.g. bundling minder-only subagents or hooks under a reverse-domain
+namespace directory) are parsed but not currently acted on. See `plugins/example-plugin/` for a
+runnable example (copy `plugins/` to `.agent/plugins/` in a project to try it).
 
 ## Autonomous loop mode
 
