@@ -198,6 +198,11 @@ the line first; on an already-empty line, it shows a `Ctrl-C again to exit` hint
 Ctrl-C within two seconds actually quits — the same "press again" convention most shells use. Ctrl-D
 or `exit`/`quit` always quits immediately, no confirmation needed.
 
+Interactive `chat`/resumed sessions run in a fullscreen alternate-screen view (like `less` or `top`)
+with the input box always pinned to the last line, so it never scrolls out of view under a burst of
+tool output. `PageUp`/`PageDown` or the mouse wheel scroll back through the conversation; new output
+snaps the view back to the bottom unless you're mid-scroll.
+
 ### Markdown in, Markdown out
 
 Assistant replies stream as plain Markdown text, not rendered styling — headings/bold/lists show up
@@ -869,7 +874,13 @@ process actually dies:
   turn is lost.
 - **A durable log, even off-terminal** — `MINDER_LOG_FILE=path/to/log` also appends every
   turn/tool-call/tool-result/retry as a plain-text line to that file, useful for a loop launched
-  under `nohup`, `tmux`, or systemd, where stderr isn't being watched live.
+  under `nohup`, `tmux`, or systemd, where stderr isn't being watched live. Set
+  `MINDER_LOG_FORMAT=json` to write JSON Lines instead (one object per event) for scripts/log
+  shippers to parse.
+- **Checking status from another terminal** — `MINDER_STATUS_FILE=path/to/status.json` keeps a small
+  JSON snapshot of what the agent is doing right now (`state`, `current_action`, `turn_started_at`,
+  provider/model, pid), rewritten atomically on every state change — `cat`/`watch` it from anywhere
+  without tailing the full log.
 
 ## Development
 

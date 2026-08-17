@@ -7,6 +7,7 @@ mod mentions;
 mod provider_select;
 mod reporter;
 mod session_store;
+mod status_reporter;
 mod tui;
 
 use std::io::{IsTerminal, Read};
@@ -33,11 +34,12 @@ use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
-use file_reporter::{CompositeReporter, FileReporter};
+use file_reporter::{CompositeReporter, FileReporter, LogFormat};
 use input_watcher::InputWatcher;
 use provider_select::select_provider;
 use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter, YELLOW};
 use session_store::SessionRecord;
+use status_reporter::StatusReporter;
 
 /// Tools offered to a `/plan` turn: investigation only, nothing that can
 /// change the working directory or run arbitrary commands, so a plan can
@@ -156,34 +158,17 @@ enum CliCommand {
 struct BuiltSession {
     session: AgentSession,
     provider: Arc<dyn LlmProvider>,
-    /// Kept so `/model <provider> [model]` can rebuild a provider via `build_provider`.
     cfg: config::ProjectConfig,
-    /// Every tool the main session has, including `agent` -- `/plan` filters
-    /// this down to `PLAN_READ_ONLY_TOOLS` itself.
     tools: Vec<Arc<dyn Tool>>,
     hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     reporter: Arc<dyn Reporter>,
     tool_ctx: ToolContext,
-    /// Shared with `TerminalReporter`'s `on_thinking` gate -- toggling this
-    /// (via `/thinking`) takes effect on the next turn without rebuilding
-    /// the session. See `config::ProjectConfig::thinking_budget` for the
-    /// initial value.
     show_thinking: Arc<AtomicBool>,
-    /// Shared with `TerminalReporter`'s spinner status suffix -- toggled by `/status`.
     show_status: Arc<AtomicBool>,
-    /// Also present in `tools` as a type-erased `Arc<dyn Tool>` (that's what
-    /// the model actually calls); kept here too, concretely typed, so
-    /// `/todo` can read the current list without downcasting.
     todo: Arc<TodoWriteTool>,
-    /// Shared with the `write_file`/`edit_file`/`delete_file` tools'
-    /// `CheckpointedTool` wrapper (see above) -- `run_turn_interruptible`
-    /// starts a fresh generation before each turn, and `/undo` reverts the
-    /// most recent one.
     checkpoint: Arc<Checkpoint>,
 }
 
-/// Loads `.agent/config.toml`, exiting like every other `.agent/` loader
-/// (hooks, skills, subagents) on a malformed file.
 fn load_project_config(agent_dir: &Path) -> config::ProjectConfig {
     match config::load(agent_dir) {
         Ok(cfg) => cfg,
@@ -194,23 +179,10 @@ fn load_project_config(agent_dir: &Path) -> config::ProjectConfig {
     }
 }
 
-/// Builds the tool/hook/skill/plugin-wired session shared by both the
-/// one-shot and `loop` entry points -- only the prompt(s) fed into
-/// `run_turn` differ between the two modes. `output` decides whether
-/// assistant text streams live to stdout (`Text`, the default and the only
-/// sensible choice for `chat`/`loop`) or is held back so a caller can print
-/// one JSON object instead (`Json`, one-shot only -- see `run_one_shot`).
 async fn build_session(output: OutputFormat) -> BuiltSession {
     build_session_with_sink(output, Arc::new(tui::DirectPrintSink)).await
 }
 
-/// Same as `build_session`, but lets the caller choose where `TerminalReporter`'s
-/// output actually goes -- `run_chat`/`run_resume`'s interactive branches pass
-/// an `InlineViewportSink` once they've decided to use the pinned-input-box
-/// REPL (see `tui::run_tui_repl`), so every reporter this builds -- including
-/// the one handed to the `agent` tool for subagents -- renders through the
-/// same pinned viewport instead of a subagent's tool trace printing straight
-/// to stdout underneath it.
 async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::OutputSink>) -> BuiltSession {
     let working_dir = std::env::current_dir().expect("cwd");
     let agent_dir = working_dir.join(".agent");
@@ -223,10 +195,6 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         mailbox: None,
     };
 
-    // Agent Plugins (https://agent-plugins.org) bundle skills and MCP servers
-    // together under .agent/plugins/<name>/{plugin.json,skills/,mcp.json};
-    // discovered up front so skill loading below can merge project + plugin
-    // skills into one duplicate-checked list.
     let plugins = match discover_plugins(&agent_dir) {
         Ok(plugins) => {
             if !plugins.is_empty() {
@@ -259,10 +227,6 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
             std::process::exit(1);
         }
     };
-
-    // Wraps write_file/edit_file/delete_file (not bash -- see `Checkpoint`'s
-    // own docs on why arbitrary shell side effects aren't covered) so
-    // `/undo` can revert whatever the most recently completed turn changed.
     let checkpoint = Arc::new(Checkpoint::new());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadFileTool),
@@ -363,18 +327,24 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         terminal_reporter_impl = terminal_reporter_impl.silence_stdout();
     }
     let terminal_reporter: Arc<dyn Reporter> = Arc::new(terminal_reporter_impl);
-    let reporter: Arc<dyn Reporter> = match std::env::var("MINDER_LOG_FILE") {
-        Ok(path) => match FileReporter::new(Path::new(&path)) {
+    let mut reporters: Vec<Arc<dyn Reporter>> = vec![terminal_reporter.clone()];
+    if let Ok(path) = std::env::var("MINDER_LOG_FILE") {
+        match FileReporter::new(Path::new(&path), LogFormat::from_env()) {
             Ok(file_reporter) => {
                 eprintln!("logging to {path}");
-                Arc::new(CompositeReporter::new(vec![terminal_reporter, Arc::new(file_reporter)]))
+                reporters.push(Arc::new(file_reporter));
             }
-            Err(e) => {
-                eprintln!("failed to open log file {path}: {e}");
-                terminal_reporter
-            }
-        },
-        Err(_) => terminal_reporter,
+            Err(e) => eprintln!("failed to open log file {path}: {e}"),
+        }
+    }
+    if let Ok(path) = std::env::var("MINDER_STATUS_FILE") {
+        eprintln!("writing status to {path}");
+        reporters.push(Arc::new(StatusReporter::new(PathBuf::from(path))));
+    }
+    let reporter: Arc<dyn Reporter> = if reporters.len() == 1 {
+        terminal_reporter
+    } else {
+        Arc::new(CompositeReporter::new(reporters))
     };
 
     // Builtins first; user-defined agents override by name.
@@ -413,10 +383,6 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         agent_registry.clone(),
     )));
 
-    // Added after `agent` is built (not before) so subagents -- which
-    // inherit a snapshot of `tools` taken above -- don't get a shared todo
-    // list, or the ability to inspect/cancel background runs, of their own;
-    // both are for the top-level conversation only.
     let todo = Arc::new(TodoWriteTool::new());
     tools.push(todo.clone() as Arc<dyn Tool>);
     tools.push(Arc::new(ListAgentsTool::new(agent_registry.clone())));
@@ -431,8 +397,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         tool_ctx.clone(),
     )
     .with_reporter(reporter.clone());
-    // Populates the spinner's provider label from the start, not just after
-    // the first `/model` switch.
+
     reporter.on_provider_changed(provider.id(), provider.model()).await;
 
     BuiltSession {
@@ -500,26 +465,14 @@ impl From<Cli> for Command {
     }
 }
 
-/// Prints a completion script for `shell` to stdout, e.g.:
-/// `minder completion zsh >> ~/.zshrc` (or wherever your shell sources
-/// completions from -- see its docs for the right file/directory).
 fn print_completion(shell: clap_complete::Shell) {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
-/// Bytes read from piped stdin beyond this point are dropped (with a note
-/// appended) rather than folded whole into the task -- keeps one enormous
-/// pipe (e.g. `cat huge.log | minder ...`) from single-handedly blowing the
-/// context budget before the model even gets a turn.
 const MAX_STDIN_CHARS: usize = 200_000;
 
-/// Folds piped stdin (if any) into `task` as extra input, the same
-/// separation `some_command | jq '...'` has between piped data and the
-/// query itself. A no-op when stdin is a terminal (nothing piped) or empty
-/// -- callers only invoke this for a one-shot task, never before the
-/// interactive REPL takes over stdin for its own input.
 fn with_piped_stdin(task: String) -> String {
     if std::io::stdin().is_terminal() {
         return task;
@@ -531,8 +484,6 @@ fn with_piped_stdin(task: String) -> String {
     combine_task_with_piped_input(task, &piped)
 }
 
-/// The pure formatting half of `with_piped_stdin`, split out so it's
-/// testable without a real (or faked) stdin handle.
 fn combine_task_with_piped_input(task: String, piped: &str) -> String {
     let piped = piped.trim();
     if piped.is_empty() {
@@ -575,43 +526,16 @@ fn working_dir() -> PathBuf {
     std::env::current_dir().expect("cwd")
 }
 
-/// How long an interrupted turn gets to wind down gracefully after an
-/// Esc/Ctrl-C (e.g. `bash` killing its child process, see `bash.rs`) before
-/// it's force-aborted regardless -- see `run_turn_interruptible`.
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
 
-/// How long a second idle Ctrl-C has to follow the first one to quit the
-/// fallback REPL -- see `run_repl_fallback`. Matches
-/// `input_box::CTRL_C_QUIT_WINDOW`, the pinned-box TUI's equivalent.
 const IDLE_CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
 
-/// Runs `session.run_turn(input)` the same as calling it directly, except
-/// Esc or Ctrl-C during the turn interrupts it instead of killing the whole
-/// process (see `InputWatcher`), and any other line typed + Enter is
-/// steered into the still-running turn (`AgentSession::enable_steering`)
-/// instead of waiting for it to finish. First Esc/Ctrl-C cancels the turn's
-/// tools (`AgentSession::reset_cancel_token`) and waits up to
-/// `INTERRUPT_GRACE_PERIOD` for the turn to notice and wind down on its own
-/// -- e.g. `bash` killing its child process rather than leaving it orphaned.
-/// A second Esc/Ctrl-C during that window (or the grace period simply
-/// elapsing) force-aborts immediately regardless.
-///
-/// Either way, an interrupted turn's partial messages are discarded (see
-/// `AgentSession::discard_interrupted_turn`) so the next turn starts from a
-/// clean, correctly-alternating transcript instead of one a provider might
-/// reject. The interrupted task itself isn't lost, though: the REPL just
-/// loops back to the prompt with full history intact, ready for a follow-up
-/// instruction.
 async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
     let steering_tx = session.enable_steering();
     let mut watcher = InputWatcher::spawn(cancel, steering_tx);
 
-    // Scoped so `turn` (and the mutable borrow of `session` it holds) ends
-    // with this block, before `discard_interrupted_turn` below needs its
-    // own borrow -- `tokio::pin!`'s storage otherwise outlives the binding
-    // itself, into the rest of the function.
     let result = 'turn: {
         let turn = session.run_turn(input);
         tokio::pin!(turn);
@@ -621,9 +545,6 @@ async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Resu
             _ = watcher.next_cancel() => {}
         }
 
-        // The watcher already called `cancel.cancel()` itself before
-        // notifying -- just wait out the grace period for a graceful stop,
-        // or force-abort on a second interrupt or the timeout.
         tokio::select! {
             result = &mut turn => result,
             _ = watcher.next_cancel() => Err(AgentError::Interrupted),
@@ -639,15 +560,6 @@ async fn run_turn_interruptible(session: &mut AgentSession, input: &str) -> Resu
     result
 }
 
-/// Prints a turn's error the way it deserves: an interrupt is an expected,
-/// user-initiated outcome (plain notice, no "error:" framing), everything
-/// else is a real failure.
-///
-/// An interrupt only discards the turn from the *transcript* (see
-/// `AgentSession::discard_interrupted_turn`) -- any `write_file`/`edit_file`
-/// calls that already ran before the interrupt land are still on disk, with
-/// nothing in the conversation remembering it happened. `checkpoint` still
-/// knows, though, so this warns instead of leaving that mismatch silent.
 fn print_turn_error(err: &AgentError, checkpoint: &Checkpoint) {
     if matches!(err, AgentError::Interrupted) {
         println!("Interrupted.");
@@ -661,9 +573,6 @@ fn print_turn_error(err: &AgentError, checkpoint: &Checkpoint) {
     }
 }
 
-/// Refreshes a session record from the live session's transcript and saves
-/// it, so the process can be resumed later via `--continue`/`--resume`.
-/// Best-effort: a save failure is a warning, never fatal to the turn itself.
 fn persist(dir: &Path, record: &mut SessionRecord, session: &AgentSession) {
     record.system_prompt = session.system_prompt().to_string();
     record.messages = session.messages().to_vec();
@@ -672,17 +581,11 @@ fn persist(dir: &Path, record: &mut SessionRecord, session: &AgentSession) {
     }
 }
 
-/// Prints the one JSON object `--output json` promises: the turn's answer
-/// (or `error`, mutually exclusive) plus which provider/model produced it.
-/// Called instead of letting assistant text stream to stdout live -- see
-/// `TerminalReporter::silence_stdout`.
 fn print_json_result(session: &AgentSession, result: &Result<Message, AgentError>) {
     let payload = json_result_payload(session.provider_id(), session.model(), result);
     println!("{payload}");
 }
 
-/// The pure half of `print_json_result`, split out so the payload shape is
-/// testable without spinning up a real `AgentSession`.
 fn json_result_payload(provider_id: &str, model: &str, result: &Result<Message, AgentError>) -> serde_json::Value {
     let (answer, error) = match result {
         Ok(message) => (Some(message.text()), None),
@@ -716,32 +619,17 @@ async fn run_one_shot(task: &str, output: OutputFormat) {
     }
 }
 
-/// Where an interactive REPL's live turn output/input actually goes --
-/// `Tui` when the terminal supports raw-mode key watching (a `ratatui`
-/// inline viewport with a pinned input box, see `tui::run_tui_repl`),
-/// `Fallback` otherwise (today's `rustyline` + per-turn `InputWatcher`
-/// split, unchanged). Decided once, before `build_session_with_sink` picks
-/// the reporter's `OutputSink` to match, so every reporter it builds --
-/// including the one shared with the `agent` tool for subagents -- renders
-/// through the same place `run_repl` ends up reading/writing.
 enum ReplBackend {
     Tui(tui::PinnedHandles),
     Fallback,
 }
 
-/// Builds a session for one of the REPL entry points (`run_chat`, the
-/// task-less branch of `run_resume`) -- the only two places that ever
-/// reach `run_repl`. Tries the pinned-box TUI first when the terminal can
-/// do raw-mode key watching at all (same check `InputWatcher` has always
-/// required); falls back to the plain `DirectPrintSink`-backed session,
-/// silently, on any terminal-init failure (a real TTY that still can't be
-/// put in the shape ratatui wants is rare, but shouldn't be fatal).
 async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend) {
     if input_watcher::supports_key_watching()
         && let Ok(handles) = tui::init()
     {
         let color = color_enabled(std::io::stdout().is_terminal());
-        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::InlineViewportSink::new(handles.clone(), color));
+        let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::FullscreenSink::new(handles.clone(), color));
         let built = build_session_with_sink(output, sink).await;
         return (built, ReplBackend::Tui(handles));
     }
@@ -755,12 +643,6 @@ async fn run_chat() {
     run_repl(&mut built, &dir, &mut record, backend).await;
 }
 
-/// Resumes a saved session (latest if `id` is `None`) and either runs one
-/// more task, or drops into an interactive session when no task is given.
-/// `output` only takes effect in the "one more task" branch -- the
-/// interactive branch always streams live text, so it's forced back to
-/// `Text` rather than risk silencing the REPL if `--output json` was passed
-/// alongside a bare `--continue`/`--resume`.
 async fn run_resume(id: Option<String>, task: Option<String>, output: OutputFormat) {
     let dir = working_dir();
     let loaded = match &id {
@@ -810,47 +692,25 @@ async fn run_resume(id: Option<String>, task: Option<String>, output: OutputForm
     }
 }
 
-/// Width used for the rule line when the terminal's own width can't be
-/// determined (not a tty, e.g. output piped to a file).
 const FALLBACK_RULE_WIDTH: usize = 64;
 
-/// Floor on the rule width so a slim terminal (or a bogus 0-width report)
-/// doesn't collapse it into something unreadable.
 const MIN_RULE_WIDTH: usize = 20;
 
-/// Width of the rule line drawn above/below the input, matched to the
-/// terminal's current column count so it spans (almost) the full width.
-/// Kept one column short of the terminal's actual width -- filling every
-/// column triggers auto-wrap on many terminals, which pushed the closing
-/// rule off screen instead of onto its own line. Queried fresh on every
-/// draw rather than cached, so a mid-session terminal resize is picked up
-/// on the next turn.
 fn rule_width() -> usize {
     terminal_size::terminal_size()
         .map(|(terminal_size::Width(w), _)| (w as usize).saturating_sub(1).max(MIN_RULE_WIDTH))
         .unwrap_or(FALLBACK_RULE_WIDTH)
 }
 
-/// Both the prompt and its surrounding rules print to stdout (rustyline
-/// renders the prompt there, not stderr), so they need the same color
-/// decision or the rule and the `❯` would disagree about `NO_COLOR`.
 fn color_enabled(stream_is_tty: bool) -> bool {
     stream_is_tty && std::env::var_os("NO_COLOR").is_none()
 }
 
-/// A plain dashed rule marking the input area's top/bottom edge. Uses
-/// ASCII `-` rather than box-drawing characters: those render double-width
-/// under some CJK-locale terminal/font combinations, which threw off the
-/// column count and wrapped the line early, leaving only a stray corner
-/// glyph visible.
 fn rule_line(color: bool) -> String {
     let rule = "-".repeat(rule_width());
     if color { format!("{DIM}{rule}{RESET}") } else { rule }
 }
 
-/// Builds the REPL's input prompt: `❯ ` marks a turn boundary without a
-/// full box around it -- see `run_repl` for the rule lines drawn above and
-/// below it.
 fn repl_prompt(color: bool) -> String {
     if color {
         format!("{BOLD}{CYAN}❯{RESET} ")
@@ -859,19 +719,11 @@ fn repl_prompt(color: bool) -> String {
     }
 }
 
-/// The line above each turn's input area: provider/model and working
-/// directory, so that context stays visible without repeating the full
-/// startup banner every turn.
 fn status_line(session: &AgentSession, dir: &Path, color: bool) -> String {
     let text = format!("{} ({}) · {}", session.provider_id(), session.model(), dir.display());
     if color { format!("{DIM}{text}{RESET}") } else { text }
 }
 
-/// The line below each turn's input area: the same keyboard shortcuts every
-/// time, so they're always one glance away instead of scrolled off after
-/// the first turn.
-/// `key_watching_supported`: whether Esc/steering actually work here (see
-/// `input_watcher::supports_key_watching`), not just Ctrl-C.
 fn hint_line(color: bool, key_watching_supported: bool) -> String {
     let text = if key_watching_supported {
         "Esc/Ctrl-C cancel input/turn, type + Enter to steer a running turn · Ctrl-D, 'exit'/'quit', or Ctrl-C twice to leave \
@@ -1093,12 +945,6 @@ impl Reporter for MuteTextReporter {
     }
 }
 
-/// `/plan <task>`: runs `task` through a throwaway `AgentSession` that
-/// shares the real session's provider/hooks (same sharing `AgentTool` uses
-/// for subagents) but only has read-only tools, so it can investigate and
-/// propose without being able to change anything. The plan is shown to the
-/// user, who then decides whether to actually run `task` on the real,
-/// fully-tooled session.
 async fn run_plan_command(
     task: &str,
     built: &mut BuiltSession,
@@ -1186,11 +1032,6 @@ async fn run_model_command(rest: &str, built: &mut BuiltSession) {
     }
 }
 
-/// `/undo`: reverts every file the most recently completed turn's
-/// `write_file`/`edit_file` calls touched, back to how it looked just
-/// before that turn started (see `Checkpoint`). Only ever reaches back one
-/// turn -- running it again right after has nothing left to revert, and a
-/// `bash` command's own file changes were never tracked in the first place.
 async fn run_undo_command(built: &BuiltSession, dir: &Path) {
     let restored = built.checkpoint.undo().await;
     if restored.is_empty() {
@@ -1203,21 +1044,10 @@ async fn run_undo_command(built: &BuiltSession, dir: &Path) {
     }
 }
 
-/// Short "it's alive" banner shown once when a REPL starts, so launching
-/// `minder` feels intentional rather than dropping silently into a bare
-/// prompt. The mark is a plain glyph, not a figlet wordmark -- it needs to
-/// render identically whether or not the terminal's font covers box-drawing
-/// or emoji beyond basic Unicode. Colored only when stderr is a tty and
-/// `NO_COLOR` isn't set, matching `TerminalReporter`'s own rule.
-///
-/// Routed through `reporter.on_notice` -- exactly the "REPL-local
-/// informational text" case its doc comment calls out -- instead of raw
-/// `eprintln!`. `run_repl`'s `ReplBackend::Tui` path has already called
-/// `tui::init()` by the time this runs, which reserves the pinned box's
-/// rows and takes over cursor placement; writing straight to stderr here
-/// bypassed that bookkeeping entirely and scrambled the banner into the
-/// reserved viewport instead of scrolling above it like `insert_before`
-/// does for every other line.
+/// Short "it's alive" banner shown once when a REPL starts. Routed through
+/// `reporter.on_notice` rather than raw `eprintln!` -- `tui::init()` has
+/// already taken over cursor placement by the time this runs, so writing
+/// straight to stderr would scramble the banner into the pinned box.
 async fn print_banner(session: &AgentSession, record: &SessionRecord, reporter: &Arc<dyn Reporter>) {
     let color = color_enabled(std::io::stderr().is_terminal());
     let paint = |code: &str, text: &str| {
@@ -1235,11 +1065,6 @@ async fn print_banner(session: &AgentSession, record: &SessionRecord, reporter: 
         format!("resumed, {} prior message(s)", record.messages.len())
     };
 
-    // Three ◆ arranged as a diamond outline (top/left-right/bottom points)
-    // rather than one lone glyph -- a single character can't get visually
-    // bigger in a terminal (font size is fixed), so this fakes scale by
-    // spreading it across a few rows instead, the same trick figlet-style
-    // banners use.
     let accent = format!("{YELLOW}{BOLD}");
     reporter.on_notice("").await;
     reporter
@@ -1277,34 +1102,7 @@ async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionReco
     }
 }
 
-/// Reads tasks from a line editor in a loop, feeding each into the same
-/// session so context carries over between them; saves after every turn so
-/// Ctrl-C or a crash mid-conversation loses at most the in-flight turn.
-///
-/// Uses `rustyline` rather than a raw `stdin().read_line()` so editing (and
-/// especially IME-driven Japanese input) redraws correctly: rustyline tracks
-/// display width itself instead of assuming the terminal's canonical line
-/// discipline gets multi-byte/wide characters right, which is what caused
-/// visible cursor drift when composing non-ASCII input. History persists
-/// per-project across sessions (see `session_store::history_path`) so an
-/// up-arrow recalls prior turns too.
-///
-/// Exits on EOF (Ctrl-D), or an "exit"/"quit" line. Ctrl-C cancels the
-/// in-progress input line and re-prompts rather than killing the process.
-/// A line starting with `/` is a REPL command (`/help`, `/model`, `/clear`,
-/// `/plan <task>`) handled by `handle_slash_command` instead of being sent
-/// to the model.
-///
-/// Only reached when raw-mode key watching isn't available at all (see
-/// `build_repl_session`) -- otherwise `run_repl` uses `tui::run_tui_repl`,
-/// which keeps a single input box pinned on screen at all times instead of
-/// this function's split between idle `rustyline` input and mid-turn
-/// `InputWatcher` steering.
 async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord) {
-    // Decided once (a terminal doesn't change tty-ness mid-session) and
-    // shared by every rule/status/hint line drawn below -- and the slash
-    // command hinter -- so they never disagree with the prompt itself about
-    // `NO_COLOR`.
     let color = color_enabled(std::io::stdout().is_terminal());
     let prompt = repl_prompt(color);
 
@@ -1325,11 +1123,6 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
         let _ = editor.load_history(path);
     }
 
-    // Tracks the last idle Ctrl-C so a second one within
-    // `IDLE_CTRL_C_QUIT_WINDOW` quits instead of just re-prompting forever
-    // -- matches `tui::run_tui_repl`'s pinned-box behavior (see
-    // `input_box::InputOutcome::CtrlCHint`) so Ctrl-C isn't a dead end in
-    // whichever REPL a given terminal happens to fall back to.
     let mut last_idle_interrupt: Option<Instant> = None;
 
     loop {
@@ -1387,10 +1180,6 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
     }
 }
 
-/// `minder loop <file>` is keyed by `file`'s canonical path (not a random
-/// id) so re-running the same command after a crash, Ctrl-C, or a container
-/// restart resumes the same conversation automatically -- see
-/// `session_store::key_for_path`.
 async fn run_loop_mode(file: &Path, task_hint: Option<&str>) {
     let dir = working_dir();
     let mut built = build_session(OutputFormat::Text).await;
@@ -1438,10 +1227,6 @@ mod tests {
     use super::*;
     use minder_core::{ProviderError, ProviderResponse, Role, StopReason, Tool, ToolContext, Usage};
 
-    /// Always answers with fixed `text` -- enough to prove
-    /// `run_turn_interruptible` behaves like a plain `run_turn` when nothing
-    /// ever interrupts it (the interrupt path itself needs a real SIGINT, so
-    /// isn't exercised by this in-process test suite).
     struct FixedTextProvider(&'static str);
 
     #[async_trait::async_trait]
@@ -1535,14 +1320,6 @@ mod tests {
         assert_eq!(session.messages().len(), 2);
     }
 
-    /// Real, end-to-end verification of the thing `run_turn_interruptible`
-    /// exists for: a live SIGINT to this test's own process should cancel a
-    /// running `bash` command (killing its child rather than waiting out
-    /// its full duration) and let the turn wind down gracefully within
-    /// `INTERRUPT_GRACE_PERIOD`. Sends a real signal to the current
-    /// process, so it's opt-in (`--ignored`) rather than part of the
-    /// default suite -- same convention as the providers' `live_round_trip`
-    /// tests that need real external state.
     #[tokio::test]
     #[ignore = "sends a real SIGINT to this test's own process -- run explicitly with --ignored"]
     async fn ctrl_c_interrupts_a_running_bash_command_instead_of_waiting_out_its_full_duration() {

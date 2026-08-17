@@ -5,14 +5,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::input_box::InputMode;
 
-/// Where a `TerminalReporter`'s formatted output actually goes -- lets it
-/// share all its formatting/color logic between the plain-print fallback
-/// REPL and the ratatui inline-viewport REPL, which need very different
-/// final delivery mechanisms for the same lines.
+/// Where a `TerminalReporter`'s formatted output actually goes -- shared
+/// between the plain-print fallback REPL and the fullscreen ratatui one.
 pub(crate) trait OutputSink: Send + Sync {
     /// Assistant text / conversational content.
     fn print_stdout(&self, text: &str);
@@ -22,10 +20,8 @@ pub(crate) trait OutputSink: Send + Sync {
     fn redraw_status(&self, text: &str);
 }
 
-/// Today's exact behavior: raw `print!`/`eprint!` straight to the real
-/// terminal. Used by every non-interactive path (`--output json`, `loop`
-/// mode, one-shot runs) and by the REPL's non-TTY fallback, so none of them
-/// change behavior because this type exists.
+/// Raw `print!`/`eprint!` to the real terminal -- used by non-interactive
+/// paths (`--output json`, `loop`, one-shot) and the REPL's non-TTY fallback.
 pub(crate) struct DirectPrintSink;
 
 impl OutputSink for DirectPrintSink {
@@ -45,13 +41,10 @@ impl OutputSink for DirectPrintSink {
     }
 }
 
-pub(crate) type InlineTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+pub(crate) type AppTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
-/// The pinned box's latest known contents, cheap to clone/lock -- kept in
-/// sync by `tui::run_tui_repl` on every keystroke/mode change so
-/// `InlineViewportSink` can redraw the box on its own right after clearing
-/// it (see `insert_text`), without needing the REPL loop's actual
-/// `InputBoxState` (which it never has direct access to).
+/// The pinned box's latest known contents, cheap to clone/lock -- lets
+/// `FullscreenSink` redraw the box on its own without a live `InputBoxState`.
 #[derive(Clone, Default)]
 pub(crate) struct PinnedInputSnapshot {
     pub(crate) buffer: String,
@@ -59,38 +52,103 @@ pub(crate) struct PinnedInputSnapshot {
     pub(crate) mode: InputMode,
 }
 
-/// The three `Arc`s every pinned-box-aware function needs, bundled together
-/// since none of them are ever useful without the other two -- threading
-/// them as separate parameters was what tripped clippy's
-/// `too_many_arguments` on `tui::run_turn_pinned`.
+/// The full conversation transcript, redrawn as part of every frame --
+/// replaces real terminal scrollback, which an alt-screen app doesn't have.
+/// Deliberately unbounded: a chat session's text is small enough (a few MB
+/// even for a long one) that cloning it into a `Paragraph` per redraw stays
+/// cheap; revisit only if that proves false.
+pub(crate) struct Transcript {
+    lines: Vec<Line<'static>>,
+    /// `true` (the default) auto-scrolls to the bottom as new content
+    /// arrives. A manual scroll that leaves the bottom edge clears this;
+    /// scrolling back down to the bottom edge re-arms it.
+    follow: bool,
+    /// Wrapped-line offset from the top; only meaningful while `!follow`.
+    scroll: u16,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            follow: true,
+            scroll: 0,
+        }
+    }
+}
+
+impl Transcript {
+    /// Appends newly printed lines (already parsed via `ansi_to_line`).
+    pub(crate) fn push(&mut self, mut new_lines: Vec<Line<'static>>) {
+        self.lines.append(&mut new_lines);
+    }
+
+    /// Scrolls by `delta` wrapped lines (negative = back through history);
+    /// leaving/returning to the bottom edge toggles `follow`.
+    pub(crate) fn scroll_by(&mut self, delta: i32, width: u16, visible_height: u16) {
+        if width == 0 {
+            return;
+        }
+        let total = self.wrapped_line_count(width);
+        let max_offset = total.saturating_sub(visible_height);
+        let current = if self.follow { max_offset } else { self.scroll };
+        let next = (i32::from(current) + delta).clamp(0, i32::from(max_offset)) as u16;
+        self.scroll = next;
+        self.follow = next >= max_offset;
+    }
+
+    fn wrapped_line_count(&self, width: u16) -> u16 {
+        if width == 0 || self.lines.is_empty() {
+            return 0;
+        }
+        Paragraph::new(Text::from(self.lines.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16
+    }
+
+    /// Renders into `area`, sticking to the bottom while `follow` is set
+    /// and clamping a stale manual `scroll` (e.g. after a resize).
+    pub(crate) fn render(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let paragraph = Paragraph::new(Text::from(self.lines.clone())).wrap(Wrap { trim: false });
+        let total = paragraph.line_count(area.width) as u16;
+        let max_offset = total.saturating_sub(area.height);
+        self.scroll = if self.follow { max_offset } else { self.scroll.min(max_offset) };
+        frame.render_widget(paragraph.scroll((self.scroll, 0)), area);
+    }
+}
+
+/// The `Arc`s every pinned-box-aware function needs, bundled to avoid clippy's `too_many_arguments`.
 #[derive(Clone)]
 pub(crate) struct PinnedHandles {
-    pub(crate) terminal: Arc<Mutex<InlineTerminal>>,
+    pub(crate) terminal: Arc<Mutex<AppTerminal>>,
     pub(crate) status: Arc<Mutex<String>>,
     /// See `PinnedInputSnapshot`.
     pub(crate) input: Arc<Mutex<PinnedInputSnapshot>>,
+    /// See `Transcript`.
+    pub(crate) transcript: Arc<Mutex<Transcript>>,
 }
 
-/// Pushes formatted lines permanently into the terminal's real scrollback
-/// (above the pinned input box) via `Terminal::insert_before`, instead of
-/// printing directly -- see `tui::run_tui_repl`. Status/spinner text is
-/// captured into `status` instead, for the input box's own render pass to
-/// pick up on its next redraw rather than clobbering a terminal row itself.
-pub(crate) struct InlineViewportSink {
+/// Appends formatted lines to the in-memory `Transcript` and redraws the
+/// whole frame, instead of printing directly -- see `tui::run_tui_repl`.
+pub(crate) struct FullscreenSink {
     handles: PinnedHandles,
     color: bool,
 }
 
-impl InlineViewportSink {
+impl FullscreenSink {
     pub(crate) fn new(handles: PinnedHandles, color: bool) -> Self {
         Self { handles, color }
     }
 }
 
-impl OutputSink for InlineViewportSink {
+impl OutputSink for FullscreenSink {
     fn print_stdout(&self, text: &str) {
-        insert_text(
+        append_text(
             &self.handles.terminal,
+            &self.handles.transcript,
             &self.handles.input,
             &self.handles.status,
             self.color,
@@ -99,8 +157,9 @@ impl OutputSink for InlineViewportSink {
     }
 
     fn print_stderr(&self, text: &str) {
-        insert_text(
+        append_text(
             &self.handles.terminal,
+            &self.handles.transcript,
             &self.handles.input,
             &self.handles.status,
             self.color,
@@ -113,26 +172,14 @@ impl OutputSink for InlineViewportSink {
     }
 }
 
-/// Splits `text` on newlines, converts each line's embedded ANSI codes
-/// (this codebase only ever emits the small fixed set in `reporter.rs`,
-/// never arbitrary terminal input) into a styled `Line`, and inserts the
-/// whole block above the pinned viewport. A no-op on empty text so a
-/// guard-only call (no actual line) doesn't push a blank row.
+/// Splits `text` into ANSI-styled `Line`s, appends them to the shared
+/// transcript, and redraws the full frame. No-op on empty text.
 ///
-/// Without ratatui's `scrolling-regions` feature (not enabled here --
-/// terminal-support is inconsistent enough across emulators/multiplexers
-/// that the plain fallback is safer), `Terminal::insert_before` clears the
-/// viewport it's inserting above and relies on the *next* `Terminal::draw`
-/// to repaint it. Left alone, that next repaint was whatever the 90ms
-/// ticker or the next keystroke happened to trigger in `tui::run_tui_repl`
-/// -- during a burst of streamed tokens or fast tool output, each
-/// `insert_before` clears the box again before that redraw lands, so the
-/// pinned box (and the spinner/status line riding along with it) reads as
-/// blank or stuck the whole time nothing is typed. Redrawing right here,
-/// immediately after every insert, closes that window instead of waiting
-/// on the next unrelated tick.
-fn insert_text(
-    terminal: &Mutex<InlineTerminal>,
+/// Locks `terminal` before `transcript`, same order as `tui::redraw` -- keep
+/// it consistent across both call sites or it deadlocks.
+fn append_text(
+    terminal: &Mutex<AppTerminal>,
+    transcript: &Mutex<Transcript>,
     input: &Mutex<PinnedInputSnapshot>,
     status: &Mutex<String>,
     color: bool,
@@ -152,26 +199,26 @@ fn insert_text(
         return;
     }
 
-    let mut term = terminal.lock().unwrap();
-    let width = term.size().map(|s| s.width).unwrap_or(80).max(1);
-    let paragraph = Paragraph::new(Text::from(rendered)).wrap(Wrap { trim: false });
-    let height = paragraph.line_count(width) as u16;
-    let _ = term.insert_before(height, |buf| paragraph.render(buf.area, buf));
-
     let snapshot = input.lock().unwrap().clone();
     let status_text = status.lock().unwrap().clone();
+
+    let mut term = terminal.lock().unwrap();
+    let mut t = transcript.lock().unwrap();
+    t.push(rendered);
     let _ = term.draw(|frame| {
         let area = frame.area();
+        let bottom = super::input_box::bottom_area(area);
+        t.render(frame, super::input_box::transcript_area(area));
         super::input_box::render_pinned(
             frame,
-            area,
+            bottom,
             &snapshot.buffer,
             snapshot.cursor,
             snapshot.mode,
             &status_text,
             color,
         );
-        if let Some(input_row) = super::input_box::input_row(area) {
+        if let Some(input_row) = super::input_box::input_row(bottom) {
             frame.set_cursor_position((
                 super::input_box::cursor_column_for(input_row, &snapshot.buffer, snapshot.cursor),
                 input_row.y,
@@ -180,12 +227,8 @@ fn insert_text(
     });
 }
 
-/// Parses embedded ANSI SGR sequences -- both `reporter.rs`'s own fixed
-/// palette and `crate::markdown`'s syntect-highlighted code blocks (24-bit
-/// and 256-color codes) -- into a styled `Line`, since a ratatui `Buffer`
-/// renders `Style`d spans, not raw escape bytes. A malformed sequence with
-/// no closing `m` (shouldn't happen given what this codebase emits) skips
-/// just the escape byte rather than looping forever on it.
+/// Parses embedded ANSI SGR sequences into a styled `Line` (ratatui renders
+/// `Style`d spans, not raw escape bytes).
 fn ansi_to_line(line: &str) -> Line<'static> {
     let mut spans = Vec::new();
     let mut style = Style::default();
@@ -212,26 +255,17 @@ fn ansi_to_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Recognizes any `\x1b[<params>m` SGR sequence at the start of `s`
-/// (`params` is the raw `;`-separated body, not just `reporter.rs`'s closed
-/// set of single-number codes) and returns it alongside the remainder past
-/// it. Deliberately doesn't validate/parse `params` here -- `crate::markdown`
-/// renders syntax-highlighted code blocks through `syntect`, which emits
-/// multi-parameter 24-bit-color codes like `38;2;249;38;114` (see
-/// `apply_sgr`); this used to reject those and fall through to the
-/// "unrecognized" path, which only skips the escape *byte* and leaves the
-/// rest of the sequence (`[38;2;249;38;114m`) to leak into the visible
-/// output as literal text.
+/// Recognizes any `\x1b[<params>m` SGR sequence and returns it alongside the
+/// remainder. `params` is the raw `;`-separated body, not validated here --
+/// `syntect`'s truecolor codes (`38;2;r;g;b`) need the full body, and used
+/// to leak into visible text when this only matched single-number codes.
 fn split_sgr_code(s: &str) -> Option<(&str, &str)> {
     let body = s.strip_prefix("\x1b[")?;
     let end = body.find('m')?;
     Some((&body[..end], &body[end + 1..]))
 }
 
-/// Applies one SGR sequence's `;`-separated parameters to `style`, covering
-/// both `reporter.rs`'s own fixed palette and the 24-bit/256-color codes
-/// `syntect` emits for highlighted code blocks (see `split_sgr_code`).
-/// Parameters this doesn't recognize are no-ops, same as before.
+/// Applies one SGR sequence's params to `style`; unrecognized ones are no-ops.
 fn apply_sgr(style: Style, params: &str) -> Style {
     use ratatui::style::Color;
 
@@ -268,9 +302,7 @@ fn apply_sgr(style: Style, params: &str) -> Style {
     }
 }
 
-/// Strips this codebase's SGR codes down to plain text -- used for the
-/// status line, which the input box re-styles itself rather than rendering
-/// pre-colored text.
+/// Strips SGR codes to plain text -- the input box re-styles the status line itself.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -297,14 +329,8 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    /// Regression test for the bug this fix addresses: `crate::markdown`
-    /// renders syntax-highlighted code blocks with syntect's 24-bit
-    /// truecolor SGR codes (`\x1b[38;2;R;G;Bm`), which the old
-    /// single-number `split_sgr_code` couldn't parse -- it fell through to
-    /// the "unrecognized sequence" path, which only skipped the escape byte
-    /// and left the rest of the code (`[38;2;249;38;114m`) as literal
-    /// visible text, garbling both the content and the width `insert_text`
-    /// wraps/scrolls by.
+    /// Regression: syntect's truecolor codes used to leak into visible text
+    /// (old `split_sgr_code` only matched single-number SGR codes).
     #[test]
     fn truecolor_sgr_codes_do_not_leak_into_the_rendered_text() {
         let line = ansi_to_line("\x1b[38;2;249;38;114mfn\x1b[0m main() {}");
@@ -342,5 +368,48 @@ mod tests {
     #[test]
     fn strip_ansi_removes_truecolor_codes_too() {
         assert_eq!(strip_ansi("\x1b[38;2;249;38;114mfn\x1b[0m"), "fn");
+    }
+
+    fn line(text: &str) -> Line<'static> {
+        Line::from(text.to_string())
+    }
+
+    #[test]
+    fn transcript_follows_the_bottom_by_default_as_content_grows() {
+        let mut t = Transcript::default();
+        for i in 0..10 {
+            t.push(vec![line(&format!("line {i}"))]);
+        }
+        // 10 lines, a 4-row viewport: following should sit at offset 6 (so
+        // rows 6..10 -- the last 4 -- are visible).
+        let total = t.wrapped_line_count(80);
+        assert_eq!(total, 10);
+        t.scroll_by(0, 80, 4); // no-op nudge just to exercise the follow path
+        assert!(t.follow);
+    }
+
+    #[test]
+    fn scrolling_up_disables_follow_and_scrolling_back_down_re_enables_it() {
+        let mut t = Transcript::default();
+        for i in 0..20 {
+            t.push(vec![line(&format!("line {i}"))]);
+        }
+        t.scroll_by(-5, 80, 4);
+        assert!(!t.follow);
+
+        // Scroll far enough down to land back on the bottom edge.
+        t.scroll_by(100, 80, 4);
+        assert!(t.follow);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_top() {
+        let mut t = Transcript::default();
+        for i in 0..5 {
+            t.push(vec![line(&format!("line {i}"))]);
+        }
+        t.scroll_by(-1000, 80, 2);
+        assert!(!t.follow);
+        assert_eq!(t.scroll, 0);
     }
 }

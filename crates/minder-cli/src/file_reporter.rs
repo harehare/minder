@@ -6,38 +6,74 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use minder_core::{Reporter, ToolCall, ToolExecOutcome, Usage};
+use serde_json::json;
 
 use crate::reporter::truncate;
 
 const RESULT_LOG_CHARS: usize = 2000;
 
-/// Appends every reporter event as a plain-text line to a log file,
-/// independent of the terminal -- so a detached/unattended run (`minder
-/// loop` under `nohup`/systemd/tmux) stays reviewable after the fact. No
-/// color, no spinner, no hook-driven customization: always the raw default
-/// view, since a log should show ground truth regardless of display hooks.
+/// How `FileReporter` serializes each event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Default: one human-readable line per event.
+    Text,
+    /// One JSON object per line (JSON Lines), for scripts to parse.
+    Json,
+}
+
+impl LogFormat {
+    /// `MINDER_LOG_FORMAT=json` opts in; anything else keeps `Text`.
+    pub fn from_env() -> Self {
+        match std::env::var("MINDER_LOG_FORMAT") {
+            Ok(v) if v.eq_ignore_ascii_case("json") => Self::Json,
+            _ => Self::Text,
+        }
+    }
+}
+
+/// Appends every reporter event to a log file, independent of the terminal
+/// -- keeps a detached run (`minder loop` under `nohup`/systemd/tmux) reviewable after the fact.
 pub struct FileReporter {
     file: Mutex<File>,
+    format: LogFormat,
 }
 
 impl FileReporter {
-    pub fn new(path: &Path) -> io::Result<Self> {
+    pub fn new(path: &Path, format: LogFormat) -> io::Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(file) })
+        Ok(Self {
+            file: Mutex::new(file),
+            format,
+        })
     }
 
-    fn write_line(&self, line: &str) {
-        let ts = SystemTime::now()
+    fn now_secs() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs()
+    }
+
+    /// Writes one event as `[ts] line` (`Text`) or `{"ts", "event", ...fields}` (`Json`).
+    fn write_event(&self, name: &str, line: &str, fields: serde_json::Value) {
+        let ts = Self::now_secs();
+        let rendered = match self.format {
+            LogFormat::Text => format!("[{ts}] {line}"),
+            LogFormat::Json => {
+                let mut obj = json!({"ts": ts, "event": name});
+                if let (Some(obj), Some(fields)) = (obj.as_object_mut(), fields.as_object()) {
+                    obj.extend(fields.clone());
+                }
+                obj.to_string()
+            }
+        };
         if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(f, "[{ts}] {line}");
+            let _ = writeln!(f, "{rendered}");
         }
     }
 }
@@ -45,39 +81,69 @@ impl FileReporter {
 #[async_trait]
 impl Reporter for FileReporter {
     async fn on_turn_start(&self) {
-        self.write_line("turn: waiting on model");
+        self.write_event("turn_start", "turn: waiting on model", json!({}));
     }
 
     async fn on_assistant_text(&self, text: &str) {
-        self.write_line(&format!("assistant: {text}"));
+        self.write_event(
+            "assistant_text",
+            &format!("assistant: {text}"),
+            json!({"text": text}),
+        );
     }
 
     async fn on_thinking(&self, text: &str) {
-        self.write_line(&format!("thinking: {text}"));
+        self.write_event("thinking", &format!("thinking: {text}"), json!({"text": text}));
     }
 
     async fn on_tool_call(&self, call: &ToolCall) {
-        self.write_line(&format!("tool_call: {}({})", call.name, call.arguments));
+        self.write_event(
+            "tool_call",
+            &format!("tool_call: {}({})", call.name, call.arguments),
+            json!({"id": call.id, "name": call.name, "arguments": call.arguments}),
+        );
     }
 
     async fn on_tool_result(&self, call: &ToolCall, outcome: &ToolExecOutcome) {
         let status = if outcome.is_error { "error" } else { "ok" };
-        self.write_line(&format!(
-            "tool_result: {} [{status}] {}",
-            call.name,
-            truncate(&outcome.content, RESULT_LOG_CHARS)
-        ));
+        self.write_event(
+            "tool_result",
+            &format!(
+                "tool_result: {} [{status}] {}",
+                call.name,
+                truncate(&outcome.content, RESULT_LOG_CHARS)
+            ),
+            json!({
+                "id": call.id,
+                "name": call.name,
+                "is_error": outcome.is_error,
+                "content": truncate(&outcome.content, RESULT_LOG_CHARS),
+            }),
+        );
     }
 
     async fn on_retry(&self, attempt: usize, max_attempts: usize, delay: Duration, reason: &str) {
-        self.write_line(&format!("retry {attempt}/{max_attempts} in {delay:?}: {reason}"));
+        self.write_event(
+            "retry",
+            &format!("retry {attempt}/{max_attempts} in {delay:?}: {reason}"),
+            json!({
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_ms": delay.as_millis() as u64,
+                "reason": reason,
+            }),
+        );
     }
 
     async fn on_usage(&self, usage: &Usage) {
-        self.write_line(&format!(
-            "usage: input={} output={}",
-            usage.input_tokens, usage.output_tokens
-        ));
+        self.write_event(
+            "usage",
+            &format!(
+                "usage: input={} output={}",
+                usage.input_tokens, usage.output_tokens
+            ),
+            json!({"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}),
+        );
     }
 }
 
@@ -178,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn writes_assistant_text_and_tool_events_as_lines() {
         let path = scratch_path("log.txt");
-        let reporter = FileReporter::new(&path).unwrap();
+        let reporter = FileReporter::new(&path, LogFormat::Text).unwrap();
 
         reporter.on_turn_start().await;
         reporter.on_assistant_text("hello there").await;
@@ -225,14 +291,55 @@ mod tests {
     #[tokio::test]
     async fn appends_across_multiple_instances_instead_of_truncating() {
         let path = scratch_path("append.txt");
-        FileReporter::new(&path).unwrap().on_assistant_text("first").await;
-        FileReporter::new(&path).unwrap().on_assistant_text("second").await;
+        FileReporter::new(&path, LogFormat::Text)
+            .unwrap()
+            .on_assistant_text("first")
+            .await;
+        FileReporter::new(&path, LogFormat::Text)
+            .unwrap()
+            .on_assistant_text("second")
+            .await;
 
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         assert!(contents.contains("first"));
         assert!(contents.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn json_format_emits_one_parseable_object_per_line() {
+        let path = scratch_path("log.jsonl");
+        let reporter = FileReporter::new(&path, LogFormat::Json).unwrap();
+
+        reporter.on_turn_start().await;
+        reporter
+            .on_tool_call(&ToolCall {
+                id: "1".to_string(),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            })
+            .await;
+        reporter
+            .on_usage(&Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            })
+            .await;
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let lines: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(lines[0]["event"], "turn_start");
+        assert_eq!(lines[1]["event"], "tool_call");
+        assert_eq!(lines[1]["name"], "bash");
+        assert_eq!(lines[1]["arguments"]["command"], "ls");
+        assert_eq!(lines[2]["event"], "usage");
+        assert_eq!(lines[2]["input_tokens"], 100);
     }
 
     struct RecordingReporter(Mutex<Vec<String>>);

@@ -11,15 +11,10 @@ use unicode_width::UnicodeWidthChar;
 use super::sink::PinnedInputSnapshot;
 use crate::mentions;
 
-/// How long a second idle Ctrl-C has to follow the first one to quit -- see
-/// `InputOutcome::CtrlCHint`. Matches the "press again to exit" convention
-/// most shells/REPLs use instead of a bare Ctrl-C silently doing nothing.
+/// Window for a second idle Ctrl-C to quit -- see `InputOutcome::CtrlCHint`.
 const CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
 
-/// Whether a turn is currently running -- changes both what Enter/Esc do
-/// and how the box renders (see `InputBoxState::render`), so a user can
-/// tell at a glance whether they're about to submit a new turn or steer a
-/// running one.
+/// Whether a turn is running -- changes what Enter/Esc do and how the box renders.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum InputMode {
     #[default]
@@ -27,44 +22,32 @@ pub(crate) enum InputMode {
     Running,
 }
 
-/// What happened to a single key event -- `run_tui_repl` acts on this
-/// instead of the box managing its own control flow, so cancel/quit/submit
-/// semantics stay in one place next to `AgentSession`'s turn-running calls.
+/// What happened to a single key event -- `run_tui_repl` acts on this.
 pub(crate) enum InputOutcome {
-    /// Consumed, nothing for the caller to do (typing, cursor movement, a
-    /// completion, an idle empty-Enter, etc.).
+    /// Consumed, nothing for the caller to do.
     Handled,
-    /// Enter on a non-empty buffer -- a new turn when idle, steering text
-    /// when a turn is running.
+    /// Enter on a non-empty buffer -- a new turn when idle, steering text when running.
     Submit(String),
     /// Esc or Ctrl-C while a turn is running.
     CancelTurn,
-    /// Ctrl-D (or `exit`/`quit`, checked by the caller) on an empty buffer,
-    /// or a second idle Ctrl-C following `CtrlCHint` within the window.
+    /// Ctrl-D on an empty buffer, or a second idle Ctrl-C within the window.
     Quit,
-    /// First idle Ctrl-C on an empty buffer -- doesn't quit yet, but the
-    /// caller should show a "press Ctrl-C again to exit" hint so the next
-    /// one (within `CTRL_C_QUIT_WINDOW`) does.
+    /// First idle Ctrl-C on an empty buffer -- shows a "press again" hint.
     CtrlCHint,
 }
 
-/// The always-visible input box's state: text buffer, cursor, and a simple
-/// in-memory history -- replaces both `rustyline`'s line editing (used only
-/// between turns before this) and `input_watcher.rs`'s hand-rolled raw-mode
-/// echo (used only during a turn before this), unifying them into one
-/// widget that's on screen the whole time. See `tui::run_tui_repl`.
+/// The always-visible input box's state: buffer, cursor, and history --
+/// unifies what used to be split between `rustyline` (idle) and
+/// `input_watcher.rs` (mid-turn). See `tui::run_tui_repl`.
 pub(crate) struct InputBoxState {
     buffer: String,
     cursor: usize,
     history: Vec<String>,
-    /// `Some(i)` while browsing history via Up/Down; `None` once back at a
-    /// freshly typed (or not-yet-submitted) line.
+    /// `Some(i)` while browsing history via Up/Down.
     history_index: Option<usize>,
-    /// What was being typed before Up first moved into history, restored
-    /// on Down past the most recent entry.
+    /// Draft text saved before Up first moved into history.
     draft: String,
-    /// When the last idle Ctrl-C on an empty buffer landed -- `None` once
-    /// any other key resets it. See `CTRL_C_QUIT_WINDOW`.
+    /// When the last idle Ctrl-C landed -- see `CTRL_C_QUIT_WINDOW`.
     last_idle_ctrl_c: Option<Instant>,
 }
 
@@ -80,9 +63,7 @@ impl InputBoxState {
         }
     }
 
-    /// Records `line` in history (skipping immediate repeats, same as
-    /// `rustyline`'s default `HistoryDuplicates::IgnoreConsecutive`) and
-    /// resets the buffer for the next line.
+    /// Records the buffer in history (skipping immediate repeats) and resets it.
     fn commit(&mut self) -> String {
         let line = std::mem::take(&mut self.buffer);
         self.cursor = 0;
@@ -223,11 +204,7 @@ impl InputBoxState {
         self.history_index = Some(next);
     }
 
-    /// Completes a `/`-command (single match only, mirroring
-    /// `SlashCommandHelper`'s Tab behavior) or a `@mention` path (first
-    /// candidate) at the cursor -- only ever active at end-of-line, same
-    /// restriction `matching_slash_commands`/`at_mention_token` already
-    /// enforce.
+    /// Completes a `/`-command (single match) or `@mention` (first candidate) at the cursor.
     fn complete(&mut self, working_dir: &Path) {
         if let Some(matches) = crate::matching_slash_commands(&self.buffer, self.cursor)
             && let [only] = matches.as_slice()
@@ -245,26 +222,18 @@ impl InputBoxState {
         }
     }
 
-    /// Renders the box into `area` (expected to be the bottom 3 rows of the
-    /// inline viewport: rule / status / input): a dim rule, a status line
-    /// built by the caller (spinner/provider while running, keyboard hints
-    /// while idle), and -- pinned to the very last row, so it's never the
-    /// one that scrolls out of view under a burst of tool output -- the
-    /// prompt glyph (different in `Running` mode so idle vs. mid-turn is
-    /// visually distinct) plus the buffer.
+    /// Renders the box into `area` (the bottom rule/status/input rows): a
+    /// dim rule, a status line, and the prompt + buffer pinned to the last row.
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, mode: InputMode, status: &str, color: bool) {
         render_pinned(frame, area, &self.buffer, self.cursor, mode, status, color);
     }
 
-    /// Cursor column within `area` (the input row specifically), for
-    /// `Frame::set_cursor_position` -- accounts for the `"❯ "`/`"» "` glyph
-    /// prefix both prompt styles share.
+    /// Cursor column within the input row, for `Frame::set_cursor_position`.
     pub(crate) fn cursor_column(&self, area: Rect) -> u16 {
         cursor_column_for(area, &self.buffer, self.cursor)
     }
 
-    /// A cheap, `Send`-able copy of just what `sink::InlineViewportSink`
-    /// needs to redraw the box on its own -- see `PinnedInputSnapshot`.
+    /// A cheap, `Send`-able copy for `sink::FullscreenSink` to redraw the box on its own.
     pub(crate) fn snapshot(&self, mode: InputMode) -> PinnedInputSnapshot {
         PinnedInputSnapshot {
             buffer: self.buffer.clone(),
@@ -274,11 +243,9 @@ impl InputBoxState {
     }
 }
 
-/// Free-function core of `InputBoxState::render`, taking just the buffer and
-/// cursor instead of a whole `&InputBoxState` -- lets `tui::sink` redraw the
-/// box from its own cheap snapshot (see `sink::PinnedInputSnapshot`) right
-/// after `insert_before` clears it, without needing a live `InputBoxState`
-/// (which only the REPL loop owns).
+/// Free-function core of `InputBoxState::render`, taking buffer + cursor
+/// instead of `&InputBoxState` -- lets `sink::append_text` redraw the box
+/// from its own cheap snapshot without a live `InputBoxState`.
 pub(crate) fn render_pinned(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -344,22 +311,39 @@ pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 
     area.x + prefix_width + col
 }
 
-/// The input row within `area` -- the bottom-most row when there's room for
-/// all 3 (rule/status/input), or the second row if the terminal is too
-/// short to fit a status line at all. Shared by `tui::redraw` and
-/// `sink::insert_text`'s cursor placement so both always agree with
-/// `render_pinned`/`split_rows` on where the box actually drew the buffer.
+/// The input row within `area` -- the bottom-most row, or the second row if
+/// too short for a status line. Shared by `tui::redraw` and `sink::append_text`.
 pub(crate) fn input_row(area: Rect) -> Option<Rect> {
     split_rows(area).1
 }
 
-/// Splits a 3-row area into (rule, input, status), with the input row
-/// pinned to the *last* row (so it's the one row a burst of scrollback
-/// output can never appear to shove offscreen or overlap) and status
-/// directly above it. Any row beyond the first is `None` if `area` is
-/// shorter than expected (defensive -- a 1-row terminal shouldn't panic,
-/// just draw what fits); when there's only room for 2 rows, input still
-/// wins over status since it's the one row that must stay visible.
+/// Rows reserved at the bottom of a full frame for rule/status/input;
+/// everything above is the scrollable transcript pane.
+pub(crate) const BOTTOM_ROWS: u16 = 3;
+
+/// The bottom `BOTTOM_ROWS` rows of a full frame (fewer if the terminal is
+/// shorter than that) -- what `render_pinned`/`input_row` treat as `area`.
+pub(crate) fn bottom_area(frame_area: Rect) -> Rect {
+    let height = BOTTOM_ROWS.min(frame_area.height);
+    Rect {
+        y: frame_area.y + frame_area.height - height,
+        height,
+        ..frame_area
+    }
+}
+
+/// Everything above `bottom_area(frame_area)` -- the scrollable transcript pane.
+pub(crate) fn transcript_area(frame_area: Rect) -> Rect {
+    Rect {
+        height: frame_area.height - bottom_area(frame_area).height,
+        ..frame_area
+    }
+}
+
+/// Splits a 3-row area into (rule, input, status), input pinned to the
+/// *last* row so it's never the one pushed offscreen. Degrades gracefully
+/// on a shorter area (`None` for rows that don't fit; input wins over
+/// status when there's only room for 2).
 fn split_rows(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
     let rule = (area.height >= 1).then_some(Rect { height: 1, ..area });
     let status = (area.height >= 3).then(|| Rect {
@@ -563,6 +547,20 @@ mod tests {
         // should advance by 2, not 1.
         assert_eq!(cursor_column_for(area, "あ", 1), area.x + 2 + 2);
         assert_eq!(cursor_column_for(area, "あい", 2), area.x + 2 + 4);
+    }
+
+    #[test]
+    fn bottom_area_is_the_last_three_rows_of_a_tall_frame() {
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(bottom_area(area), Rect::new(0, 21, 80, 3));
+        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 21));
+    }
+
+    #[test]
+    fn bottom_area_shrinks_instead_of_overflowing_a_short_frame() {
+        let area = Rect::new(0, 0, 80, 2);
+        assert_eq!(bottom_area(area), Rect::new(0, 0, 80, 2));
+        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 0));
     }
 
     #[test]

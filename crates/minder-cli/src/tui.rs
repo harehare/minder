@@ -1,12 +1,11 @@
-//! Pinned-input-box REPL: a `ratatui` inline viewport that keeps a single
-//! input box always visible at the bottom of the terminal, whether or not a
-//! turn is currently running, so typing is never gated on first noticing
-//! the turn finished -- replacing the old split between `rustyline`
-//! (between turns) and `input_watcher::InputWatcher` (during a turn) with
-//! one continuous mechanism. Falls back entirely to the old split when the
-//! terminal can't do raw-mode key watching at all (see
-//! `input_watcher::supports_key_watching`, checked by the caller before
-//! any of this module is reached).
+//! Fullscreen REPL: a `ratatui` alternate-screen viewport with an
+//! always-visible input box pinned to the bottom and the conversation kept
+//! in an in-memory `sink::Transcript`, redrawn as a scrollable pane above it
+//! every frame -- replaces an earlier design that pushed output into the
+//! *real* terminal scrollback on a non-alt-screen viewport, which raced its
+//! own re-repaint under bursty output. Falls back to the old split
+//! (`rustyline` idle, `input_watcher::InputWatcher` mid-turn) when the
+//! terminal can't do raw-mode key watching at all.
 
 pub(crate) mod input_box;
 pub(crate) mod sink;
@@ -16,7 +15,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, MouseEventKind};
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use minder_core::{AgentError, AgentSession, Message, Reporter};
 
@@ -24,73 +24,56 @@ use crate::reporter::{BOLD, CYAN, RESET, YELLOW};
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
 use sink::PinnedInputSnapshot;
-pub(crate) use sink::{DirectPrintSink, InlineViewportSink, OutputSink, PinnedHandles};
+pub(crate) use sink::{DirectPrintSink, FullscreenSink, OutputSink, PinnedHandles};
 
-/// How often the pinned box redraws on its own while a turn is running (so
-/// the spinner's elapsed-seconds counter advances even with no keystrokes)
-/// -- matches `reporter::SPINNER_INTERVAL`.
+/// How often the pinned box redraws on its own while running -- matches `reporter::SPINNER_INTERVAL`.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(90);
 
-/// Same grace period `run_turn_interruptible` uses -- see its doc comment
-/// for why: time for a cancelled tool (e.g. `bash` killing its child) to
-/// wind down on its own before a second interrupt force-aborts.
+/// Grace period before a second interrupt force-aborts -- see `run_turn_interruptible`.
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
 
-/// Fixed rows reserved at the bottom of the terminal: a dim rule, the
-/// prompt/input line, and a status line (spinner-or-hints). Not
-/// dynamically resized for multi-line input yet -- see the plan's open
-/// design questions.
-const VIEWPORT_HEIGHT: u16 = 3;
+/// Wrapped lines a mouse-wheel notch scrolls (`PageUp`/`PageDown` scroll a full pane instead).
+const MOUSE_SCROLL_LINES: i32 = 3;
 
-/// Initializes the ratatui inline viewport and its shared status-line
-/// handle. Returns `Err` (never panics) if raw mode / terminal init fails
-/// even though `input_watcher::supports_key_watching()` said it should
-/// work -- callers fall back to the plain REPL in that case.
+/// Initializes the fullscreen/alt-screen viewport and shared handles.
+/// `Err` (never panics) on init failure -- callers fall back to the plain REPL.
 ///
-/// Builds the backend on a `BufWriter` instead of going through
-/// `ratatui::try_init_with_options` (which uses raw `stdout()`) --
-/// `CrosstermBackend::draw` issues one `write()` per changed cell, and
-/// unbuffered `Stdout` turns each of those into its own locking syscall.
-/// `Terminal::draw` already flushes the backend once at the end of every
-/// draw, so buffering here just batches those writes without changing when
-/// anything actually reaches the terminal.
+/// Backend is `BufWriter`-wrapped rather than going through `ratatui::try_init`
+/// (raw `stdout()`): `CrosstermBackend::draw` issues one `write()` per changed
+/// cell, so unbuffered `Stdout` turns each into its own syscall.
 pub(crate) fn init() -> std::io::Result<PinnedHandles> {
     set_panic_hook();
     crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::BufWriter::new(std::io::stdout()));
-    let terminal = ratatui::Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
-        },
-    )?;
+    let terminal = ratatui::Terminal::new(backend)?;
     Ok(PinnedHandles {
         terminal: Arc::new(Mutex::new(terminal)),
         status: Arc::new(Mutex::new(String::new())),
         input: Arc::new(Mutex::new(PinnedInputSnapshot::default())),
+        transcript: Arc::new(Mutex::new(sink::Transcript::default())),
     })
 }
 
-/// Same panic hook `ratatui::try_init`/`try_init_with_options` installs
-/// internally, replicated here since switching to our own buffered backend
-/// means we no longer call those.
+/// Undoes `init`'s terminal setup -- shared by the panic hook and `run_tui_repl`'s own cleanup.
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = ratatui::try_restore();
+}
+
+/// Same panic hook `ratatui::try_init` installs internally, replicated since we use our own backend.
 fn set_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
+        restore_terminal();
         hook(info);
     }));
 }
 
-/// Drives one interactive session end-to-end -- same shape as
-/// `run_repl_fallback`, but idle input and mid-turn steering both go
-/// through the same `InputBoxState` instead of `rustyline` vs.
-/// `InputWatcher`. Slash commands (including `/plan`'s own nested turn and
-/// y/N confirmation) still run through the existing `handle_slash_command`
-/// unchanged, briefly borrowing the terminal the old way -- `clear()`
-/// after each one discards ratatui's diff cache so the next redraw doesn't
-/// assume anything about what a nested `rustyline`/`InputWatcher` call left
-/// on screen.
+/// Drives one interactive session end-to-end. Slash commands still run
+/// through `handle_slash_command` unchanged, printing straight to
+/// stdout/rustyline outside ratatui's frame -- so the alternate screen is
+/// left before the call and re-entered (plus `terminal.clear()`) after.
 pub(crate) async fn run_tui_repl(
     built: &mut crate::BuiltSession,
     dir: &Path,
@@ -121,14 +104,13 @@ pub(crate) async fn run_tui_repl(
         }
 
         if let Some(command) = line.strip_prefix('/') {
+            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             let mut editor: crate::ReplEditor = rustyline::Editor::new().expect("failed to initialize line editor");
             crate::handle_slash_command(command, built, dir, record, &mut editor).await;
-            // A nested `/plan` turn (`run_turn_interruptible`) spawns its own
-            // `InputWatcher`, which unconditionally disables raw mode on
-            // exit -- put it back, then discard ratatui's stale diff/cursor
-            // assumptions so the next redraw repaints cleanly instead of
-            // corrupting whatever `rustyline`/`InputWatcher` left on screen.
+            // A nested `/plan` turn's `InputWatcher` disables raw mode on exit -- put it back,
+            // then discard ratatui's stale diff/cursor state before the next redraw.
             let _ = crossterm::terminal::enable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
             let _ = handles.terminal.lock().unwrap().clear();
             continue;
         }
@@ -153,17 +135,12 @@ pub(crate) async fn run_tui_repl(
     }
 
     let _ = handles.terminal.lock().unwrap().clear();
-    let _ = ratatui::try_restore();
+    restore_terminal();
 }
 
-/// Echoes what the user just submitted into the permanent scrollback.
-/// `InputBoxState::commit` (see its doc comment) clears the pinned box's own
-/// owned region on submit, unlike the old `rustyline`/`InputWatcher` split
-/// this replaced -- there, the typed line stayed on screen as a side effect
-/// of normal terminal echo. Without this, a submitted line (especially
-/// mid-turn steering text) vanishes with no record it was ever sent.
-/// `TerminalReporter::on_steering_message`'s doc comment already assumes
-/// this echo happened upstream -- this is what makes that assumption true.
+/// Echoes what the user just submitted into the transcript -- `commit`
+/// clears the input box on submit, so without this the line would vanish
+/// with no record it was sent.
 async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &str, color: bool) {
     let (glyph, glyph_color) = match mode {
         InputMode::Idle => ("❯", CYAN),
@@ -179,11 +156,56 @@ async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &st
 
 fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
     format!(
-        "{} ({}) · {} · Ctrl-D/exit/Ctrl-C twice quits · Tab completes",
+        "{} ({}) · {} · Ctrl-D/exit/Ctrl-C twice quits · Tab completes · PgUp/PgDn scrolls",
         session.provider_id(),
         session.model(),
         dir.display()
     )
+}
+
+/// `(width, visible_height)` of the transcript pane for the current terminal size.
+fn transcript_metrics(handles: &PinnedHandles) -> (u16, u16) {
+    let size = handles.terminal.lock().unwrap().size().unwrap_or_default();
+    let height = size.height.saturating_sub(input_box::BOTTOM_ROWS.min(size.height));
+    (size.width, height)
+}
+
+/// Scrolls on `PageUp`/`PageDown`/mouse-wheel; `false` for anything else, so
+/// the caller falls through to normal handling. Bails before locking
+/// anything for non-scroll events -- mouse capture reports every
+/// motion/click, not just wheel notches.
+fn handle_scroll_event(handles: &PinnedHandles, event: &Event) -> bool {
+    enum Scroll {
+        PageUp,
+        PageDown,
+        WheelUp,
+        WheelDown,
+    }
+
+    let action = match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => match key.code {
+            KeyCode::PageUp => Scroll::PageUp,
+            KeyCode::PageDown => Scroll::PageDown,
+            _ => return false,
+        },
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => Scroll::WheelUp,
+            MouseEventKind::ScrollDown => Scroll::WheelDown,
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    let (width, height) = transcript_metrics(handles);
+    let page = i32::from(height.max(1));
+    let delta = match action {
+        Scroll::PageUp => -page,
+        Scroll::PageDown => page,
+        Scroll::WheelUp => -MOUSE_SCROLL_LINES,
+        Scroll::WheelDown => MOUSE_SCROLL_LINES,
+    };
+    handles.transcript.lock().unwrap().scroll_by(delta, width, height);
+    true
 }
 
 /// Reads one line from the pinned box while idle (no turn running):
@@ -205,10 +227,11 @@ async fn read_line(
             Some(Ok(e)) => e,
         };
         if matches!(event, Event::Resize(_, _)) {
-            // Nothing but a keystroke redraws while idle -- without this,
-            // ratatui's autoresize (which only runs inside `Terminal::draw`)
-            // never sees the new size and the pinned box goes stale until
-            // the next key press.
+            // Autoresize only runs inside `Terminal::draw`, so force one now.
+            redraw(handles, box_state, InputMode::Idle, status_text, color);
+            continue;
+        }
+        if handle_scroll_event(handles, &event) {
             redraw(handles, box_state, InputMode::Idle, status_text, color);
             continue;
         }
@@ -216,11 +239,8 @@ async fn read_line(
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
-        // Shows a "press again to exit" hint for exactly the one redraw
-        // right after a first idle Ctrl-C, in place of the usual idle
-        // status text -- the actual quit window is timed by
-        // `InputBoxState` itself (see `CTRL_C_QUIT_WINDOW`); this is purely
-        // what the box displays in the meantime.
+        // Shows a "press again to exit" hint for one redraw after an idle Ctrl-C
+        // (the quit window itself is timed inside `InputBoxState`).
         let show_ctrl_c_hint = match box_state.handle_key(key, InputMode::Idle, dir) {
             InputOutcome::Submit(line) => return Some(line),
             InputOutcome::Quit => return None,
@@ -236,12 +256,10 @@ async fn read_line(
     }
 }
 
-/// Runs one turn to completion while keeping the pinned box live: same
-/// cancel/steering contract `run_turn_interruptible` gives the fallback
-/// REPL (first Esc/Ctrl-C cancels and starts a grace period, a second one
-/// or the grace period elapsing force-aborts), but driven by this module's
-/// own `EventStream` poll instead of a per-turn `InputWatcher`, so the box
-/// never disappears or hands off to a different input mechanism.
+/// Runs one turn while keeping the pinned box live: same cancel/steering
+/// contract as `run_turn_interruptible` (first Esc/Ctrl-C starts a grace
+/// period, a second or the deadline force-aborts), driven by this module's
+/// own `EventStream` poll instead of a per-turn `InputWatcher`.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_pinned(
     session: &mut AgentSession,
@@ -265,10 +283,7 @@ async fn run_turn_pinned(
         color,
     );
 
-    // Scoped so `turn` (and the mutable borrow of `session` it holds) ends
-    // before `discard_interrupted_turn` below needs its own borrow -- same
-    // shape `run_turn_interruptible` uses in `main.rs` and for the same
-    // reason.
+    // Scoped so `turn`'s borrow of `session` ends before `discard_interrupted_turn` needs its own.
     let result = {
         let turn = session.run_turn(task);
         tokio::pin!(turn);
@@ -299,6 +314,10 @@ async fn run_turn_pinned(
                         Some(Err(_)) => continue,
                         Some(Ok(e)) => e,
                     };
+                    if handle_scroll_event(handles, &event) {
+                        redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
+                        continue;
+                    }
                     let Event::Key(key) = event else { continue };
                     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
@@ -332,20 +351,22 @@ async fn run_turn_pinned(
     result
 }
 
-/// Draws the pinned box and, first, publishes its current contents into
-/// `handles.input` -- the shared snapshot `InlineViewportSink::insert_text`
-/// reads from to redraw the box itself right after scrollback output clears
-/// it (see `sink::PinnedInputSnapshot`). Updating it here, right before every
-/// draw this module does directly, keeps it correct without a second place
-/// that has to remember to touch it.
+/// Publishes the box's contents into `handles.input` (so `sink::append_text`
+/// can redraw it without a live `InputBoxState`), then draws both it and the
+/// transcript pane.
+///
+/// Locks `terminal` before `transcript`, same order as `sink::append_text` -- keep it consistent or it deadlocks.
 fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, status_text: &str, color: bool) {
     *handles.input.lock().unwrap() = box_state.snapshot(mode);
 
     let mut term = handles.terminal.lock().unwrap();
+    let mut transcript = handles.transcript.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();
-        box_state.render(frame, area, mode, status_text, color);
-        if let Some(input_row) = input_box::input_row(area) {
+        let bottom = input_box::bottom_area(area);
+        transcript.render(frame, input_box::transcript_area(area));
+        box_state.render(frame, bottom, mode, status_text, color);
+        if let Some(input_row) = input_box::input_row(bottom) {
             frame.set_cursor_position((box_state.cursor_column(input_row), input_row.y));
         }
     });
@@ -353,7 +374,7 @@ fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, s
 
 /// Same wording as `print_turn_error` in `main.rs`, but routed through the
 /// reporter (`on_notice`) instead of raw `println!`/`eprintln!`, so it
-/// lands above the pinned box via `insert_before` instead of corrupting it.
+/// lands above the pinned box via the transcript instead of corrupting it.
 async fn print_turn_error_pinned(
     reporter: &Arc<dyn Reporter>,
     err: &AgentError,
@@ -371,12 +392,7 @@ async fn print_turn_error_pinned(
     }
 }
 
-/// Rustyline's `FileHistory` v2 on-disk format: a `#V2` header line, then
-/// one entry per line with `\`/`\n` escaped -- read here (best-effort, not
-/// used to persist compaction/expiry rules `FileHistory` itself has) so
-/// history carries over regardless of which REPL mode wrote it, and
-/// written in the same shape so a later `rustyline`-backed session can
-/// still read it.
+/// Rustyline's `FileHistory` v2 format: a `#V2` header, then one `\`/`\n`-escaped entry per line.
 const HISTORY_VERSION_HEADER: &str = "#V2";
 
 fn load_history(path: &Path) -> Vec<String> {

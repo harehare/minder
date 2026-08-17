@@ -149,8 +149,8 @@ pub struct TerminalReporter {
     /// reset each time `on_assistant_text` flushes it -- see `StreamSegmenter`.
     stream: Mutex<StreamSegmenter>,
     /// Where formatted lines actually go -- `DirectPrintSink` (today's raw
-    /// `print!`/`eprint!`) by default, or an `InlineViewportSink` when
-    /// `tui::run_tui_repl` builds this reporter for the pinned-input-box
+    /// `print!`/`eprint!`) by default, or a `FullscreenSink` when
+    /// `tui::run_tui_repl` builds this reporter for the fullscreen
     /// REPL. See `tui::sink`.
     sink: Arc<dyn OutputSink>,
 }
@@ -406,8 +406,8 @@ impl TerminalReporter {
     /// Prints a line while holding the spinner lock, so the ticker task
     /// can't redraw mid-print and the spinner's current line gets cleared
     /// first (stdout and stderr share one terminal row when both are ttys;
-    /// under `InlineViewportSink` the clear is a harmless no-op since the
-    /// input box and scrollback never share a row, but the lock still
+    /// under `FullscreenSink` the clear is a harmless no-op since the
+    /// input box and transcript never share a row, but the lock still
     /// serializes concurrent tool-call reporter events, e.g. from the
     /// `agent` tool's concurrent branch in `AgentSession`).
     async fn print_guarded(&self, to_stderr: bool, line: &str) {
