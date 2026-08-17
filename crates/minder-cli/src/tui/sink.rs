@@ -115,7 +115,11 @@ impl Transcript {
         let paragraph = Paragraph::new(Text::from(self.lines.clone())).wrap(Wrap { trim: false });
         let total = paragraph.line_count(area.width) as u16;
         let max_offset = total.saturating_sub(area.height);
-        self.scroll = if self.follow { max_offset } else { self.scroll.min(max_offset) };
+        self.scroll = if self.follow {
+            max_offset
+        } else {
+            self.scroll.min(max_offset)
+        };
         frame.render_widget(paragraph.scroll((self.scroll, 0)), area);
     }
 }

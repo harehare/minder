@@ -85,11 +85,7 @@ impl Reporter for FileReporter {
     }
 
     async fn on_assistant_text(&self, text: &str) {
-        self.write_event(
-            "assistant_text",
-            &format!("assistant: {text}"),
-            json!({"text": text}),
-        );
+        self.write_event("assistant_text", &format!("assistant: {text}"), json!({"text": text}));
     }
 
     async fn on_thinking(&self, text: &str) {
@@ -138,10 +134,7 @@ impl Reporter for FileReporter {
     async fn on_usage(&self, usage: &Usage) {
         self.write_event(
             "usage",
-            &format!(
-                "usage: input={} output={}",
-                usage.input_tokens, usage.output_tokens
-            ),
+            &format!("usage: input={} output={}", usage.input_tokens, usage.output_tokens),
             json!({"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}),
         );
     }
@@ -329,10 +322,7 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let lines: Vec<serde_json::Value> = contents
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let lines: Vec<serde_json::Value> = contents.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
 
         assert_eq!(lines[0]["event"], "turn_start");
         assert_eq!(lines[1]["event"], "tool_call");
