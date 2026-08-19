@@ -2,10 +2,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use super::sink::PinnedInputSnapshot;
@@ -243,9 +243,24 @@ impl InputBoxState {
     }
 }
 
+/// Panel background, a shade darker than the default terminal background so
+/// the box reads as a distinct panel (Codex/Claude Code-style) instead of
+/// just a bordered rule -- fixed rather than derived from the terminal's own
+/// palette so it looks the same everywhere. Only used when `color` is on.
+const PANEL_BG: Color = Color::Rgb(30, 32, 38);
+/// Foreground for text drawn on `PANEL_BG`, explicit rather than the
+/// terminal's own default -- a dark panel over a light-theme default
+/// foreground would otherwise be unreadable.
+const PANEL_FG: Color = Color::Rgb(220, 220, 225);
+
 /// Free-function core of `InputBoxState::render`, taking buffer + cursor
 /// instead of `&InputBoxState` -- lets `sink::append_text` redraw the box
 /// from its own cheap snapshot without a live `InputBoxState`.
+///
+/// Draws a full rounded border with a filled panel background (rather than
+/// just a top rule on the terminal's own background) so the box reads as a
+/// distinct, self-contained panel and its bottom edge is always explicitly
+/// drawn instead of just trailing off at the last row of the terminal.
 pub(crate) fn render_pinned(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -255,27 +270,23 @@ pub(crate) fn render_pinned(
     status: &str,
     color: bool,
 ) {
-    if area.height == 0 {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let rows = split_rows(area);
 
-    if let Some(rule_area) = rows.0 {
-        let rule = "-".repeat(rule_area.width as usize);
-        let style = if color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
-        frame.render_widget(Paragraph::new(Line::styled(rule, style)), rule_area);
-    }
+    let panel_style = if color { Style::default().bg(PANEL_BG).fg(PANEL_FG) } else { Style::default() };
+    let accent = if mode == InputMode::Running { Color::Yellow } else { Color::Cyan };
+    let border_style = if color { panel_style.fg(accent) } else { Style::default() };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(panel_style)
+        .border_style(border_style);
+    frame.render_widget(&block, area);
 
-    if let Some(status_area) = rows.2 {
-        let style = if color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
+    let rows = split_inner_rows(interior(area));
+
+    if let Some(status_area) = rows.0 {
+        let style = if color { panel_style.add_modifier(Modifier::DIM) } else { Style::default() };
         frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
     }
 
@@ -284,16 +295,14 @@ pub(crate) fn render_pinned(
             InputMode::Idle => "❯",
             InputMode::Running => "»",
         };
-        let glyph_style = if !color {
-            Style::default()
-        } else if mode == InputMode::Running {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        let glyph_style = if color {
+            panel_style.fg(accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
         };
         let line = Line::from(vec![
             Span::styled(format!("{glyph} "), glyph_style),
-            Span::raw(buffer.to_string()),
+            Span::styled(buffer.to_string(), panel_style),
         ]);
         frame.render_widget(Paragraph::new(line), input_area);
     }
@@ -311,15 +320,17 @@ pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 
     area.x + prefix_width + col
 }
 
-/// The input row within `area` -- the bottom-most row, or the second row if
-/// too short for a status line. Shared by `tui::redraw` and `sink::append_text`.
+/// The input row within `area` (a full `bottom_area`, border included) --
+/// the bottom-most row inside the border, or the only interior row if too
+/// short for a status line. Shared by `tui::redraw` and `sink::append_text`.
 pub(crate) fn input_row(area: Rect) -> Option<Rect> {
-    split_rows(area).1
+    split_inner_rows(interior(area)).1
 }
 
-/// Rows reserved at the bottom of a full frame for rule/status/input;
-/// everything above is the scrollable transcript pane.
-pub(crate) const BOTTOM_ROWS: u16 = 3;
+/// Rows reserved at the bottom of a full frame for the bordered input box
+/// (top border, status, input, bottom border); everything above is the
+/// scrollable transcript pane.
+pub(crate) const BOTTOM_ROWS: u16 = 4;
 
 /// The bottom `BOTTOM_ROWS` rows of a full frame (fewer if the terminal is
 /// shorter than that) -- what `render_pinned`/`input_row` treat as `area`.
@@ -340,24 +351,30 @@ pub(crate) fn transcript_area(frame_area: Rect) -> Rect {
     }
 }
 
-/// Splits a 3-row area into (rule, input, status), input pinned to the
+/// The area inside a rounded border drawn around `area` -- inset by one cell
+/// on every side, saturating on a too-small `area`. Mirrors what
+/// `Block::bordered().inner()` computes in `render_pinned`, kept as a pure
+/// function so `input_row` (used by `tui::redraw`/`sink::append_text` for
+/// cursor placement) doesn't need a live `Block`.
+fn interior(area: Rect) -> Rect {
+    area.inner(Margin::new(1, 1))
+}
+
+/// Splits a border's interior into (status, input), input pinned to the
 /// *last* row so it's never the one pushed offscreen. Degrades gracefully
-/// on a shorter area (`None` for rows that don't fit; input wins over
-/// status when there's only room for 2).
-fn split_rows(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
-    let rule = (area.height >= 1).then_some(Rect { height: 1, ..area });
-    let status = (area.height >= 3).then(|| Rect {
-        y: area.y + 1,
+/// on a shorter interior (`None` for rows that don't fit; input wins over
+/// status when there's only room for 1).
+fn split_inner_rows(inner: Rect) -> (Option<Rect>, Option<Rect>) {
+    if inner.height == 0 {
+        return (None, None);
+    }
+    let input = Some(Rect {
+        y: inner.y + inner.height - 1,
         height: 1,
-        ..area
+        ..inner
     });
-    let input_y = if area.height >= 3 { area.y + 2 } else { area.y + 1 };
-    let input = (area.height >= 2).then_some(Rect {
-        y: input_y,
-        height: 1,
-        ..area
-    });
-    (rule, input, status)
+    let status = (inner.height >= 2).then_some(Rect { height: 1, ..inner });
+    (status, input)
 }
 
 fn char_boundary(s: &str, char_idx: usize) -> usize {
@@ -550,10 +567,10 @@ mod tests {
     }
 
     #[test]
-    fn bottom_area_is_the_last_three_rows_of_a_tall_frame() {
+    fn bottom_area_is_the_last_four_rows_of_a_tall_frame() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area), Rect::new(0, 21, 80, 3));
-        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 21));
+        assert_eq!(bottom_area(area), Rect::new(0, 20, 80, 4));
+        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 20));
     }
 
     #[test]
