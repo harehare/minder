@@ -12,6 +12,7 @@ pub(crate) mod sink;
 
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,9 +21,9 @@ use crossterm::event::{
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
-use minder_core::{AgentError, AgentSession, Message, Reporter};
+use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 
-use crate::reporter::{BOLD, CYAN, RESET, YELLOW};
+use crate::reporter::{BOLD, CYAN, DIM, RED, RESET, YELLOW};
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
 use sink::PinnedInputSnapshot;
@@ -87,9 +88,21 @@ pub(crate) async fn run_tui_repl(
     let initial_history = history_path.as_deref().map(load_history).unwrap_or_default();
     let mut box_state = InputBoxState::new(initial_history);
     let mut events = EventStream::new();
+    // What `spawn_side_question` needs to build its own ephemeral sessions
+    // for text submitted while a turn is running -- same provider/tools/hooks
+    // as the main session, minus `agent` itself (a side question shouldn't
+    // spawn its own nested subagents). Captured once here rather than
+    // re-cloned per keystroke.
+    let side_provider = built.provider.clone();
+    let side_tools: Vec<Arc<dyn Tool>> = built.tools.iter().filter(|t| t.name() != "agent").cloned().collect();
+    let side_hooks = built.hooks.clone();
+    // How many side questions are still in flight -- surfaced in the status
+    // line (see `running_status`) so a submission that hasn't answered yet
+    // doesn't look like it vanished.
+    let in_flight = Arc::new(AtomicUsize::new(0));
 
     loop {
-        let idle_status = idle_status_text(&built.session, dir);
+        let idle_status = idle_status_text(&built.session, dir, &in_flight);
         let Some(line) = read_line(&handles, &mut box_state, &mut events, dir, &idle_status, color).await else {
             break;
         };
@@ -128,6 +141,11 @@ pub(crate) async fn run_tui_repl(
             dir,
             color,
             &built.reporter,
+            &side_provider,
+            &side_tools,
+            &side_hooks,
+            &built.tool_ctx,
+            &in_flight,
         )
         .await;
         if let Err(e) = &result {
@@ -156,13 +174,17 @@ async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &st
     reporter.on_notice(&line).await;
 }
 
-fn idle_status_text(session: &AgentSession, dir: &Path) -> String {
-    format!(
+fn idle_status_text(session: &AgentSession, dir: &Path, in_flight: &AtomicUsize) -> String {
+    let base = format!(
         "{} ({}) · {} · Ctrl-D/exit/Ctrl-C twice quits · Tab completes · PgUp/PgDn scrolls",
         session.provider_id(),
         session.model(),
         dir.display()
-    )
+    );
+    match in_flight.load(Ordering::Relaxed) {
+        0 => base,
+        n => format!("{base} · {n} answering"),
+    }
 }
 
 /// `(width, visible_height)` of the transcript pane for the current terminal size.
@@ -258,10 +280,87 @@ async fn read_line(
     }
 }
 
-/// Runs one turn while keeping the pinned box live: same cancel/steering
-/// contract as `run_turn_interruptible` (first Esc/Ctrl-C starts a grace
-/// period, a second or the deadline force-aborts), driven by this module's
-/// own `EventStream` poll instead of a per-turn `InputWatcher`.
+/// The running status line, with a suffix noting how many `spawn_side_question`
+/// calls haven't answered yet -- so a submission that hasn't come back reads
+/// as "still working on it" rather than "lost".
+fn running_status(handles: &PinnedHandles, in_flight: &AtomicUsize) -> String {
+    let base = handles.status.lock().unwrap().clone();
+    match in_flight.load(Ordering::Relaxed) {
+        0 => base,
+        n => format!("{base} · {n} answering"),
+    }
+}
+
+/// System prompt for the ephemeral session `spawn_side_question` builds --
+/// deliberately not the main turn's own system prompt: this session exists
+/// for exactly one reply and runs concurrently with whatever the main task
+/// is doing in the same working directory, so it's told to act accordingly
+/// rather than as the primary agent.
+const SIDE_QUESTION_SYSTEM_PROMPT: &str = "You're answering a quick side question the user asked while \
+    their main task keeps running concurrently in this same working directory. Use the available tools \
+    if you need to, but keep any changes conservative to avoid conflicting with whatever the main task \
+    might be doing at the same time. Reply concisely -- this is the only message the user will see from you.";
+
+/// Spawns `question` as an independent `AgentSession` turn -- runs
+/// concurrently with whatever the main turn is doing, touches none of its
+/// state, and prints its answer into the transcript (via `reporter`) the
+/// moment it's ready instead of waiting for the main turn to end. Used for
+/// text typed and submitted while a turn is running -- splicing it into
+/// that turn's own context instead used to derail the model into addressing
+/// the interruption rather than finishing what it was already doing.
+///
+/// Deliberately built with no reporter of its own (defaults to a no-op)
+/// rather than sharing the main session's: `TerminalReporter` tracks the
+/// live spinner under one fixed key per session
+/// (`reporter::TURN_LABEL_KEY`), so two sessions driving it at once -- this
+/// one and the main turn -- would stomp each other's spinner state and
+/// status line. Only this function's own final `on_notice` call touches the
+/// real reporter.
+#[allow(clippy::too_many_arguments)]
+fn spawn_side_question(
+    provider: Arc<dyn LlmProvider>,
+    tools: Vec<Arc<dyn Tool>>,
+    hooks: Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+    question: String,
+    tool_ctx: ToolContext,
+    reporter: Arc<dyn Reporter>,
+    in_flight: Arc<AtomicUsize>,
+    color: bool,
+) {
+    in_flight.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        let child_ctx = ToolContext {
+            working_dir: tool_ctx.working_dir,
+            session_id: format!("{}:aside", tool_ctx.session_id),
+            // Independent of the main turn's own cancel token -- Esc-ing
+            // out of the main task shouldn't take a side question down
+            // with it, and vice versa.
+            cancel: tokio_util::sync::CancellationToken::new(),
+            mailbox: None,
+        };
+        let mut session = AgentSession::new(provider, tools, hooks, SIDE_QUESTION_SYSTEM_PROMPT, child_ctx);
+        let result = session.run_turn(&question).await;
+        in_flight.fetch_sub(1, Ordering::Relaxed);
+
+        let (glyph, glyph_color, text) = match &result {
+            Ok(message) => ("↩", DIM, message.text()),
+            Err(e) => ("✗", RED, e.to_string()),
+        };
+        let line = if color {
+            format!("{glyph_color}{glyph}{RESET} {text}")
+        } else {
+            format!("{glyph} {text}")
+        };
+        reporter.on_notice(&line).await;
+    });
+}
+
+/// Runs one turn while keeping the pinned box live: same cancel contract as
+/// `run_turn_interruptible` (first Esc/Ctrl-C starts a grace period, a
+/// second or the deadline force-aborts), driven by this module's own
+/// `EventStream` poll instead of a per-turn `InputWatcher`. Anything typed
+/// and submitted while this runs is answered concurrently rather than
+/// spliced into this turn -- see `spawn_side_question`.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_pinned(
     session: &mut AgentSession,
@@ -272,18 +371,16 @@ async fn run_turn_pinned(
     dir: &Path,
     color: bool,
     reporter: &Arc<dyn Reporter>,
+    side_provider: &Arc<dyn LlmProvider>,
+    side_tools: &[Arc<dyn Tool>],
+    side_hooks: &Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
+    tool_ctx: &ToolContext,
+    in_flight: &Arc<AtomicUsize>,
 ) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
-    let steering_tx = session.enable_steering();
 
-    redraw(
-        handles,
-        box_state,
-        InputMode::Running,
-        &handles.status.lock().unwrap().clone(),
-        color,
-    );
+    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
 
     // Scoped so `turn`'s borrow of `session` ends before `discard_interrupted_turn` needs its own.
     let result = {
@@ -308,7 +405,7 @@ async fn run_turn_pinned(
                 result = &mut turn => break result,
                 () = wait_for_deadline => break Err(AgentError::Interrupted),
                 _ = ticker.tick() => {
-                    redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
+                    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
                 }
                 event = events.next() => {
                     let event = match event {
@@ -317,7 +414,7 @@ async fn run_turn_pinned(
                         Some(Ok(e)) => e,
                     };
                     if handle_scroll_event(handles, &event) {
-                        redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
+                        redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
                         continue;
                     }
                     let Event::Key(key) = event else { continue };
@@ -335,13 +432,22 @@ async fn run_turn_pinned(
                         }
                         InputOutcome::Submit(text) => {
                             echo_submitted(reporter, InputMode::Running, &text, color).await;
-                            let _ = steering_tx.send(text);
+                            spawn_side_question(
+                                side_provider.clone(),
+                                side_tools.to_vec(),
+                                side_hooks.clone(),
+                                text,
+                                tool_ctx.clone(),
+                                reporter.clone(),
+                                in_flight.clone(),
+                                color,
+                            );
                         }
                         // `handle_key` never returns `Quit`/`CtrlCHint` while
                         // `mode == Running` -- those are idle-only outcomes.
                         InputOutcome::Quit | InputOutcome::CtrlCHint | InputOutcome::Handled => {}
                     }
-                    redraw(handles, box_state, InputMode::Running, &handles.status.lock().unwrap().clone(), color);
+                    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
                 }
             }
         }
