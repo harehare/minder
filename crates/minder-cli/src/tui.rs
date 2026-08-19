@@ -381,7 +381,13 @@ async fn run_turn_pinned(
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
 
-    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
+    redraw(
+        handles,
+        box_state,
+        InputMode::Running,
+        &running_status(handles, in_flight),
+        color,
+    );
 
     // Scoped so `turn`'s borrow of `session` ends before `discard_interrupted_turn` needs its own.
     let result = {

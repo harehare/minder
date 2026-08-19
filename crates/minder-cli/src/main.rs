@@ -707,7 +707,9 @@ async fn run_chat() {
                 "resuming a session that didn't finish cleanly last time ({} prior message(s))",
                 prior.messages.len()
             );
-            built.session.restore(prior.system_prompt.clone(), prior.messages.clone());
+            built
+                .session
+                .restore(prior.system_prompt.clone(), prior.messages.clone());
             prior
         }
         _ => SessionRecord::new(),

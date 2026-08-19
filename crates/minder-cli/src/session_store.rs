@@ -130,12 +130,6 @@ fn ensure_sessions_dir(working_dir: &Path) -> io::Result<PathBuf> {
 /// Saves (creating or overwriting) a session, refreshing `updated_at` and
 /// `summary`. Drops a `.gitignore` next to the transcripts on first use so
 /// they aren't accidentally committed.
-///
-/// Writes to a `.tmp` sibling then `fs::rename`s it into place (mirrors
-/// `StatusReporter::write_snapshot`) rather than writing the target path
-/// directly -- a crash or power loss mid-write can otherwise leave a
-/// truncated, unparseable JSON file that `load_by_id`/`load_latest` would
-/// then choke on.
 pub fn save(working_dir: &Path, record: &mut SessionRecord) -> io::Result<()> {
     record.updated_at = unix_now();
     record.summary = summarize(&record.messages);

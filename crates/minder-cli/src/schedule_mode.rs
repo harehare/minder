@@ -82,7 +82,13 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
         };
-        AgentSession::new(Arc::new(FixedReplyProvider), Vec::new(), None, "you are a test agent", tool_ctx)
+        AgentSession::new(
+            Arc::new(FixedReplyProvider),
+            Vec::new(),
+            None,
+            "you are a test agent",
+            tool_ctx,
+        )
     }
 
     #[tokio::test(start_paused = true)]

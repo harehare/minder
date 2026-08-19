@@ -274,9 +274,21 @@ pub(crate) fn render_pinned(
         return;
     }
 
-    let panel_style = if color { Style::default().bg(PANEL_BG).fg(PANEL_FG) } else { Style::default() };
-    let accent = if mode == InputMode::Running { Color::Yellow } else { Color::Cyan };
-    let border_style = if color { panel_style.fg(accent) } else { Style::default() };
+    let panel_style = if color {
+        Style::default().bg(PANEL_BG).fg(PANEL_FG)
+    } else {
+        Style::default()
+    };
+    let accent = if mode == InputMode::Running {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let border_style = if color {
+        panel_style.fg(accent)
+    } else {
+        Style::default()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .style(panel_style)
@@ -286,7 +298,11 @@ pub(crate) fn render_pinned(
     let rows = split_inner_rows(interior(area));
 
     if let Some(status_area) = rows.0 {
-        let style = if color { panel_style.add_modifier(Modifier::DIM) } else { Style::default() };
+        let style = if color {
+            panel_style.add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
         frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
     }
 
