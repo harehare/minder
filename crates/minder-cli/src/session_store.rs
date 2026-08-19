@@ -19,6 +19,14 @@ pub struct SessionRecord {
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub summary: String,
+    /// `true` from just before a turn starts until it ends -- lets a later
+    /// `minder chat` invocation tell "the last session for this directory
+    /// never finished" (crash, SIGKILL, power loss) apart from a session
+    /// that ended cleanly (the user typed `exit`), and offer to resume the
+    /// former automatically. `#[serde(default)]` so records written before
+    /// this field existed load as `false` rather than failing to parse.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl SessionRecord {
@@ -40,6 +48,7 @@ impl SessionRecord {
             system_prompt: String::new(),
             messages: Vec::new(),
             summary: String::new(),
+            interrupted: false,
         }
     }
 }
@@ -61,6 +70,21 @@ pub fn key_for_path(path: &Path) -> String {
         })
         .collect();
     format!("loop-{sanitized}")
+}
+
+/// Like `key_for_path`, but for `minder schedule <task>`, which has no file
+/// to key off of -- re-running the exact same task string resumes the same
+/// session. Truncated since an arbitrary task string (unlike a canonical
+/// path) has no natural length bound.
+const TASK_KEY_CHARS: usize = 60;
+
+pub fn key_for_task(task: &str) -> String {
+    let sanitized: String = task
+        .chars()
+        .take(TASK_KEY_CHARS)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("schedule-{sanitized}")
 }
 
 fn unix_now() -> u64 {
@@ -106,13 +130,22 @@ fn ensure_sessions_dir(working_dir: &Path) -> io::Result<PathBuf> {
 /// Saves (creating or overwriting) a session, refreshing `updated_at` and
 /// `summary`. Drops a `.gitignore` next to the transcripts on first use so
 /// they aren't accidentally committed.
+///
+/// Writes to a `.tmp` sibling then `fs::rename`s it into place (mirrors
+/// `StatusReporter::write_snapshot`) rather than writing the target path
+/// directly -- a crash or power loss mid-write can otherwise leave a
+/// truncated, unparseable JSON file that `load_by_id`/`load_latest` would
+/// then choke on.
 pub fn save(working_dir: &Path, record: &mut SessionRecord) -> io::Result<()> {
     record.updated_at = unix_now();
     record.summary = summarize(&record.messages);
 
     ensure_sessions_dir(working_dir)?;
     let json = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
-    fs::write(path_for(working_dir, &record.id), json)
+    let target = path_for(working_dir, &record.id);
+    let tmp = target.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &target)
 }
 
 /// Path to the interactive REPL's persisted line-editing history (arrow-key
@@ -168,10 +201,21 @@ pub fn load_by_id(working_dir: &Path, id: &str) -> io::Result<Option<SessionReco
 }
 
 /// Loads the most recently updated session for this project, if any.
+///
+/// A record that fails to parse (e.g. truncated by a crash mid-write on a
+/// version of `minder` older than `save`'s atomic-write fix) is skipped with
+/// a warning rather than aborting the whole scan -- unlike `load_by_id`,
+/// there's always a next-best candidate to fall back to here.
 pub fn load_latest(working_dir: &Path) -> io::Result<Option<SessionRecord>> {
     let mut best: Option<SessionRecord> = None;
     for path in json_files(working_dir)? {
-        let record = read_record(&path)?;
+        let record = match read_record(&path) {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("warning: skipping unreadable session file {}: {e}", path.display());
+                continue;
+            }
+        };
         if best.as_ref().is_none_or(|b| record.updated_at > b.updated_at) {
             best = Some(record);
         }
@@ -236,6 +280,60 @@ mod tests {
     }
 
     #[test]
+    fn load_latest_skips_a_corrupt_record_and_falls_back_to_the_next_best() {
+        let dir = scratch_dir();
+        let valid = SessionRecord::new();
+        let valid_id = valid.id.clone();
+        write_with_timestamp(&dir, valid, 100);
+
+        // Simulates a save interrupted mid-write on a pre-atomic-write build
+        // -- truncated/invalid JSON, but still updated more recently than
+        // the valid record above.
+        fs::create_dir_all(sessions_dir(&dir)).unwrap();
+        fs::write(path_for(&dir, "corrupt-session"), b"{not valid json").unwrap();
+
+        let latest = load_latest(&dir).unwrap().unwrap();
+        assert_eq!(latest.id, valid_id);
+    }
+
+    #[test]
+    fn save_writes_atomically_leaving_no_tmp_file_behind() {
+        let dir = scratch_dir();
+        let mut record = SessionRecord::new();
+        save(&dir, &mut record).unwrap();
+
+        let tmp = path_for(&dir, &record.id).with_extension("json.tmp");
+        assert!(!tmp.exists());
+        assert!(path_for(&dir, &record.id).exists());
+    }
+
+    #[test]
+    fn interrupted_flag_round_trips_and_defaults_false_for_legacy_records() {
+        let dir = scratch_dir();
+        let mut record = SessionRecord::new();
+        record.interrupted = true;
+        save(&dir, &mut record).unwrap();
+        let loaded = load_by_id(&dir, &record.id).unwrap().unwrap();
+        assert!(loaded.interrupted);
+
+        // A record predating this field (no `interrupted` key at all) must
+        // still parse, defaulting to `false` rather than failing to load.
+        let legacy = SessionRecord::new();
+        fs::create_dir_all(sessions_dir(&dir)).unwrap();
+        let json = serde_json::json!({
+            "id": legacy.id,
+            "created_at": legacy.created_at,
+            "updated_at": legacy.updated_at,
+            "system_prompt": "",
+            "messages": [],
+            "summary": "",
+        });
+        fs::write(path_for(&dir, &legacy.id), serde_json::to_vec(&json).unwrap()).unwrap();
+        let loaded = load_by_id(&dir, &legacy.id).unwrap().unwrap();
+        assert!(!loaded.interrupted);
+    }
+
+    #[test]
     fn load_by_id_returns_none_when_missing() {
         let dir = scratch_dir();
         assert!(load_by_id(&dir, "does-not-exist").unwrap().is_none());
@@ -251,6 +349,12 @@ mod tests {
 
         assert_eq!(key_for_path(&a), key_for_path(&a));
         assert_ne!(key_for_path(&a), key_for_path(&b));
+    }
+
+    #[test]
+    fn key_for_task_is_stable_and_distinguishes_different_tasks() {
+        assert_eq!(key_for_task("check status"), key_for_task("check status"));
+        assert_ne!(key_for_task("check status"), key_for_task("check something else"));
     }
 
     #[test]

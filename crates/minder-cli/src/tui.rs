@@ -132,6 +132,7 @@ pub(crate) async fn run_tui_repl(
 
         let expanded = crate::mentions::expand_mentions(&line, dir);
         built.checkpoint.start_turn();
+        crate::mark_turn_started(dir, record);
         let result = run_turn_pinned(
             &mut built.session,
             &expanded,

@@ -6,6 +6,7 @@ mod markdown;
 mod mentions;
 mod provider_select;
 mod reporter;
+mod schedule_mode;
 mod session_store;
 mod status_reporter;
 mod tui;
@@ -142,6 +143,20 @@ enum CliCommand {
         file: PathBuf,
         /// Optional task hint guiding the first pass over the checklist
         task_hint: Option<String>,
+    },
+    /// Reruns the same task on a fixed interval, forever (or until
+    /// --max-runs is hit) -- for a recurring job with no checklist to poll
+    /// (e.g. periodic status checks), instead of an external cron/systemd
+    /// timer. Re-running the same task string later resumes its history.
+    Schedule {
+        /// The task to run every interval
+        task: String,
+        /// Seconds between runs (the first run happens immediately)
+        #[arg(long, default_value_t = 3600)]
+        every_secs: u64,
+        /// Stop after this many runs instead of running forever
+        #[arg(long)]
+        max_runs: Option<usize>,
     },
     /// Prints a shell completion script to stdout
     Completion {
@@ -434,6 +449,11 @@ enum Command {
         file: PathBuf,
         task_hint: Option<String>,
     },
+    Schedule {
+        task: String,
+        every_secs: u64,
+        max_runs: Option<usize>,
+    },
     Completion {
         shell: clap_complete::Shell,
     },
@@ -444,6 +464,17 @@ impl From<Cli> for Command {
         match cli.command {
             Some(CliCommand::Chat) => return Command::Chat,
             Some(CliCommand::Loop { file, task_hint }) => return Command::Loop { file, task_hint },
+            Some(CliCommand::Schedule {
+                task,
+                every_secs,
+                max_runs,
+            }) => {
+                return Command::Schedule {
+                    task,
+                    every_secs,
+                    max_runs,
+                };
+            }
             Some(CliCommand::Completion { shell }) => return Command::Completion { shell },
             None => {}
         }
@@ -518,6 +549,11 @@ async fn main() {
         }
         Command::Chat => run_chat().await,
         Command::Loop { file, task_hint } => run_loop_mode(&file, task_hint.as_deref()).await,
+        Command::Schedule {
+            task,
+            every_secs,
+            max_runs,
+        } => run_schedule_mode(&expand_task_mentions(task), every_secs, max_runs).await,
         Command::Completion { shell } => print_completion(shell),
     }
 }
@@ -573,9 +609,30 @@ fn print_turn_error(err: &AgentError, checkpoint: &Checkpoint) {
     }
 }
 
+/// `persist` only ever runs once a turn has concluded (successfully, or
+/// after `discard_interrupted_turn` already rolled back an in-memory
+/// Ctrl-C), so it doubles as "this session is safely at rest" -- clears
+/// `interrupted` (see `mark_turn_started`) accordingly.
 fn persist(dir: &Path, record: &mut SessionRecord, session: &AgentSession) {
     record.system_prompt = session.system_prompt().to_string();
     record.messages = session.messages().to_vec();
+    record.interrupted = false;
+    if let Err(e) = session_store::save(dir, record) {
+        eprintln!("warning: failed to save session: {e}");
+    }
+}
+
+/// Flags `record` as mid-turn *before* running one, so a crash (panic,
+/// SIGKILL, power loss) between this call and the matching `persist` leaves
+/// `interrupted: true` on disk -- what `run_chat` checks on its next
+/// invocation to offer resuming instead of starting fresh. Called only from
+/// the two interactive REPL loops (`run_repl_fallback`, `tui::run_tui_repl`)
+/// that `run_chat` actually leads into -- one-shot paths and `minder loop`/
+/// `minder schedule` already resume unconditionally (explicit
+/// `--continue`/`--resume`) or via their own deterministic per-iteration
+/// persistence, so they don't need this.
+fn mark_turn_started(dir: &Path, record: &mut SessionRecord) {
+    record.interrupted = true;
     if let Err(e) = session_store::save(dir, record) {
         eprintln!("warning: failed to save session: {e}");
     }
@@ -636,10 +693,25 @@ async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend)
     (build_session(output).await, ReplBackend::Fallback)
 }
 
+/// Starts fresh, unless the most recently updated session for this
+/// directory was left `interrupted` (see `mark_turn_started`/`persist`) --
+/// evidence the last `minder chat` here ended mid-turn rather than cleanly
+/// (`exit`/`quit`), in which case it's restored automatically instead of
+/// silently discarding it.
 async fn run_chat() {
     let dir = working_dir();
     let (mut built, backend) = build_repl_session(OutputFormat::Text).await;
-    let mut record = SessionRecord::new();
+    let mut record = match session_store::load_latest(&dir) {
+        Ok(Some(prior)) if prior.interrupted => {
+            eprintln!(
+                "resuming a session that didn't finish cleanly last time ({} prior message(s))",
+                prior.messages.len()
+            );
+            built.session.restore(prior.system_prompt.clone(), prior.messages.clone());
+            prior
+        }
+        _ => SessionRecord::new(),
+    };
     run_repl(&mut built, &dir, &mut record, backend).await;
 }
 
@@ -1172,6 +1244,7 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
 
         let expanded = mentions::expand_mentions(line, dir);
         built.checkpoint.start_turn();
+        mark_turn_started(dir, record);
         if let Err(e) = run_turn_interruptible(&mut built.session, &expanded).await {
             print_turn_error(&e, &built.checkpoint);
         }
@@ -1213,6 +1286,50 @@ async fn run_loop_mode(file: &Path, task_hint: Option<&str>) {
             persist(&dir, &mut record, session);
         },
     )
+    .await;
+    persist(&dir, &mut record, &built.session);
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Reruns `task` every `every_secs`, forever unless `max_runs` caps it --
+/// see `CliCommand::Schedule`. Resumes via `session_store::key_for_task`
+/// exactly like `run_loop_mode` resumes via `key_for_path`: re-running the
+/// same task string later picks the same session back up.
+async fn run_schedule_mode(task: &str, every_secs: u64, max_runs: Option<usize>) {
+    let dir = working_dir();
+    let mut built = build_session(OutputFormat::Text).await;
+
+    let key = session_store::key_for_task(task);
+    let mut record = match session_store::load_by_id(&dir, &key) {
+        Ok(Some(record)) => {
+            built
+                .session
+                .restore(record.system_prompt.clone(), record.messages.clone());
+            eprintln!(
+                "resuming schedule session for '{task}' ({} prior message(s))",
+                record.messages.len()
+            );
+            record
+        }
+        Ok(None) => SessionRecord::with_id(key),
+        Err(e) => {
+            eprintln!("warning: failed to load prior schedule session: {e}");
+            SessionRecord::with_id(key)
+        }
+    };
+
+    eprintln!("[schedule] running '{task}' every {every_secs}s (Ctrl-C to stop)");
+    let opts = schedule_mode::ScheduleOptions {
+        interval: Duration::from_secs(every_secs),
+        max_runs,
+    };
+    let result = schedule_mode::run(&mut built.session, task, opts, |session| {
+        persist(&dir, &mut record, session);
+    })
     .await;
     persist(&dir, &mut record, &built.session);
 
