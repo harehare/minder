@@ -250,7 +250,6 @@ instead of a task:
 | `/model` | Shows the active provider and model |
 | `/model <provider> [model]` | Switches the active provider/model mid-session, keeping conversation history (e.g. `/model openai gpt-5.4`) |
 | `/clear` | Clears the conversation history (the session file stays, so `--continue` still works, just with nothing to continue) |
-| `/plan <task>` | Investigates read-only and proposes a plan for `<task>` before touching anything — see below |
 | `/status` | Toggles showing the active provider/model in the spinner while a turn runs — see above |
 | `/thinking` | Toggles showing the model's extended-thinking output (Anthropic only, once `thinking_budget` is configured — see below) |
 | `/todo` | Shows the model's current todo list (from `todo_write`) |
@@ -261,25 +260,6 @@ env-var/`.agent/config.toml` precedence as startup) and swaps it into the runnin
 for dropping to a cheaper model mid-task, or switching providers without losing context. It doesn't
 change the `agent` tool's own default provider, so a subagent delegated afterward still uses
 whichever provider the session started with unless its `AGENT.md` (or the call itself) overrides it.
-
-`/plan` runs `<task>` through a throwaway session that shares the real session's provider and
-[hooks](#hooks) but is only given read-only tools (`read_file`, `grep`, `glob`, `ls`, `git_diff`,
-`git_log`, `git_status`, `web_fetch`, `web_search`), so the model can investigate but never actually
-change anything:
-
-```sh
-❯ /plan add retry-with-backoff to the http client
-Planning (read-only investigation, no changes will be made)...
-
-1. Add a `max_retries` field to `HttpClient` in src/http.rs...
-2. Wrap the request in a loop that retries on 5xx/timeout with exponential backoff...
-3. Add a unit test that a 503 followed by a 200 succeeds after one retry...
-
-Proceed with this plan? [y/N] y
-```
-
-Answering `y`/`yes` feeds the plan back into the real session (full tools, normal hooks) as the
-task to implement; anything else discards it.
 
 </details>
 
@@ -418,9 +398,6 @@ Always registered:
 | `git_log` | Shows commit history |
 | `git_status` | Shows `git status` |
 | `git_commit` | Creates a commit |
-| `worktree_add` | Creates a new git worktree (`git worktree add`), optionally on a new or existing branch |
-| `worktree_list` | Lists every worktree linked to the repo (`git worktree list`) |
-| `worktree_remove` | Removes a worktree and its directory (`git worktree remove`), leaving its branch intact |
 | `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees) |
 | `agent` | Delegates a task to a named subagent — always available via a built-in `general-purpose` subagent, no project config required; see [Subagents](#subagents) |
 | `todo_write` | Replaces the current todo list with a full updated one, so the model can plan and track progress on a multi-step task |
@@ -432,13 +409,8 @@ Registered only when configured:
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
 | `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
 
-Worktree tools let the agent check out a second branch into its own directory without disturbing
-the current one — e.g. running `main`'s test suite for comparison while mid-edit on a feature
-branch. minder itself doesn't switch its own working directory between worktrees; point a fresh
-`minder` process at the new directory to actually work inside it.
-
-`todo_write` always replaces the *whole* list, never a partial patch. It's not offered to subagents
-or `/plan`'s read-only session. Run `/todo` any time to see the current list.
+`todo_write` always replaces the *whole* list, never a partial patch. It's not offered to
+subagents. Run `/todo` any time to see the current list.
 
 Additional tools can be supplied per-project as [WASM plugins](#tool-plugins-wasm) or from
 [MCP servers](#mcp-servers-optional) (opt-in feature).

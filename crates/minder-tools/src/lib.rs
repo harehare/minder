@@ -18,7 +18,6 @@ mod subagent;
 mod todo;
 mod web_fetch;
 mod web_search;
-mod worktree;
 mod write_file;
 
 pub use agent_monitor::{AgentOutputTool, AgentStopTool, ListAgentsTool};
@@ -40,5 +39,4 @@ pub use subagent::{AgentTool, ProviderFactory, Subagent, SubagentLoadError, buil
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool, format_checklist};
 pub use web_fetch::{FetchResult, WebFetchTool, fetch};
 pub use web_search::WebSearchTool;
-pub use worktree::{WorktreeAddTool, WorktreeListTool, WorktreeRemoveTool};
 pub use write_file::WriteFileTool;

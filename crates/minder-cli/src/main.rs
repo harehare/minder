@@ -23,9 +23,8 @@ use minder_hooks::HookEngine;
 use minder_tools::{
     AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool,
     EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool, ListAgentsTool, LsTool,
-    ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WorktreeAddTool,
-    WorktreeListTool, WorktreeRemoveTool, WriteFileTool, builtin_subagents, discover_all_skills, discover_plugins,
-    discover_subagents, format_checklist,
+    ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    builtin_subagents, discover_all_skills, discover_plugins, discover_subagents, format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -41,28 +40,6 @@ use provider_select::select_provider;
 use reporter::{BOLD, CYAN, DIM, RESET, TerminalReporter, YELLOW};
 use session_store::SessionRecord;
 use status_reporter::StatusReporter;
-
-/// Tools offered to a `/plan` turn: investigation only, nothing that can
-/// change the working directory or run arbitrary commands, so a plan can
-/// never turn into an unreviewed action -- enforced by omitting the tools
-/// entirely rather than relying on the model to behave.
-const PLAN_READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "grep",
-    "glob",
-    "ls",
-    "git_diff",
-    "git_log",
-    "git_status",
-    "web_fetch",
-    "web_search",
-];
-
-const PLAN_SYSTEM_PROMPT: &str = "\
-You are minder in planning mode. Investigate the repository using only the read-only tools \
-available to you -- file writes, shell, git mutations, and delegation aren't offered right now, \
-on purpose. Reply with a concise, numbered implementation plan for the task below. Do not \
-attempt to implement anything yourself; a human reviews the plan and decides whether to proceed.";
 
 const SYSTEM_PROMPT: &str = "\
 You are minder, a coding agent working in a git repository via tool calls. Investigate with \
@@ -167,9 +144,9 @@ enum CliCommand {
 }
 
 /// Everything `build_session` assembles, kept around (not just handed to
-/// `AgentSession::new` and dropped) so the REPL's `/plan` command can build
-/// a second, read-only-tooled `AgentSession` sharing the same provider/hooks
-/// -- the same sharing `AgentTool` already does for subagents.
+/// `AgentSession::new` and dropped) so `tui.rs`'s `spawn_side_question` can
+/// build its own ephemeral `AgentSession` sharing the same provider/hooks --
+/// the same sharing `AgentTool` already does for subagents.
 struct BuiltSession {
     session: AgentSession,
     provider: Arc<dyn LlmProvider>,
@@ -256,9 +233,6 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         Arc::new(GitLogTool),
         Arc::new(GitStatusTool),
         Arc::new(GitCommitTool),
-        Arc::new(WorktreeAddTool),
-        Arc::new(WorktreeListTool),
-        Arc::new(WorktreeRemoveTool),
         Arc::new(WebFetchTool::new()),
     ];
     // Omitted entirely (not registered with a doomed-to-fail key) when unset,
@@ -819,7 +793,6 @@ Available commands:
   /model                     Show the active provider and model
   /model <provider> [model]  Switch the active provider/model mid-session (keeps history)
   /clear                     Clear the conversation history (keeps the session file, starts fresh)
-  /plan <task>               Investigate read-only and propose a plan for <task> before touching anything
   /status                    Toggle showing the active provider/model in the spinner while a turn runs
   /thinking                  Toggle showing the model's extended-thinking output (Anthropic only)
   /todo                      Show the model's current todo list
@@ -830,7 +803,7 @@ Type @path (Tab to complete) to attach a file or directory's contents, e.g. @src
 
 /// Names accepted by `handle_slash_command`, kept in sync with `SLASH_HELP`
 /// above; also drives completion/hinting in `SlashCommandHelper`.
-const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "plan", "status", "thinking", "todo", "undo"];
+const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "status", "thinking", "todo", "undo"];
 
 /// Commands still matching what's typed after `/`, or `None` if `line`/`pos`
 /// isn't in "typing a command name" position at all (no leading `/`, cursor
@@ -960,13 +933,7 @@ type ReplEditor = Editor<SlashCommandHelper, FileHistory>;
 /// Runs a `/`-prefixed REPL command. Returns `false` only for a command that
 /// should end the REPL (none do today, but keeping the return type leaves
 /// room for e.g. a future `/exit` alias without changing every call site).
-async fn handle_slash_command(
-    input: &str,
-    built: &mut BuiltSession,
-    dir: &Path,
-    record: &mut SessionRecord,
-    editor: &mut ReplEditor,
-) {
+async fn handle_slash_command(input: &str, built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord) {
     let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
 
@@ -980,8 +947,6 @@ async fn handle_slash_command(
             persist(dir, record, &built.session);
             println!("Conversation cleared.");
         }
-        "plan" if !rest.is_empty() => run_plan_command(rest, built, dir, record, editor).await,
-        "plan" => println!("Usage: /plan <task>"),
         "status" => {
             let shown = !built.show_status.fetch_xor(true, Ordering::Relaxed);
             println!("Spinner status bar is now {}.", if shown { "on" } else { "off" });
@@ -994,96 +959,6 @@ async fn handle_slash_command(
         "undo" => run_undo_command(built, dir).await,
         other => println!("Unknown command '/{other}'. Type /help for a list."),
     }
-}
-
-/// Forwards everything except assistant text/thinking -- used by `/plan` to
-/// keep the tool-call trace live without duplicating the final plan text.
-struct MuteTextReporter(Arc<dyn Reporter>);
-
-#[async_trait::async_trait]
-impl Reporter for MuteTextReporter {
-    async fn on_turn_start(&self) {
-        self.0.on_turn_start().await;
-    }
-    async fn on_turn_end(&self) {
-        self.0.on_turn_end().await;
-    }
-    async fn on_tool_call(&self, call: &minder_core::ToolCall) {
-        self.0.on_tool_call(call).await;
-    }
-    async fn on_tool_result(&self, call: &minder_core::ToolCall, outcome: &minder_core::ToolExecOutcome) {
-        self.0.on_tool_result(call, outcome).await;
-    }
-    async fn on_retry(&self, attempt: usize, max_attempts: usize, delay: Duration, reason: &str) {
-        self.0.on_retry(attempt, max_attempts, delay, reason).await;
-    }
-}
-
-async fn run_plan_command(
-    task: &str,
-    built: &mut BuiltSession,
-    dir: &Path,
-    record: &mut SessionRecord,
-    editor: &mut ReplEditor,
-) {
-    println!("Planning (read-only investigation, no changes will be made)...");
-    println!();
-
-    let read_only_tools: Vec<Arc<dyn Tool>> = built
-        .tools
-        .iter()
-        .filter(|t| PLAN_READ_ONLY_TOOLS.contains(&t.name()))
-        .cloned()
-        .collect();
-    // Mutes live text streaming so the plan isn't shown twice -- see below.
-    let plan_reporter: Arc<dyn Reporter> = Arc::new(MuteTextReporter(built.reporter.clone()));
-    let mut plan_session = AgentSession::new(
-        built.provider.clone(),
-        read_only_tools,
-        built.hooks.clone(),
-        PLAN_SYSTEM_PROMPT,
-        built.tool_ctx.clone(),
-    )
-    .with_reporter(plan_reporter);
-
-    let plan_text = match run_turn_interruptible(&mut plan_session, task).await {
-        Ok(message) => message.text(),
-        Err(AgentError::Interrupted) => {
-            println!("Planning interrupted.");
-            return;
-        }
-        Err(e) => {
-            eprintln!("error: planning turn failed: {e}");
-            return;
-        }
-    };
-
-    if plan_text.trim().is_empty() {
-        println!("(model returned no plan text -- try rephrasing the task, or check /thinking output above)");
-        println!();
-        return;
-    }
-
-    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    println!("{}", markdown::render(&plan_text, color));
-    println!();
-
-    let confirmed = match editor.readline("Proceed with this plan? [y/N] ") {
-        Ok(answer) => matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"),
-        Err(_) => false,
-    };
-
-    if !confirmed {
-        println!("Plan discarded.");
-        return;
-    }
-
-    let follow_up = format!("Implement the following plan:\n\n{plan_text}\n\nOriginal task: {task}");
-    built.checkpoint.start_turn();
-    if let Err(e) = run_turn_interruptible(&mut built.session, &follow_up).await {
-        print_turn_error(&e, &built.checkpoint);
-    }
-    persist(dir, record, &built.session);
 }
 
 /// `/model <provider> [model]`: swaps the live provider, keeping history.
@@ -1239,7 +1114,7 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
         }
 
         if let Some(command) = line.strip_prefix('/') {
-            handle_slash_command(command, built, dir, record, &mut editor).await;
+            handle_slash_command(command, built, dir, record).await;
             println!();
             continue;
         }
@@ -1597,7 +1472,7 @@ mod tests {
         assert_eq!(start, 0);
         let names: Vec<&str> = candidates.iter().map(|p| p.display.as_str()).collect();
         assert_eq!(names.len(), SLASH_COMMANDS.len());
-        assert!(names.contains(&"/plan"));
+        assert!(names.contains(&"/model"));
     }
 
     #[test]
@@ -1610,7 +1485,7 @@ mod tests {
 
     #[test]
     fn slash_completion_stops_after_the_command_name() {
-        let (_, candidates) = complete_at_cursor("/plan fix the ");
+        let (_, candidates) = complete_at_cursor("/model fix the ");
         assert!(candidates.is_empty());
     }
 
@@ -1641,7 +1516,7 @@ mod tests {
 
     #[test]
     fn slash_hint_absent_past_the_command_name() {
-        assert_eq!(hint_at_cursor("/plan fix the "), None);
+        assert_eq!(hint_at_cursor("/model fix the "), None);
     }
 
     #[test]
