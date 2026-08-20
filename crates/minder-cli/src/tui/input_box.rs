@@ -245,14 +245,23 @@ impl InputBoxState {
         }
     }
 
-    /// Renders the status line above the bordered input panel into `area`.
-    pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, mode: InputMode, status: &str, color: bool) {
-        render_pinned(frame, area, &self.buffer, self.cursor, mode, status, color);
+    /// Renders the status line and pending (unanswered mid-turn) questions
+    /// above the bordered input panel into `area`.
+    pub(crate) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        mode: InputMode,
+        status: &str,
+        pending: &[String],
+        color: bool,
+    ) {
+        render_pinned(frame, area, &self.buffer, self.cursor, mode, status, pending, color);
     }
 
     /// Cursor's on-screen `(x, y)`, for `Frame::set_cursor_position`.
-    pub(crate) fn cursor_screen_position(&self, area: Rect) -> (u16, u16) {
-        cursor_screen_position_for(area, &self.buffer, self.cursor)
+    pub(crate) fn cursor_screen_position(&self, area: Rect, pending: &[String]) -> (u16, u16) {
+        cursor_screen_position_for(area, &self.buffer, self.cursor, pending)
     }
 
     /// The current buffer text -- used to size the pinned box before a live `render` call.
@@ -282,6 +291,13 @@ const PANEL_FG: Color = Color::Rgb(220, 220, 225);
 
 /// Most input lines shown at once before the box scrolls internally instead of growing further.
 const MAX_INPUT_LINES: usize = 6;
+
+/// Most pinned pending-question lines shown at once above the input box.
+const MAX_PENDING_LINES: usize = 3;
+
+fn pending_line_count(pending: &[String]) -> usize {
+    pending.len().min(MAX_PENDING_LINES)
+}
 
 /// Number of `\n`-separated lines in `buffer` (always >= 1).
 fn total_lines(buffer: &str) -> usize {
@@ -344,9 +360,7 @@ fn cursor_from_line_col(buffer: &str, target_line: usize, target_col: usize) -> 
 /// Free-function core of `InputBoxState::render`, taking buffer + cursor
 /// instead of `&InputBoxState` -- lets `sink::append_text` redraw the box
 /// from its own cheap snapshot without a live `InputBoxState`.
-///
-/// `area` holds a plain status line (no border, drawn outside the box) above
-/// the bordered panel containing the prompt glyph and buffer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_pinned(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -354,6 +368,7 @@ pub(crate) fn render_pinned(
     cursor: usize,
     mode: InputMode,
     status: &str,
+    pending: &[String],
     color: bool,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -366,7 +381,7 @@ pub(crate) fn render_pinned(
         Color::Yellow
     };
 
-    let (status_area, box_area, interior) = split_bottom(area);
+    let (status_area, pending_area, box_area, interior) = split_bottom(area, pending);
 
     if let Some(status_area) = status_area {
         let style = if color {
@@ -375,6 +390,10 @@ pub(crate) fn render_pinned(
             Style::default()
         };
         frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
+    }
+
+    if let Some(pending_area) = pending_area {
+        render_pending(frame, pending_area, pending, color);
     }
 
     let Some(box_area) = box_area else { return };
@@ -422,9 +441,38 @@ pub(crate) fn render_pinned(
     frame.render_widget(Paragraph::new(rendered).style(panel_style), interior);
 }
 
+/// Renders up to `MAX_PENDING_LINES` pending mid-turn questions (dim, prefixed
+/// with an hourglass), collapsing any remainder into a "+N more" summary line.
+fn render_pending(frame: &mut ratatui::Frame, area: Rect, pending: &[String], color: bool) {
+    let style = if color {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    let visible = area.height as usize;
+    if visible == 0 {
+        return;
+    }
+    let overflow = pending.len() > visible;
+    let shown = if overflow { visible.saturating_sub(1) } else { pending.len().min(visible) };
+    let mut lines: Vec<Line> = pending
+        .iter()
+        .take(shown)
+        .map(|q| Line::styled(format!("⏳ {}", first_line(q)), style))
+        .collect();
+    if overflow {
+        lines.push(Line::styled(format!("… +{} more waiting", pending.len() - shown), style));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn first_line(text: &str) -> &str {
+    text.split('\n').next().unwrap_or("")
+}
+
 /// Cursor's on-screen `(x, y)` for `buffer`/`cursor` rendered into `area` by `render_pinned`.
-pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize) -> (u16, u16) {
-    let Some(interior) = split_bottom(area).2 else {
+pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize, pending: &[String]) -> (u16, u16) {
+    let Some(interior) = split_bottom(area, pending).3 else {
         return (area.x, area.y);
     };
     let (line, col) = line_col(buffer, cursor);
@@ -443,10 +491,12 @@ pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize
     (interior.x + prefix_width + col_width, row)
 }
 
-/// Rows reserved at the bottom of a full frame: status line + bordered input box (up to `MAX_INPUT_LINES` lines).
-pub(crate) fn bottom_area(frame_area: Rect, buffer: &str) -> Rect {
+/// Rows reserved at the bottom of a full frame: status line + pending-question
+/// lines (up to `MAX_PENDING_LINES`) + bordered input box (up to `MAX_INPUT_LINES` lines).
+pub(crate) fn bottom_area(frame_area: Rect, buffer: &str, pending: &[String]) -> Rect {
     let content_lines = visible_line_count(buffer) as u16;
-    let height = (1 + 2 + content_lines).min(frame_area.height);
+    let pending_lines = pending_line_count(pending) as u16;
+    let height = (1 + pending_lines + 2 + content_lines).min(frame_area.height);
     Rect {
         y: frame_area.y + frame_area.height - height,
         height,
@@ -454,30 +504,56 @@ pub(crate) fn bottom_area(frame_area: Rect, buffer: &str) -> Rect {
     }
 }
 
-/// Everything above `bottom_area(frame_area, buffer)` -- the scrollable transcript pane.
-pub(crate) fn transcript_area(frame_area: Rect, buffer: &str) -> Rect {
+/// Everything above `bottom_area(frame_area, buffer, pending)` -- the scrollable transcript pane.
+pub(crate) fn transcript_area(frame_area: Rect, buffer: &str, pending: &[String]) -> Rect {
     Rect {
-        height: frame_area.height - bottom_area(frame_area, buffer).height,
+        height: frame_area.height - bottom_area(frame_area, buffer, pending).height,
         ..frame_area
     }
 }
 
-/// Splits a full bottom `area` into (status line, bordered box, box interior) -- each `None` once too short to fit.
-fn split_bottom(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+/// Splits a full bottom `area` into (status line, pending-question panel,
+/// bordered box, box interior) -- each `None` once too short to fit.
+#[allow(clippy::type_complexity)]
+fn split_bottom(area: Rect, pending: &[String]) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     if area.height == 0 {
-        return (None, None, None);
+        return (None, None, None, None);
     }
     let status = Some(Rect { height: 1, ..area });
     if area.height == 1 {
-        return (status, None, None);
+        return (status, None, None, None);
     }
-    let box_area = Rect {
+    let rest = Rect {
         y: area.y + 1,
         height: area.height - 1,
         ..area
     };
+
+    let wanted_pending = pending_line_count(pending) as u16;
+    let (pending_area, rest) = if wanted_pending == 0 {
+        (None, rest)
+    } else {
+        let take = wanted_pending.min(rest.height.saturating_sub(1));
+        if take == 0 {
+            (None, rest)
+        } else {
+            (
+                Some(Rect { height: take, ..rest }),
+                Rect {
+                    y: rest.y + take,
+                    height: rest.height - take,
+                    ..rest
+                },
+            )
+        }
+    };
+
+    if rest.height == 0 {
+        return (status, pending_area, None, None);
+    }
+    let box_area = rest;
     let interior = (box_area.height > 2).then(|| box_area.inner(Margin::new(1, 1)));
-    (status, Some(box_area), interior)
+    (status, pending_area, Some(box_area), interior)
 }
 
 fn char_boundary(s: &str, char_idx: usize) -> usize {
@@ -666,31 +742,50 @@ mod tests {
         let area = Rect::new(0, 0, 20, 4);
         // "あ" is one char but two display columns -- the column after it
         // should advance by 2, not 1.
-        assert_eq!(cursor_screen_position_for(area, "あ", 1), (area.x + 1 + 2 + 2, area.y + 2));
-        assert_eq!(cursor_screen_position_for(area, "あい", 2), (area.x + 1 + 2 + 4, area.y + 2));
+        assert_eq!(cursor_screen_position_for(area, "あ", 1, &[]), (area.x + 1 + 2 + 2, area.y + 2));
+        assert_eq!(cursor_screen_position_for(area, "あい", 2, &[]), (area.x + 1 + 2 + 4, area.y + 2));
     }
 
     #[test]
     fn bottom_area_is_the_last_four_rows_of_a_tall_frame_for_a_single_line_buffer() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area, ""), Rect::new(0, 20, 80, 4));
-        assert_eq!(transcript_area(area, ""), Rect::new(0, 0, 80, 20));
+        assert_eq!(bottom_area(area, "", &[]), Rect::new(0, 20, 80, 4));
+        assert_eq!(transcript_area(area, "", &[]), Rect::new(0, 0, 80, 20));
     }
 
     #[test]
     fn bottom_area_shrinks_instead_of_overflowing_a_short_frame() {
         let area = Rect::new(0, 0, 80, 2);
-        assert_eq!(bottom_area(area, ""), Rect::new(0, 0, 80, 2));
-        assert_eq!(transcript_area(area, ""), Rect::new(0, 0, 80, 0));
+        assert_eq!(bottom_area(area, "", &[]), Rect::new(0, 0, 80, 2));
+        assert_eq!(transcript_area(area, "", &[]), Rect::new(0, 0, 80, 0));
     }
 
     #[test]
     fn bottom_area_grows_with_extra_buffer_lines_up_to_the_cap() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area, "one\ntwo").height, 5); // status + 2 borders + 2 lines
+        assert_eq!(bottom_area(area, "one\ntwo", &[]).height, 5); // status + 2 borders + 2 lines
         // 10 lines is more than MAX_INPUT_LINES -- height caps instead of growing further.
         let many = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
-        assert_eq!(bottom_area(area, many).height, 3 + MAX_INPUT_LINES as u16);
+        assert_eq!(bottom_area(area, many, &[]).height, 3 + MAX_INPUT_LINES as u16);
+    }
+
+    #[test]
+    fn bottom_area_grows_for_pending_questions_and_caps_at_max_pending_lines() {
+        let area = Rect::new(0, 0, 80, 24);
+        let one = vec!["question one".to_string()];
+        assert_eq!(bottom_area(area, "", &one).height, 5); // status + 1 pending + 2 borders + 1 input line
+        let many: Vec<String> = (0..5).map(|i| format!("q{i}")).collect();
+        assert_eq!(bottom_area(area, "", &many).height, (1 + MAX_PENDING_LINES + 2 + 1) as u16);
+    }
+
+    #[test]
+    fn pending_questions_render_above_the_box_capped_with_an_overflow_summary() {
+        let area = Rect::new(0, 0, 80, 24);
+        let many: Vec<String> = (0..5).map(|i| format!("q{i}")).collect();
+        let bottom = bottom_area(area, "", &many);
+        let (_, pending_area, box_area, _) = split_bottom(bottom, &many);
+        assert_eq!(pending_area.unwrap().height, MAX_PENDING_LINES as u16);
+        assert!(box_area.is_some());
     }
 
     #[test]

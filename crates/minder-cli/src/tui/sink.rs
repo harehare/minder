@@ -133,6 +133,8 @@ pub(crate) struct PinnedHandles {
     pub(crate) input: Arc<Mutex<PinnedInputSnapshot>>,
     /// See `Transcript`.
     pub(crate) transcript: Arc<Mutex<Transcript>>,
+    /// Mid-turn questions submitted but not yet answered -- see `tui::spawn_side_question`.
+    pub(crate) pending: Arc<Mutex<Vec<String>>>,
 }
 
 /// Appends formatted lines to the in-memory `Transcript` and redraws the
@@ -155,6 +157,7 @@ impl OutputSink for FullscreenSink {
             &self.handles.transcript,
             &self.handles.input,
             &self.handles.status,
+            &self.handles.pending,
             self.color,
             text,
         );
@@ -166,6 +169,7 @@ impl OutputSink for FullscreenSink {
             &self.handles.transcript,
             &self.handles.input,
             &self.handles.status,
+            &self.handles.pending,
             self.color,
             text,
         );
@@ -181,11 +185,13 @@ impl OutputSink for FullscreenSink {
 ///
 /// Locks `terminal` before `transcript`, same order as `tui::redraw` -- keep
 /// it consistent across both call sites or it deadlocks.
+#[allow(clippy::too_many_arguments)]
 fn append_text(
     terminal: &Mutex<AppTerminal>,
     transcript: &Mutex<Transcript>,
     input: &Mutex<PinnedInputSnapshot>,
     status: &Mutex<String>,
+    pending: &Mutex<Vec<String>>,
     color: bool,
     text: &str,
 ) {
@@ -205,14 +211,18 @@ fn append_text(
 
     let snapshot = input.lock().unwrap().clone();
     let status_text = status.lock().unwrap().clone();
+    let pending_snapshot = pending.lock().unwrap().clone();
 
     let mut term = terminal.lock().unwrap();
     let mut t = transcript.lock().unwrap();
     t.push(rendered);
     let _ = term.draw(|frame| {
         let area = frame.area();
-        let bottom = super::input_box::bottom_area(area, &snapshot.buffer);
-        t.render(frame, super::input_box::transcript_area(area, &snapshot.buffer));
+        let bottom = super::input_box::bottom_area(area, &snapshot.buffer, &pending_snapshot);
+        t.render(
+            frame,
+            super::input_box::transcript_area(area, &snapshot.buffer, &pending_snapshot),
+        );
         super::input_box::render_pinned(
             frame,
             bottom,
@@ -220,6 +230,7 @@ fn append_text(
             snapshot.cursor,
             snapshot.mode,
             &status_text,
+            &pending_snapshot,
             color,
         );
         if bottom.height > 0 {
@@ -227,6 +238,7 @@ fn append_text(
                 bottom,
                 &snapshot.buffer,
                 snapshot.cursor,
+                &pending_snapshot,
             ));
         }
     });

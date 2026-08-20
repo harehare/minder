@@ -12,7 +12,6 @@ pub(crate) mod sink;
 
 use std::io::IsTerminal;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +54,7 @@ pub(crate) fn init() -> std::io::Result<PinnedHandles> {
         status: Arc::new(Mutex::new(String::new())),
         input: Arc::new(Mutex::new(PinnedInputSnapshot::default())),
         transcript: Arc::new(Mutex::new(sink::Transcript::default())),
+        pending: Arc::new(Mutex::new(Vec::new())),
     })
 }
 
@@ -96,13 +96,9 @@ pub(crate) async fn run_tui_repl(
     let side_provider = built.provider.clone();
     let side_tools: Vec<Arc<dyn Tool>> = built.tools.iter().filter(|t| t.name() != "agent").cloned().collect();
     let side_hooks = built.hooks.clone();
-    // How many side questions are still in flight -- surfaced in the status
-    // line (see `running_status`) so a submission that hasn't answered yet
-    // doesn't look like it vanished.
-    let in_flight = Arc::new(AtomicUsize::new(0));
 
     loop {
-        let idle_status = idle_status_text(&built.session, dir, &in_flight);
+        let idle_status = idle_status_text(&built.session, dir, &handles);
         let Some(line) = read_line(&handles, &mut box_state, &mut events, dir, &idle_status, color).await else {
             break;
         };
@@ -120,10 +116,10 @@ pub(crate) async fn run_tui_repl(
 
         if let Some(command) = line.strip_prefix('/') {
             let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-            let mut editor: crate::ReplEditor = rustyline::Editor::new().expect("failed to initialize line editor");
-            crate::handle_slash_command(command, built, dir, record, &mut editor).await;
-            // A nested `/plan` turn's `InputWatcher` disables raw mode on exit -- put it back,
-            // then discard ratatui's stale diff/cursor state before the next redraw.
+            crate::handle_slash_command(command, built, dir, record).await;
+            // Slash commands print/prompt straight to the real terminal outside
+            // ratatui's frame -- put raw mode back, then discard ratatui's stale
+            // diff/cursor state before the next redraw.
             let _ = crossterm::terminal::enable_raw_mode();
             let _ = crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
             let _ = handles.terminal.lock().unwrap().clear();
@@ -146,7 +142,6 @@ pub(crate) async fn run_tui_repl(
             &side_tools,
             &side_hooks,
             &built.tool_ctx,
-            &in_flight,
         )
         .await;
         if let Err(e) = &result {
@@ -175,14 +170,14 @@ async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &st
     reporter.on_notice(&line).await;
 }
 
-fn idle_status_text(session: &AgentSession, dir: &Path, in_flight: &AtomicUsize) -> String {
+fn idle_status_text(session: &AgentSession, dir: &Path, handles: &PinnedHandles) -> String {
     let base = format!(
         "{} ({}) · {} · Alt+Enter for newline · Ctrl-D/exit/Ctrl-C twice quits · Tab completes · PgUp/PgDn scrolls",
         session.provider_id(),
         session.model(),
         dir.display()
     );
-    match in_flight.load(Ordering::Relaxed) {
+    match handles.pending.lock().unwrap().len() {
         0 => base,
         n => format!("{base} · {n} answering"),
     }
@@ -192,8 +187,9 @@ fn idle_status_text(session: &AgentSession, dir: &Path, in_flight: &AtomicUsize)
 fn transcript_metrics(handles: &PinnedHandles) -> (u16, u16) {
     let size = handles.terminal.lock().unwrap().size().unwrap_or_default();
     let buffer = handles.input.lock().unwrap().buffer.clone();
+    let pending = handles.pending.lock().unwrap().clone();
     let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-    let height = input_box::transcript_area(frame_area, &buffer).height;
+    let height = input_box::transcript_area(frame_area, &buffer, &pending).height;
     (size.width, height)
 }
 
@@ -286,9 +282,9 @@ async fn read_line(
 /// The running status line, with a suffix noting how many `spawn_side_question`
 /// calls haven't answered yet -- so a submission that hasn't come back reads
 /// as "still working on it" rather than "lost".
-fn running_status(handles: &PinnedHandles, in_flight: &AtomicUsize) -> String {
+fn running_status(handles: &PinnedHandles) -> String {
     let base = handles.status.lock().unwrap().clone();
-    match in_flight.load(Ordering::Relaxed) {
+    match handles.pending.lock().unwrap().len() {
         0 => base,
         n => format!("{base} · {n} answering"),
     }
@@ -327,10 +323,10 @@ fn spawn_side_question(
     question: String,
     tool_ctx: ToolContext,
     reporter: Arc<dyn Reporter>,
-    in_flight: Arc<AtomicUsize>,
+    pending: Arc<Mutex<Vec<String>>>,
     color: bool,
 ) {
-    in_flight.fetch_add(1, Ordering::Relaxed);
+    pending.lock().unwrap().push(question.clone());
     tokio::spawn(async move {
         let child_ctx = ToolContext {
             working_dir: tool_ctx.working_dir,
@@ -343,7 +339,12 @@ fn spawn_side_question(
         };
         let mut session = AgentSession::new(provider, tools, hooks, SIDE_QUESTION_SYSTEM_PROMPT, child_ctx);
         let result = session.run_turn(&question).await;
-        in_flight.fetch_sub(1, Ordering::Relaxed);
+        {
+            let mut pending = pending.lock().unwrap();
+            if let Some(idx) = pending.iter().position(|q| q == &question) {
+                pending.remove(idx);
+            }
+        }
 
         let (glyph, glyph_color, text) = match &result {
             Ok(message) => ("↩", DIM, message.text()),
@@ -378,18 +379,11 @@ async fn run_turn_pinned(
     side_tools: &[Arc<dyn Tool>],
     side_hooks: &Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     tool_ctx: &ToolContext,
-    in_flight: &Arc<AtomicUsize>,
 ) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
 
-    redraw(
-        handles,
-        box_state,
-        InputMode::Running,
-        &running_status(handles, in_flight),
-        color,
-    );
+    redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
 
     // Scoped so `turn`'s borrow of `session` ends before `discard_interrupted_turn` needs its own.
     let result = {
@@ -414,7 +408,7 @@ async fn run_turn_pinned(
                 result = &mut turn => break result,
                 () = wait_for_deadline => break Err(AgentError::Interrupted),
                 _ = ticker.tick() => {
-                    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
+                    redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
                 }
                 event = events.next() => {
                     let event = match event {
@@ -423,7 +417,7 @@ async fn run_turn_pinned(
                         Some(Ok(e)) => e,
                     };
                     if handle_scroll_event(handles, &event) {
-                        redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
+                        redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
                         continue;
                     }
                     let Event::Key(key) = event else { continue };
@@ -448,7 +442,7 @@ async fn run_turn_pinned(
                                 text,
                                 tool_ctx.clone(),
                                 reporter.clone(),
-                                in_flight.clone(),
+                                handles.pending.clone(),
                                 color,
                             );
                         }
@@ -456,7 +450,7 @@ async fn run_turn_pinned(
                         // `mode == Running` -- those are idle-only outcomes.
                         InputOutcome::Quit | InputOutcome::CtrlCHint | InputOutcome::Handled => {}
                     }
-                    redraw(handles, box_state, InputMode::Running, &running_status(handles, in_flight), color);
+                    redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
                 }
             }
         }
@@ -475,16 +469,17 @@ async fn run_turn_pinned(
 /// Locks `terminal` before `transcript`, same order as `sink::append_text` -- keep it consistent or it deadlocks.
 fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, status_text: &str, color: bool) {
     *handles.input.lock().unwrap() = box_state.snapshot(mode);
+    let pending = handles.pending.lock().unwrap().clone();
 
     let mut term = handles.terminal.lock().unwrap();
     let mut transcript = handles.transcript.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();
-        let bottom = input_box::bottom_area(area, box_state.buffer());
-        transcript.render(frame, input_box::transcript_area(area, box_state.buffer()));
-        box_state.render(frame, bottom, mode, status_text, color);
+        let bottom = input_box::bottom_area(area, box_state.buffer(), &pending);
+        transcript.render(frame, input_box::transcript_area(area, box_state.buffer(), &pending));
+        box_state.render(frame, bottom, mode, status_text, &pending, color);
         if bottom.height > 0 {
-            frame.set_cursor_position(box_state.cursor_screen_position(bottom));
+            frame.set_cursor_position(box_state.cursor_screen_position(bottom, &pending));
         }
     });
 }
