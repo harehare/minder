@@ -63,6 +63,7 @@ jobs:
         with:
           bin: minder
           package: minder-cli
+          features: wasm,mcp
           target: ${{ matrix.target }}
           archive: minder-$tag-$target
           checksum: sha256

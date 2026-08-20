@@ -17,12 +17,13 @@ path = "src/main.rs"
 
 [features]
 mcp = ["dep:minder-tools-mcp"]
+wasm = ["dep:minder-tools-wasm"]
 
 [dependencies]
 minder-core.workspace = true
 minder-providers.workspace = true
 minder-tools.workspace = true
-minder-tools-wasm.workspace = true
+minder-tools-wasm = { workspace = true, optional = true }
 minder-tools-mcp = { workspace = true, optional = true }
 minder-hooks.workspace = true
 async-trait.workspace = true

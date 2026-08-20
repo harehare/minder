@@ -26,7 +26,8 @@ interception points and never drive the loop itself.
 - **Policy without a general-purpose scripting language** — hooks are written in [`mq`](https://github.com/harehare/mq)'s embeddable query language, which can't write files, hit the network, or spawn processes, so a hook can observe, block, or transform agent behavior but never cause side effects itself.
 - **Nothing hidden** — every tool call and result streams live to the terminal, split across stdout (the conversation) and stderr (the execution trace). See [Live execution display](#quick-start).
 - **Multi-provider** — Anthropic, OpenAI, Gemini, and local Ollama (including gpt-oss) behind one interface, switched with a single env var.
-- **Extensible without forking** — project-local [skills](#skills), [subagents](#subagents), [hooks](#hooks), [WASM tool plugins](#tool-plugins-wasm), and optional [MCP servers](#mcp-servers-optional) all live under `.agent/` in the target repo, not in minder itself.
+- **Extensible without forking** — project-local [skills](#skills), [subagents](#subagents), [hooks](#hooks), optional [WASM tool plugins](#tool-plugins-wasm), and optional [MCP servers](#mcp-servers-optional) all live under `.agent/` in the target repo, not in minder itself.
+- **Lean by default** — `cargo install minder-cli` builds a minimal binary with no WASM runtime or MCP client compiled in; both are opt-in Cargo features for when you actually need them. Prebuilt [GitHub Release](https://github.com/harehare/minder/releases) binaries ship with both enabled.
 - **Unattended runs** — [`minder loop`](#autonomous-loop-mode) works through a Markdown checklist turn by turn, with retry/backoff on transient provider errors and a session that survives a restart.
 
 ## Packages
@@ -641,7 +642,18 @@ instead.
 
 ## Tool plugins (WASM)
 
-Tools can also be provided by sandboxed WASI plugins, discovered from `.agent/tools/`:
+Tools can also be provided by sandboxed WASI plugins, discovered from `.agent/tools/`. This is
+behind an opt-in `wasm` Cargo feature — wasmtime (and its Cranelift codegen) is one of the heavier
+dependencies in the tree, so it's left out of the default build:
+
+```sh
+cargo install --path crates/minder-cli --features wasm
+```
+
+Built without `--features wasm`, minder ignores `.agent/tools/*.wasm` entirely (the
+`minder-tools-wasm` crate, including wasmtime, is compiled out). Prebuilt GitHub Release binaries
+are built with `wasm` (and `mcp`) enabled, so this only matters if you're building from source or
+publishing your own minimal binary for embedding.
 
 ```
 .agent/tools/weather.wasm

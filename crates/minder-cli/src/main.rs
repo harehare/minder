@@ -255,6 +255,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         }
     }
 
+    #[cfg(feature = "wasm")]
     match minder_tools_wasm::load_plugins(&working_dir.join(".agent")).await {
         Ok(plugins) => {
             if !plugins.is_empty() {
