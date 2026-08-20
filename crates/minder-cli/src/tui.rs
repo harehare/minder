@@ -23,7 +23,7 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 
-use crate::reporter::{BOLD, CYAN, DIM, RED, RESET, YELLOW};
+use crate::reporter::{BOLD, DIM, RED, RESET, YELLOW};
 
 use input_box::{InputBoxState, InputMode, InputOutcome};
 use sink::PinnedInputSnapshot;
@@ -164,7 +164,7 @@ pub(crate) async fn run_tui_repl(
 /// with no record it was sent.
 async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &str, color: bool) {
     let (glyph, glyph_color) = match mode {
-        InputMode::Idle => ("❯", CYAN),
+        InputMode::Idle => ("❯", YELLOW),
         InputMode::Running => ("»", YELLOW),
     };
     let line = if color {
@@ -177,7 +177,7 @@ async fn echo_submitted(reporter: &Arc<dyn Reporter>, mode: InputMode, text: &st
 
 fn idle_status_text(session: &AgentSession, dir: &Path, in_flight: &AtomicUsize) -> String {
     let base = format!(
-        "{} ({}) · {} · Ctrl-D/exit/Ctrl-C twice quits · Tab completes · PgUp/PgDn scrolls",
+        "{} ({}) · {} · Alt+Enter for newline · Ctrl-D/exit/Ctrl-C twice quits · Tab completes · PgUp/PgDn scrolls",
         session.provider_id(),
         session.model(),
         dir.display()
@@ -191,7 +191,9 @@ fn idle_status_text(session: &AgentSession, dir: &Path, in_flight: &AtomicUsize)
 /// `(width, visible_height)` of the transcript pane for the current terminal size.
 fn transcript_metrics(handles: &PinnedHandles) -> (u16, u16) {
     let size = handles.terminal.lock().unwrap().size().unwrap_or_default();
-    let height = size.height.saturating_sub(input_box::BOTTOM_ROWS.min(size.height));
+    let buffer = handles.input.lock().unwrap().buffer.clone();
+    let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    let height = input_box::transcript_area(frame_area, &buffer).height;
     (size.width, height)
 }
 
@@ -478,11 +480,11 @@ fn redraw(handles: &PinnedHandles, box_state: &InputBoxState, mode: InputMode, s
     let mut transcript = handles.transcript.lock().unwrap();
     let _ = term.draw(|frame| {
         let area = frame.area();
-        let bottom = input_box::bottom_area(area);
-        transcript.render(frame, input_box::transcript_area(area));
+        let bottom = input_box::bottom_area(area, box_state.buffer());
+        transcript.render(frame, input_box::transcript_area(area, box_state.buffer()));
         box_state.render(frame, bottom, mode, status_text, color);
-        if let Some(input_row) = input_box::input_row(bottom) {
-            frame.set_cursor_position((box_state.cursor_column(input_row), input_row.y));
+        if bottom.height > 0 {
+            frame.set_cursor_position(box_state.cursor_screen_position(bottom));
         }
     });
 }

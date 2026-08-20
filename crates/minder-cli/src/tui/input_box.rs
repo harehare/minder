@@ -95,6 +95,13 @@ impl InputBoxState {
                 InputOutcome::Handled
             };
         }
+        // Alt+Enter inserts a newline instead of submitting (Shift+Enter too, where a terminal reports it).
+        if key.code == KeyCode::Enter && key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+            let idx = char_boundary(&self.buffer, self.cursor);
+            self.buffer.insert(idx, '\n');
+            self.cursor += 1;
+            return InputOutcome::Handled;
+        }
         if key.code == KeyCode::Esc || is_ctrl_c {
             if mode == InputMode::Running {
                 return InputOutcome::CancelTurn;
@@ -144,19 +151,35 @@ impl InputBoxState {
                 InputOutcome::Handled
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                let (line, _) = line_col(&self.buffer, self.cursor);
+                self.cursor = cursor_from_line_col(&self.buffer, line, 0);
                 InputOutcome::Handled
             }
             KeyCode::End => {
-                self.cursor = self.buffer.chars().count();
+                let (line, _) = line_col(&self.buffer, self.cursor);
+                self.cursor = cursor_from_line_col(&self.buffer, line, usize::MAX);
                 InputOutcome::Handled
             }
             KeyCode::Up => {
-                self.navigate_history(-1);
+                if self.buffer.contains('\n') {
+                    let (line, col) = line_col(&self.buffer, self.cursor);
+                    if line > 0 {
+                        self.cursor = cursor_from_line_col(&self.buffer, line - 1, col);
+                    }
+                } else {
+                    self.navigate_history(-1);
+                }
                 InputOutcome::Handled
             }
             KeyCode::Down => {
-                self.navigate_history(1);
+                if self.buffer.contains('\n') {
+                    let (line, col) = line_col(&self.buffer, self.cursor);
+                    if line + 1 < total_lines(&self.buffer) {
+                        self.cursor = cursor_from_line_col(&self.buffer, line + 1, col);
+                    }
+                } else {
+                    self.navigate_history(1);
+                }
                 InputOutcome::Handled
             }
             KeyCode::Tab => {
@@ -222,15 +245,19 @@ impl InputBoxState {
         }
     }
 
-    /// Renders the box into `area` (the bottom rule/status/input rows): a
-    /// dim rule, a status line, and the prompt + buffer pinned to the last row.
+    /// Renders the status line above the bordered input panel into `area`.
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, mode: InputMode, status: &str, color: bool) {
         render_pinned(frame, area, &self.buffer, self.cursor, mode, status, color);
     }
 
-    /// Cursor column within the input row, for `Frame::set_cursor_position`.
-    pub(crate) fn cursor_column(&self, area: Rect) -> u16 {
-        cursor_column_for(area, &self.buffer, self.cursor)
+    /// Cursor's on-screen `(x, y)`, for `Frame::set_cursor_position`.
+    pub(crate) fn cursor_screen_position(&self, area: Rect) -> (u16, u16) {
+        cursor_screen_position_for(area, &self.buffer, self.cursor)
+    }
+
+    /// The current buffer text -- used to size the pinned box before a live `render` call.
+    pub(crate) fn buffer(&self) -> &str {
+        &self.buffer
     }
 
     /// A cheap, `Send`-able copy for `sink::FullscreenSink` to redraw the box on its own.
@@ -253,19 +280,78 @@ const PANEL_BG: Color = Color::Rgb(30, 32, 38);
 /// foreground would otherwise be unreadable.
 const PANEL_FG: Color = Color::Rgb(220, 220, 225);
 
+/// Most input lines shown at once before the box scrolls internally instead of growing further.
+const MAX_INPUT_LINES: usize = 6;
+
+/// Number of `\n`-separated lines in `buffer` (always >= 1).
+fn total_lines(buffer: &str) -> usize {
+    buffer.matches('\n').count() + 1
+}
+
+/// How many of `buffer`'s lines are shown at once, capped at `MAX_INPUT_LINES`.
+fn visible_line_count(buffer: &str) -> usize {
+    total_lines(buffer).min(MAX_INPUT_LINES)
+}
+
+/// First visible line when showing `visible` lines of `buffer` -- sticks to the bottom by default, follows the cursor up.
+fn scroll_offset(buffer: &str, cursor_line: usize, visible: usize) -> usize {
+    let total = total_lines(buffer);
+    let max_offset = total.saturating_sub(visible);
+    cursor_line.min(max_offset)
+}
+
+/// `(line, col)` of `cursor` (both 0-based, in chars) within `buffer`'s `\n`-separated lines.
+fn line_col(buffer: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, c) in buffer.chars().enumerate() {
+        if i == cursor {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Inverse of `line_col`; clamps `target_col` to the line's length (`usize::MAX` means "end of line").
+fn cursor_from_line_col(buffer: &str, target_line: usize, target_col: usize) -> usize {
+    let mut idx = 0usize;
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for c in buffer.chars() {
+        if line == target_line && col == target_col {
+            return idx;
+        }
+        if c == '\n' {
+            if line == target_line {
+                return idx;
+            }
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        idx += 1;
+    }
+    idx
+}
+
 /// Free-function core of `InputBoxState::render`, taking buffer + cursor
 /// instead of `&InputBoxState` -- lets `sink::append_text` redraw the box
 /// from its own cheap snapshot without a live `InputBoxState`.
 ///
-/// Draws a full rounded border with a filled panel background (rather than
-/// just a top rule on the terminal's own background) so the box reads as a
-/// distinct, self-contained panel and its bottom edge is always explicitly
-/// drawn instead of just trailing off at the last row of the terminal.
+/// `area` holds a plain status line (no border, drawn outside the box) above
+/// the bordered panel containing the prompt glyph and buffer.
 pub(crate) fn render_pinned(
     frame: &mut ratatui::Frame,
     area: Rect,
     buffer: &str,
-    _cursor: usize,
+    cursor: usize,
     mode: InputMode,
     status: &str,
     color: bool,
@@ -274,84 +360,93 @@ pub(crate) fn render_pinned(
         return;
     }
 
-    let panel_style = if color {
-        Style::default().bg(PANEL_BG).fg(PANEL_FG)
-    } else {
-        Style::default()
-    };
     let accent = if mode == InputMode::Running {
+        Color::LightYellow
+    } else {
         Color::Yellow
-    } else {
-        Color::Cyan
     };
-    let border_style = if color {
-        panel_style.fg(accent)
-    } else {
-        Style::default()
-    };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .style(panel_style)
-        .border_style(border_style);
-    frame.render_widget(&block, area);
 
-    let rows = split_inner_rows(interior(area));
+    let (status_area, box_area, interior) = split_bottom(area);
 
-    if let Some(status_area) = rows.0 {
+    if let Some(status_area) = status_area {
         let style = if color {
-            panel_style.add_modifier(Modifier::DIM)
+            Style::default().fg(accent).add_modifier(Modifier::DIM)
         } else {
             Style::default()
         };
         frame.render_widget(Paragraph::new(Line::styled(status.to_string(), style)), status_area);
     }
 
-    if let Some(input_area) = rows.1 {
-        let glyph = match mode {
-            InputMode::Idle => "❯",
-            InputMode::Running => "»",
-        };
-        let glyph_style = if color {
-            panel_style.fg(accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let line = Line::from(vec![
-            Span::styled(format!("{glyph} "), glyph_style),
-            Span::styled(buffer.to_string(), panel_style),
-        ]);
-        frame.render_widget(Paragraph::new(line), input_area);
-    }
+    let Some(box_area) = box_area else { return };
+
+    let panel_style = if color {
+        Style::default().bg(PANEL_BG).fg(PANEL_FG)
+    } else {
+        Style::default()
+    };
+    let border_style = if color { panel_style.fg(accent) } else { Style::default() };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(panel_style)
+        .border_style(border_style);
+    frame.render_widget(&block, box_area);
+
+    let Some(interior) = interior else { return };
+
+    let glyph = match mode {
+        InputMode::Idle => "❯",
+        InputMode::Running => "»",
+    };
+    let glyph_style = if color {
+        panel_style.fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let (cursor_line, _) = line_col(buffer, cursor);
+    let visible = interior.height as usize;
+    let offset = scroll_offset(buffer, cursor_line, visible);
+    let raw_lines: Vec<&str> = buffer.split('\n').collect();
+
+    let rendered: Vec<Line> = (0..visible)
+        .map(|i| {
+            let prefix = if i == 0 {
+                Span::styled(format!("{glyph} "), glyph_style)
+            } else {
+                Span::styled("  ", panel_style)
+            };
+            let text = raw_lines.get(offset + i).copied().unwrap_or("");
+            Line::from(vec![prefix, Span::styled(text.to_string(), panel_style)])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rendered).style(panel_style), interior);
 }
 
-/// Free-function core of `InputBoxState::cursor_column` -- see `render_pinned`.
-/// Sums display width, not char count, so double-width (CJK/emoji) chars don't
-/// throw off the on-screen cursor position.
-pub(crate) fn cursor_column_for(area: Rect, buffer: &str, cursor: usize) -> u16 {
-    let prefix_width = 2u16; // glyph + one space, both single-column
-    let col: u16 = buffer[..char_boundary(buffer, cursor)]
+/// Cursor's on-screen `(x, y)` for `buffer`/`cursor` rendered into `area` by `render_pinned`.
+pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize) -> (u16, u16) {
+    let Some(interior) = split_bottom(area).2 else {
+        return (area.x, area.y);
+    };
+    let (line, col) = line_col(buffer, cursor);
+    let visible = interior.height as usize;
+    let offset = scroll_offset(buffer, line, visible);
+    let row = interior.y + (line - offset) as u16;
+
+    let raw_lines: Vec<&str> = buffer.split('\n').collect();
+    let line_text = raw_lines.get(line).copied().unwrap_or("");
+    let col_width: u16 = line_text
         .chars()
+        .take(col)
         .map(|c| c.width().unwrap_or(0) as u16)
         .sum();
-    area.x + prefix_width + col
+    let prefix_width = 2u16; // glyph/indent + one space, both single-column
+    (interior.x + prefix_width + col_width, row)
 }
 
-/// The input row within `area` (a full `bottom_area`, border included) --
-/// the bottom-most row inside the border, or the only interior row if too
-/// short for a status line. Shared by `tui::redraw` and `sink::append_text`.
-pub(crate) fn input_row(area: Rect) -> Option<Rect> {
-    split_inner_rows(interior(area)).1
-}
-
-/// Rows reserved at the bottom of a full frame for the bordered input box
-/// (top border, status, input, bottom border); everything above is the
-/// scrollable transcript pane.
-pub(crate) const BOTTOM_ROWS: u16 = 4;
-
-/// The bottom `BOTTOM_ROWS` rows of a full frame (fewer if the terminal is
-/// shorter than that) -- what `render_pinned`/`input_row` treat as `area`.
-pub(crate) fn bottom_area(frame_area: Rect) -> Rect {
-    let height = BOTTOM_ROWS.min(frame_area.height);
+/// Rows reserved at the bottom of a full frame: status line + bordered input box (up to `MAX_INPUT_LINES` lines).
+pub(crate) fn bottom_area(frame_area: Rect, buffer: &str) -> Rect {
+    let content_lines = visible_line_count(buffer) as u16;
+    let height = (1 + 2 + content_lines).min(frame_area.height);
     Rect {
         y: frame_area.y + frame_area.height - height,
         height,
@@ -359,38 +454,30 @@ pub(crate) fn bottom_area(frame_area: Rect) -> Rect {
     }
 }
 
-/// Everything above `bottom_area(frame_area)` -- the scrollable transcript pane.
-pub(crate) fn transcript_area(frame_area: Rect) -> Rect {
+/// Everything above `bottom_area(frame_area, buffer)` -- the scrollable transcript pane.
+pub(crate) fn transcript_area(frame_area: Rect, buffer: &str) -> Rect {
     Rect {
-        height: frame_area.height - bottom_area(frame_area).height,
+        height: frame_area.height - bottom_area(frame_area, buffer).height,
         ..frame_area
     }
 }
 
-/// The area inside a rounded border drawn around `area` -- inset by one cell
-/// on every side, saturating on a too-small `area`. Mirrors what
-/// `Block::bordered().inner()` computes in `render_pinned`, kept as a pure
-/// function so `input_row` (used by `tui::redraw`/`sink::append_text` for
-/// cursor placement) doesn't need a live `Block`.
-fn interior(area: Rect) -> Rect {
-    area.inner(Margin::new(1, 1))
-}
-
-/// Splits a border's interior into (status, input), input pinned to the
-/// *last* row so it's never the one pushed offscreen. Degrades gracefully
-/// on a shorter interior (`None` for rows that don't fit; input wins over
-/// status when there's only room for 1).
-fn split_inner_rows(inner: Rect) -> (Option<Rect>, Option<Rect>) {
-    if inner.height == 0 {
-        return (None, None);
+/// Splits a full bottom `area` into (status line, bordered box, box interior) -- each `None` once too short to fit.
+fn split_bottom(area: Rect) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+    if area.height == 0 {
+        return (None, None, None);
     }
-    let input = Some(Rect {
-        y: inner.y + inner.height - 1,
-        height: 1,
-        ..inner
-    });
-    let status = (inner.height >= 2).then_some(Rect { height: 1, ..inner });
-    (status, input)
+    let status = Some(Rect { height: 1, ..area });
+    if area.height == 1 {
+        return (status, None, None);
+    }
+    let box_area = Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    };
+    let interior = (box_area.height > 2).then(|| box_area.inner(Margin::new(1, 1)));
+    (status, Some(box_area), interior)
 }
 
 fn char_boundary(s: &str, char_idx: usize) -> usize {
@@ -574,26 +661,95 @@ mod tests {
     }
 
     #[test]
-    fn cursor_column_accounts_for_double_width_chars_before_the_cursor() {
-        let area = Rect::new(0, 0, 20, 1);
+    fn cursor_screen_position_accounts_for_double_width_chars_before_the_cursor() {
+        // Status row + top border + 1 input line + bottom border.
+        let area = Rect::new(0, 0, 20, 4);
         // "あ" is one char but two display columns -- the column after it
         // should advance by 2, not 1.
-        assert_eq!(cursor_column_for(area, "あ", 1), area.x + 2 + 2);
-        assert_eq!(cursor_column_for(area, "あい", 2), area.x + 2 + 4);
+        assert_eq!(cursor_screen_position_for(area, "あ", 1), (area.x + 1 + 2 + 2, area.y + 2));
+        assert_eq!(cursor_screen_position_for(area, "あい", 2), (area.x + 1 + 2 + 4, area.y + 2));
     }
 
     #[test]
-    fn bottom_area_is_the_last_four_rows_of_a_tall_frame() {
+    fn bottom_area_is_the_last_four_rows_of_a_tall_frame_for_a_single_line_buffer() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area), Rect::new(0, 20, 80, 4));
-        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 20));
+        assert_eq!(bottom_area(area, ""), Rect::new(0, 20, 80, 4));
+        assert_eq!(transcript_area(area, ""), Rect::new(0, 0, 80, 20));
     }
 
     #[test]
     fn bottom_area_shrinks_instead_of_overflowing_a_short_frame() {
         let area = Rect::new(0, 0, 80, 2);
-        assert_eq!(bottom_area(area), Rect::new(0, 0, 80, 2));
-        assert_eq!(transcript_area(area), Rect::new(0, 0, 80, 0));
+        assert_eq!(bottom_area(area, ""), Rect::new(0, 0, 80, 2));
+        assert_eq!(transcript_area(area, ""), Rect::new(0, 0, 80, 0));
+    }
+
+    #[test]
+    fn bottom_area_grows_with_extra_buffer_lines_up_to_the_cap() {
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(bottom_area(area, "one\ntwo").height, 5); // status + 2 borders + 2 lines
+        // 10 lines is more than MAX_INPUT_LINES -- height caps instead of growing further.
+        let many = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+        assert_eq!(bottom_area(area, many).height, 3 + MAX_INPUT_LINES as u16);
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        box_state.handle_key(key(KeyCode::Char('a')), InputMode::Idle, &dir());
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert!(matches!(
+            box_state.handle_key(alt_enter, InputMode::Idle, &dir()),
+            InputOutcome::Handled
+        ));
+        box_state.handle_key(key(KeyCode::Char('b')), InputMode::Idle, &dir());
+        assert_eq!(box_state.buffer, "a\nb");
+    }
+
+    #[test]
+    fn plain_enter_still_submits_a_multi_line_buffer() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        box_state.handle_key(key(KeyCode::Char('a')), InputMode::Idle, &dir());
+        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        box_state.handle_key(key(KeyCode::Char('b')), InputMode::Idle, &dir());
+        match box_state.handle_key(key(KeyCode::Enter), InputMode::Idle, &dir()) {
+            InputOutcome::Submit(line) => assert_eq!(line, "a\nb"),
+            _ => panic!("expected Submit"),
+        }
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_instead_of_history_once_the_buffer_has_a_newline() {
+        let mut box_state = InputBoxState::new(vec!["old history entry".to_string()]);
+        box_state.handle_key(key(KeyCode::Char('a')), InputMode::Idle, &dir());
+        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        box_state.handle_key(key(KeyCode::Char('b')), InputMode::Idle, &dir());
+        assert_eq!(box_state.cursor, 3); // after "a\nb"
+
+        box_state.handle_key(key(KeyCode::Up), InputMode::Idle, &dir());
+        assert_eq!(box_state.buffer, "a\nb", "Up should move the cursor, not recall history");
+        // Column is preserved where possible, clamped to line 0's length ("a" -> col 1).
+        assert_eq!(box_state.cursor, 1);
+
+        box_state.handle_key(key(KeyCode::Down), InputMode::Idle, &dir());
+        assert_eq!(box_state.cursor, 3); // back to the end of "b"
+    }
+
+    #[test]
+    fn home_and_end_operate_on_the_current_line_of_a_multi_line_buffer() {
+        let mut box_state = InputBoxState::new(Vec::new());
+        for c in "ab".chars() {
+            box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
+        }
+        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        for c in "cd".chars() {
+            box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
+        }
+        // Cursor is after "cd" on the second line.
+        box_state.handle_key(key(KeyCode::Home), InputMode::Idle, &dir());
+        assert_eq!(box_state.cursor, 3); // start of "cd", right after "ab\n"
+        box_state.handle_key(key(KeyCode::End), InputMode::Idle, &dir());
+        assert_eq!(box_state.cursor, 5); // end of "cd"
     }
 
     #[test]

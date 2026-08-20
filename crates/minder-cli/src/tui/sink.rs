@@ -211,8 +211,8 @@ fn append_text(
     t.push(rendered);
     let _ = term.draw(|frame| {
         let area = frame.area();
-        let bottom = super::input_box::bottom_area(area);
-        t.render(frame, super::input_box::transcript_area(area));
+        let bottom = super::input_box::bottom_area(area, &snapshot.buffer);
+        t.render(frame, super::input_box::transcript_area(area, &snapshot.buffer));
         super::input_box::render_pinned(
             frame,
             bottom,
@@ -222,10 +222,11 @@ fn append_text(
             &status_text,
             color,
         );
-        if let Some(input_row) = super::input_box::input_row(bottom) {
-            frame.set_cursor_position((
-                super::input_box::cursor_column_for(input_row, &snapshot.buffer, snapshot.cursor),
-                input_row.y,
+        if bottom.height > 0 {
+            frame.set_cursor_position(super::input_box::cursor_screen_position_for(
+                bottom,
+                &snapshot.buffer,
+                snapshot.cursor,
             ));
         }
     });
