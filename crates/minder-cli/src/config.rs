@@ -3,27 +3,25 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Project-level defaults read from `.agent/config.toml`. Every field is
-/// optional and fully optional as a file -- a missing `.agent/config.toml`
-/// resolves to all-`None`, same as every other `.agent/` input.
+/// optional -- a missing `.agent/config.toml` resolves to all-`None`.
 ///
 /// Precedence when both are set: the matching env var (`MINDER_PROVIDER`,
-/// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_THINKING_BUDGET`,
-/// `MINDER_REQUEST_TIMEOUT_SECS`, `MINDER_SHOW_STATUS_BAR`) always wins over
-/// this file, so a one-off override never requires editing the project
-/// config back and forth -- see `provider_select::select_provider`.
+/// `MINDER_MODEL`, `OLLAMA_BASE_URL`, `MINDER_REQUEST_TIMEOUT_SECS`,
+/// `MINDER_NUM_CTX`, `MINDER_SHOW_STATUS_BAR`) always wins over this file --
+/// see `provider_select::select_provider`.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub ollama_base_url: Option<String>,
-    /// Anthropic-only: requests extended thinking with this token budget
-    /// (unset by default -- no thinking requested, no cost/latency change).
-    /// Whether the resulting `Thinking` blocks are actually shown is a
-    /// separate, runtime-toggleable question -- see `/thinking` in the REPL.
-    pub thinking_budget: Option<u32>,
-    /// Overrides every provider's default request timeout (900s).
+    /// Base URL for `provider = "openai-compat"` (llama-server, LM Studio,
+    /// vLLM, ...). No default -- must be set for that provider to build.
+    pub openai_compat_base_url: Option<String>,
+    /// Overrides the default request timeout (900s).
     pub request_timeout_secs: Option<u64>,
+    /// Overrides Ollama's context window in tokens (minder's default: 8192).
+    pub num_ctx: Option<u32>,
     /// Whether the spinner shows the active provider/model while a turn
     /// runs. Defaults to `true`; runtime-toggleable via `/status`.
     pub show_status_bar: Option<bool>,
@@ -69,18 +67,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.toml"),
-            "provider = \"openai\"\nmodel = \"gpt-5.4\"\nollama_base_url = \"http://localhost:11434\"\nthinking_budget = 4000\nrequest_timeout_secs = 1800\nshow_status_bar = false\n",
+            "provider = \"ollama\"\nmodel = \"llama3.2\"\nollama_base_url = \"http://localhost:11434\"\nopenai_compat_base_url = \"http://localhost:8080/v1\"\nrequest_timeout_secs = 1800\nnum_ctx = 16384\nshow_status_bar = false\n",
         )
         .unwrap();
 
         let cfg = load(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(cfg.provider.as_deref(), Some("openai"));
-        assert_eq!(cfg.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(cfg.provider.as_deref(), Some("ollama"));
+        assert_eq!(cfg.model.as_deref(), Some("llama3.2"));
         assert_eq!(cfg.ollama_base_url.as_deref(), Some("http://localhost:11434"));
-        assert_eq!(cfg.thinking_budget, Some(4000));
+        assert_eq!(cfg.openai_compat_base_url.as_deref(), Some("http://localhost:8080/v1"));
         assert_eq!(cfg.request_timeout_secs, Some(1800));
+        assert_eq!(cfg.num_ctx, Some(16384));
         assert_eq!(cfg.show_status_bar, Some(false));
     }
 

@@ -5,7 +5,7 @@ use crate::reporter::Reporter;
 pub trait LlmProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
-    /// The model name in use (e.g. `"claude-sonnet-5"`), for display purposes
+    /// The model name in use (e.g. `"llama3.2"`), for display purposes
     /// only -- not used for any routing decision.
     fn model(&self) -> &str;
 
@@ -36,6 +36,26 @@ pub trait LlmProvider: Send + Sync {
             }
         }
         Ok(response)
+    }
+
+    /// Locally available model names, for `/models`/completion. Default:
+    /// empty (not every provider can enumerate models).
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    /// The active model's context window in tokens, if known -- drives
+    /// `AgentSession`'s proactive-compaction threshold so it scales with
+    /// what the model can actually hold instead of a cloud-sized constant.
+    fn context_window(&self) -> Option<u32> {
+        None
+    }
+
+    /// Makes sure the active model is actually usable before the first
+    /// turn, pulling it if the provider supports that and it isn't yet.
+    /// Default: no-op (not every provider has a "pull" concept).
+    async fn ensure_model_available(&self, _reporter: &dyn Reporter) -> Result<(), ProviderError> {
+        Ok(())
     }
 }
 

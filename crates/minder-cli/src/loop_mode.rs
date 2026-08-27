@@ -72,7 +72,9 @@ fn env_parsed<T: std::str::FromStr>(var: &str, default: T) -> T {
 fn remaining_todos(path: &Path, query: &str) -> Result<Vec<String>, LoopError> {
     let mut engine = mq_lang::DefaultEngine::default();
     engine.load_builtin_module();
-    engine.set_allow_read(true);
+    engine.set_io(mq_lang::Shared::new(
+        mq_lang::SandboxedIo::new(mq_lang::NativeIo::default()).allow_read(true),
+    ));
     engine.define_value("path", path.to_string_lossy().into_owned().into());
 
     let results = engine

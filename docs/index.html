@@ -7,7 +7,7 @@
     <title>minder – a coding-agent harness in Rust</title>
     <meta
       name="description"
-      content="minder is a multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness written in Rust. Policy hooks are written in mq — a query language with no builtin for file writes, network requests, or process execution — so hooks can observe, block, or transform agent behavior without being able to cause side effects themselves."
+      content="minder is a local-LLM coding-agent harness written in Rust, running entirely against a local Ollama server — no API key or cloud round-trip needed. Policy hooks are written in mq — a query language with no builtin for file writes, network requests, or process execution — so hooks can observe, block, or transform agent behavior without being able to cause side effects themselves."
     />
     <link rel="canonical" href="https://harehare.github.io/minder/" />
     <meta property="og:type" content="website" />
@@ -91,7 +91,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "minder",
-        "description": "A multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness written in Rust, with policy hooks written in the mq query language.",
+        "description": "A local-LLM coding-agent harness written in Rust, running against a local Ollama server, with policy hooks written in the mq query language.",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, macOS, Windows",
         "codeRepository": "https://github.com/harehare/minder",
@@ -138,9 +138,10 @@
             Let it run <span class="text-accent">free</span>.
           </h1>
           <p class="text-lg text-body max-w-2xl mb-10 leading-relaxed fade-up">
-            minder drives Anthropic, OpenAI, Gemini, and Ollama through the same
-            tool-calling loop. Policy hooks sit at five fixed points in that loop —
-            written in
+            minder runs a local model through
+            <a href="https://ollama.com" target="_blank" class="text-accent hover:underline">Ollama</a>
+            — no API key, no cloud round-trip. Policy hooks sit at five fixed points in
+            that tool-calling loop — written in
             <a href="https://github.com/harehare/mq" target="_blank" class="text-accent hover:underline">mq</a>,
             a query language with no builtin for file writes, network requests, or
             process execution. A hook can watch the loop. It cannot become the loop.
@@ -259,8 +260,8 @@
           <div class="grid sm:grid-cols-2 md:grid-cols-3 gap-px bg-line rounded-lg overflow-hidden border border-line">
             <div class="bg-ink p-6">
               <p class="font-mono text-accent text-xs mb-3">01</p>
-              <h4 class="font-bold mb-2 text-body-bright font-headline text-sm">Multi-provider</h4>
-              <p class="text-xs text-body leading-relaxed">Anthropic, OpenAI, Gemini, and Ollama (including local gpt-oss) behind one CLI.</p>
+              <h4 class="font-bold mb-2 text-body-bright font-headline text-sm">Local-first</h4>
+              <p class="text-xs text-body leading-relaxed">Runs entirely against a local Ollama server (including gpt-oss) — no API key or cloud round-trip.</p>
             </div>
             <div class="bg-ink p-6">
               <p class="font-mono text-accent text-xs mb-3">02</p>
@@ -342,7 +343,7 @@
             </div>
           </div>
           <p class="mt-8 text-center text-sm font-mono text-body">
-            export ANTHROPIC_API_KEY=sk-ant-... <span class="text-body">&&</span>
+            ollama pull qwen2.5-coder:14b <span class="text-body">&&</span>
             <span class="text-accent">minder "summarize what this project does"</span>
           </p>
         </div>

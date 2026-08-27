@@ -1,6 +1,6 @@
 [package]
 name = "minder-providers"
-description = "Anthropic/OpenAI/Gemini/Ollama client implementations for the minder coding-agent harness"
+description = "Ollama and OpenAI-compatible local LLM client implementations for the minder coding-agent harness"
 categories = ["development-tools"]
 keywords = ["agent", "llm", "coding-agent"]
 edition.workspace = true

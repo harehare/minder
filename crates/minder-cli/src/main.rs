@@ -303,7 +303,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         }
     }
 
-    let show_thinking = Arc::new(AtomicBool::new(cfg.thinking_budget.is_some()));
+    let show_thinking = Arc::new(AtomicBool::new(true));
     let show_status = Arc::new(AtomicBool::new(
         std::env::var("MINDER_SHOW_STATUS_BAR")
             .ok()
@@ -389,6 +389,10 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
     .with_reporter(reporter.clone());
 
     reporter.on_provider_changed(provider.id(), provider.model()).await;
+    if let Err(e) = provider.ensure_model_available(reporter.as_ref()).await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
 
     BuiltSession {
         session,
@@ -793,9 +797,10 @@ Available commands:
   /help                      Show this list
   /model                     Show the active provider and model
   /model <provider> [model]  Switch the active provider/model mid-session (keeps history)
+  /models                    List locally pulled models, marking the active one
   /clear                     Clear the conversation history (keeps the session file, starts fresh)
   /status                    Toggle showing the active provider/model in the spinner while a turn runs
-  /thinking                  Toggle showing the model's extended-thinking output (Anthropic only)
+  /thinking                  Toggle showing the model's extended-thinking output
   /todo                      Show the model's current todo list
   /undo                      Revert the file changes from the most recently completed turn
   exit, quit                 Leave (Ctrl-D also works)
@@ -853,6 +858,36 @@ impl rustyline::hint::Hint for SlashCommandHint {
 struct SlashCommandHelper {
     color: bool,
     working_dir: PathBuf,
+    /// Snapshot of locally pulled Ollama models, fetched once at REPL
+    /// startup -- drives `/model`'s argument completion. Doesn't pick up a
+    /// model pulled mid-session; `/models` always re-fetches fresh.
+    known_models: Vec<String>,
+}
+
+/// Completion candidates for `/model`'s `<provider> [model]` arguments:
+/// "ollama" (today's only provider), then a name from `known_models`.
+pub(crate) fn matching_model_args(line: &str, pos: usize, known_models: &[String]) -> Option<(usize, Vec<String>)> {
+    if pos != line.len() {
+        return None;
+    }
+    let rest = line.strip_prefix("/model ")?;
+    if let Some((provider, model_prefix)) = rest.split_once(' ') {
+        if provider != "ollama" {
+            return None;
+        }
+        let matches: Vec<String> = known_models
+            .iter()
+            .filter(|m| m.starts_with(model_prefix))
+            .cloned()
+            .collect();
+        return (!matches.is_empty()).then(|| (line.len() - model_prefix.len(), matches));
+    }
+    let matches: Vec<String> = ["ollama"]
+        .into_iter()
+        .filter(|p| p.starts_with(rest))
+        .map(String::from)
+        .collect();
+    (!matches.is_empty()).then(|| (line.len() - rest.len(), matches))
 }
 
 impl Completer for SlashCommandHelper {
@@ -868,6 +903,16 @@ impl Completer for SlashCommandHelper {
                 })
                 .collect();
             return Ok((0, candidates));
+        }
+        if let Some((start, matches)) = matching_model_args(line, pos, &self.known_models) {
+            let candidates = matches
+                .into_iter()
+                .map(|m| Pair {
+                    display: m.clone(),
+                    replacement: format!("{m} "),
+                })
+                .collect();
+            return Ok((start, candidates));
         }
         if let Some((start, prefix)) = mentions::at_mention_token(line, pos) {
             return Ok((start, mentions::complete_at_mention(prefix, &self.working_dir)));
@@ -898,6 +943,23 @@ impl Hinter for SlashCommandHelper {
                         completion_len: 0,
                     })
                 }
+            };
+        }
+        if let Some((start, matches)) = matching_model_args(line, pos, &self.known_models) {
+            let typed_len = pos - start;
+            return match matches.as_slice() {
+                [] => None,
+                [only] => {
+                    let suffix = &only[typed_len..];
+                    (!suffix.is_empty()).then(|| SlashCommandHint {
+                        display: suffix.to_string(),
+                        completion_len: suffix.len(),
+                    })
+                }
+                many => Some(SlashCommandHint {
+                    display: format!("  {}", many.join("  ")),
+                    completion_len: 0,
+                }),
             };
         }
         // Ghost-text hints only make sense at end-of-line.
@@ -958,7 +1020,24 @@ async fn handle_slash_command(input: &str, built: &mut BuiltSession, dir: &Path,
         }
         "todo" => println!("{}", format_checklist(&built.todo.items())),
         "undo" => run_undo_command(built, dir).await,
+        "models" => run_models_command(built).await,
         other => println!("Unknown command '/{other}'. Type /help for a list."),
+    }
+}
+
+/// `/models`: lists locally pulled models, marking the active one.
+async fn run_models_command(built: &BuiltSession) {
+    match built.provider.list_models().await {
+        Ok(models) if models.is_empty() => {
+            println!("No local models found -- try `ollama pull <model>`.")
+        }
+        Ok(models) => {
+            for m in models {
+                let marker = if m == built.session.model() { "  (active)" } else { "" };
+                println!("  {m}{marker}");
+            }
+        }
+        Err(e) => println!("failed to list models: {e}"),
     }
 }
 
@@ -970,6 +1049,10 @@ async fn run_model_command(rest: &str, built: &mut BuiltSession) {
 
     match provider_select::build_provider(provider_name, model, &built.cfg) {
         Ok(provider) => {
+            if let Err(e) = provider.ensure_model_available(built.reporter.as_ref()).await {
+                println!("error: {e}");
+                return;
+            }
             built.session.set_provider(provider.clone()).await;
             built.provider = provider;
             println!(
@@ -1064,10 +1147,12 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
     }
 
     let history = session_store::history_path(dir).ok();
+    let known_models = built.provider.list_models().await.unwrap_or_default();
     let mut editor: ReplEditor = Editor::new().expect("failed to initialize line editor");
     editor.set_helper(Some(SlashCommandHelper {
         color,
         working_dir: dir.to_path_buf(),
+        known_models,
     }));
     if let Some(path) = &history {
         let _ = editor.load_history(path);
@@ -1280,7 +1365,17 @@ mod tests {
 
     #[tokio::test]
     async fn model_command_switches_the_live_session_to_a_key_free_provider() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "llama3.2"}],
+            })))
+            .mount(&server)
+            .await;
+
         let mut built = test_built_session();
+        built.cfg.ollama_base_url = Some(server.uri());
         assert_eq!(built.session.provider_id(), "fixed");
 
         run_model_command("ollama llama3.2", &mut built).await;
@@ -1431,9 +1526,9 @@ mod tests {
             content: vec![minder_core::ContentBlock::Text("42".to_string())],
             metadata: serde_json::Value::Null,
         });
-        let payload = json_result_payload("anthropic", "claude-sonnet-5", &ok);
-        assert_eq!(payload["provider"], "anthropic");
-        assert_eq!(payload["model"], "claude-sonnet-5");
+        let payload = json_result_payload("ollama", "llama3.2", &ok);
+        assert_eq!(payload["provider"], "ollama");
+        assert_eq!(payload["model"], "llama3.2");
         assert_eq!(payload["answer"], "42");
         assert!(payload["error"].is_null());
     }
@@ -1441,7 +1536,7 @@ mod tests {
     #[test]
     fn json_payload_carries_the_error_on_failure() {
         let err: Result<Message, AgentError> = Err(AgentError::HookBlocked("blocked by policy".to_string()));
-        let payload = json_result_payload("anthropic", "claude-sonnet-5", &err);
+        let payload = json_result_payload("ollama", "llama3.2", &err);
         assert!(payload["answer"].is_null());
         assert!(payload["error"].as_str().unwrap().contains("blocked by policy"));
     }
@@ -1450,6 +1545,14 @@ mod tests {
         SlashCommandHelper {
             color: false,
             working_dir: std::env::temp_dir(),
+            known_models: Vec::new(),
+        }
+    }
+
+    fn test_helper_with_models(models: &[&str]) -> SlashCommandHelper {
+        SlashCommandHelper {
+            known_models: models.iter().map(|m| m.to_string()).collect(),
+            ..test_helper()
         }
     }
 
@@ -1457,6 +1560,18 @@ mod tests {
         let history = rustyline::history::MemHistory::new();
         let ctx = Context::new(&history);
         test_helper().complete(line, line.len(), &ctx).unwrap()
+    }
+
+    fn complete_at_cursor_with(helper: &SlashCommandHelper, line: &str) -> (usize, Vec<Pair>) {
+        let history = rustyline::history::MemHistory::new();
+        let ctx = Context::new(&history);
+        helper.complete(line, line.len(), &ctx).unwrap()
+    }
+
+    fn hint_at_cursor_with(helper: &SlashCommandHelper, line: &str) -> Option<String> {
+        let history = rustyline::history::MemHistory::new();
+        let ctx = Context::new(&history);
+        helper.hint(line, line.len(), &ctx).map(|h| rustyline::hint::Hint::display(&h).to_string())
     }
 
     fn hint_at_cursor(line: &str) -> Option<String> {
@@ -1523,5 +1638,37 @@ mod tests {
     #[test]
     fn slash_hint_absent_for_plain_text() {
         assert_eq!(hint_at_cursor("hello"), None);
+    }
+
+    #[test]
+    fn model_completion_suggests_ollama_as_the_provider() {
+        let helper = test_helper_with_models(&["qwen2.5-coder:14b"]);
+        let (start, candidates) = complete_at_cursor_with(&helper, "/model oll");
+        assert_eq!(start, "/model ".len());
+        assert_eq!(candidates[0].display, "ollama");
+        assert_eq!(candidates[0].replacement, "ollama ");
+    }
+
+    #[test]
+    fn model_completion_suggests_pulled_model_names() {
+        let helper = test_helper_with_models(&["qwen2.5-coder:14b", "llama3.2"]);
+        let (start, candidates) = complete_at_cursor_with(&helper, "/model ollama qwen");
+        assert_eq!(start, "/model ollama ".len());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "qwen2.5-coder:14b");
+    }
+
+    #[test]
+    fn model_completion_is_empty_for_an_unknown_provider() {
+        let helper = test_helper_with_models(&["qwen2.5-coder:14b"]);
+        let (_, candidates) = complete_at_cursor_with(&helper, "/model anthropic ");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn model_hint_completes_the_rest_of_a_single_matching_model() {
+        let helper = test_helper_with_models(&["qwen2.5-coder:14b", "llama3.2"]);
+        let hint = hint_at_cursor_with(&helper, "/model ollama qwen").unwrap();
+        assert_eq!(hint, "2.5-coder:14b");
     }
 }

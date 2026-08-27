@@ -9,9 +9,8 @@ pub enum Role {
     Tool,
 }
 
-/// Provider-agnostic chat message. Anthropic's content-block shape is the
-/// canonical representation; other providers' flatter shapes are projected
-/// into/out of this at the provider boundary.
+/// Provider-agnostic chat message, using a content-block shape; flatter
+/// provider shapes are projected into/out of this at the provider boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,

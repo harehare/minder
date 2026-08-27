@@ -211,11 +211,11 @@ mod tests {
     async fn provider_changed_updates_the_snapshot_without_touching_running_state() {
         let path = scratch_path("provider.json");
         let reporter = StatusReporter::new(path.clone());
-        reporter.on_provider_changed("anthropic", "claude-sonnet-5").await;
+        reporter.on_provider_changed("ollama", "llama3.2").await;
         let snapshot = read_snapshot(&path);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(snapshot["provider"], "anthropic");
-        assert_eq!(snapshot["model"], "claude-sonnet-5");
+        assert_eq!(snapshot["provider"], "ollama");
+        assert_eq!(snapshot["model"], "llama3.2");
         assert_eq!(snapshot["state"], "idle");
     }
 }

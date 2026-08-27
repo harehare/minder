@@ -141,9 +141,7 @@ pub struct TerminalReporter {
     /// Runtime toggle for `on_thinking` (see `Reporter::on_thinking`) --
     /// shared with the REPL's `/thinking` command via the same `Arc`, so
     /// flipping it takes effect on the very next turn without rebuilding the
-    /// reporter. Defaults to whatever `.agent/config.toml`'s `thinking_budget`
-    /// implies: shown if extended thinking was requested, since a user who
-    /// opted into paying for it almost certainly wants to see it.
+    /// reporter. Defaults to `true`.
     show_thinking: Arc<AtomicBool>,
     /// Incremental state for `on_assistant_text_delta`'s current text block,
     /// reset each time `on_assistant_text` flushes it -- see `StreamSegmenter`.
@@ -674,8 +672,8 @@ mod tests {
 
     #[test]
     fn an_agent_call_with_a_model_override_shows_both_name_and_model() {
-        let args = serde_json::json!({"name": "reviewer", "task": "...", "model": "claude-haiku-4-5"});
-        assert_eq!(summarize_args(&args), "name=reviewer model=claude-haiku-4-5");
+        let args = serde_json::json!({"name": "reviewer", "task": "...", "model": "llama3.2"});
+        assert_eq!(summarize_args(&args), "name=reviewer model=llama3.2");
     }
 
     #[test]
@@ -916,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn on_provider_changed_updates_the_spinner_label() {
         let reporter = no_color_reporter(None);
-        reporter.on_provider_changed("openai", "gpt-5.4").await;
-        assert_eq!(reporter.spinner.lock().await.provider_label, "openai (gpt-5.4)");
+        reporter.on_provider_changed("ollama", "llama3.2").await;
+        assert_eq!(reporter.spinner.lock().await.provider_label, "ollama (llama3.2)");
     }
 }

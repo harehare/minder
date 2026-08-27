@@ -369,7 +369,7 @@ mod tests {
         composite.on_assistant_text_delta("h").await;
         composite.on_thinking("hmm").await;
         composite.on_steering_message("wait").await;
-        composite.on_provider_changed("anthropic", "claude").await;
+        composite.on_provider_changed("ollama", "llama3.2").await;
         composite
             .on_usage(&Usage {
                 input_tokens: 5,
@@ -382,7 +382,7 @@ mod tests {
             "delta:h",
             "thinking:hmm",
             "steering:wait",
-            "provider:anthropic/claude",
+            "provider:ollama/llama3.2",
             "usage:5/1",
         ];
         assert_eq!(a.0.lock().unwrap().as_slice(), expected);

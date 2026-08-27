@@ -25,9 +25,8 @@ pub trait Reporter: Send + Sync {
     /// only once it's complete. See `LlmProvider::complete_streaming`.
     async fn on_assistant_text_delta(&self, _delta: &str) {}
     /// Extended-thinking content seen on a turn (only fired when the
-    /// provider actually returns a `Thinking` block, e.g. Anthropic with a
-    /// thinking budget configured -- see `AnthropicProvider::with_thinking_budget`).
-    /// Whether/how to display it is entirely up to the reporter.
+    /// provider actually returns a `Thinking` block, e.g. a reasoning model
+    /// via Ollama). Whether/how to display it is up to the reporter.
     async fn on_thinking(&self, _text: &str) {}
     /// Fired just before a tool call is executed (post-hook-transform).
     async fn on_tool_call(&self, _call: &ToolCall) {}

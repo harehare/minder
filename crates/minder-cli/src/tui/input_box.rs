@@ -49,6 +49,10 @@ pub(crate) struct InputBoxState {
     draft: String,
     /// When the last idle Ctrl-C landed -- see `CTRL_C_QUIT_WINDOW`.
     last_idle_ctrl_c: Option<Instant>,
+    /// Snapshot of locally pulled models, for `/model` argument completion
+    /// -- see `crate::matching_model_args`. Empty unless set via
+    /// `with_known_models`.
+    known_models: Vec<String>,
 }
 
 impl InputBoxState {
@@ -60,7 +64,13 @@ impl InputBoxState {
             history_index: None,
             draft: String::new(),
             last_idle_ctrl_c: None,
+            known_models: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_known_models(mut self, known_models: Vec<String>) -> Self {
+        self.known_models = known_models;
+        self
     }
 
     /// Records the buffer in history (skipping immediate repeats) and resets it.
@@ -227,12 +237,21 @@ impl InputBoxState {
         self.history_index = Some(next);
     }
 
-    /// Completes a `/`-command (single match) or `@mention` (first candidate) at the cursor.
+    /// Completes a `/`-command (single match), `/model`'s arguments (first
+    /// candidate), or an `@mention` (first candidate) at the cursor.
     fn complete(&mut self, working_dir: &Path) {
         if let Some(matches) = crate::matching_slash_commands(&self.buffer, self.cursor)
             && let [only] = matches.as_slice()
         {
             self.buffer = format!("/{only} ");
+            self.cursor = self.buffer.chars().count();
+            return;
+        }
+        if let Some((start, matches)) = crate::matching_model_args(&self.buffer, self.cursor, &self.known_models)
+            && let Some(first) = matches.into_iter().next()
+        {
+            self.buffer.replace_range(start.., &first);
+            self.buffer.push(' ');
             self.cursor = self.buffer.chars().count();
             return;
         }
@@ -855,5 +874,22 @@ mod tests {
         }
         box_state.handle_key(key(KeyCode::Tab), InputMode::Idle, &dir());
         assert_eq!(box_state.buffer, "/help ");
+    }
+
+    #[test]
+    fn tab_completes_the_provider_then_a_pulled_model_name() {
+        let mut box_state =
+            InputBoxState::new(Vec::new()).with_known_models(vec!["qwen2.5-coder:14b".to_string()]);
+        for c in "/model oll".chars() {
+            box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
+        }
+        box_state.handle_key(key(KeyCode::Tab), InputMode::Idle, &dir());
+        assert_eq!(box_state.buffer, "/model ollama ");
+
+        for c in "qwen".chars() {
+            box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
+        }
+        box_state.handle_key(key(KeyCode::Tab), InputMode::Idle, &dir());
+        assert_eq!(box_state.buffer, "/model ollama qwen2.5-coder:14b ");
     }
 }

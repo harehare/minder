@@ -18,7 +18,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-mq-lang = { version = "0.7", default-features = false, features = ["std", "sync"] }
+mq-lang = { version = "0.8.4", default-features = false, features = ["std", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

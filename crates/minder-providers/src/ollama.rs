@@ -10,10 +10,27 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
+/// Ollama's own default (2048-4096) silently truncates context instead of
+/// erroring -- a common cause of broken tool-calling. Sent on every request.
+const DEFAULT_NUM_CTX: u32 = 8192;
+
+/// A refused connection almost always means `ollama serve` isn't running --
+/// surface that guess instead of reqwest's raw "connection refused" text.
+fn describe_transport_error(e: reqwest::Error, base_url: &str) -> ProviderError {
+    if e.is_connect() {
+        ProviderError::Transport(format!(
+            "could not connect to Ollama at {base_url} -- is it running? Start it with `ollama serve`, or install it from https://ollama.com/download"
+        ))
+    } else {
+        ProviderError::Transport(e.to_string())
+    }
+}
+
 pub struct OllamaProvider {
     base_url: String,
     model: String,
     client: reqwest::Client,
+    num_ctx: u32,
 }
 
 impl OllamaProvider {
@@ -22,6 +39,7 @@ impl OllamaProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             client: Self::build_client(None),
+            num_ctx: DEFAULT_NUM_CTX,
         }
     }
 
@@ -33,6 +51,12 @@ impl OllamaProvider {
     /// Overrides the default request timeout -- see `crate::http`.
     pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
         self.client = Self::build_client(Some(secs));
+        self
+    }
+
+    /// Overrides `DEFAULT_NUM_CTX` -- see its doc comment.
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = num_ctx;
         self
     }
 
@@ -78,6 +102,7 @@ impl LlmProvider for OllamaProvider {
             messages: ol_messages,
             tools: to_ollama_tools(tools),
             stream: false,
+            options: OlOptions { num_ctx: self.num_ctx },
         };
 
         let resp = self
@@ -86,10 +111,10 @@ impl LlmProvider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         if !status.is_success() {
             return Err(ProviderError::Api {
@@ -124,6 +149,7 @@ impl LlmProvider for OllamaProvider {
             messages: ol_messages,
             tools: to_ollama_tools(tools),
             stream: true,
+            options: OlOptions { num_ctx: self.num_ctx },
         };
 
         let resp = self
@@ -132,11 +158,11 @@ impl LlmProvider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 body: text,
@@ -151,7 +177,7 @@ impl LlmProvider for OllamaProvider {
         let mut accum = OlStreamAccumulator::default();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let chunk = chunk.map_err(|e| describe_transport_error(e, &self.base_url))?;
             line_buf.extend_from_slice(&chunk);
 
             while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
@@ -166,6 +192,92 @@ impl LlmProvider for OllamaProvider {
         }
 
         Ok(from_ollama_response(accum.into_response()))
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
+        if !status.is_success() {
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        let parsed: OlTagsResponse = serde_json::from_str(&text).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        Ok(parsed.models.into_iter().map(|m| m.name).collect())
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        Some(self.num_ctx)
+    }
+
+    async fn ensure_model_available(&self, reporter: &dyn Reporter) -> Result<(), ProviderError> {
+        if self.list_models().await?.iter().any(|m| m == &self.model) {
+            return Ok(());
+        }
+        reporter
+            .on_notice(&format!("model '{}' isn't pulled yet -- downloading...", self.model))
+            .await;
+
+        let resp = self
+            .client
+            .post(format!("{}/api/pull", self.base_url))
+            .json(&serde_json::json!({"model": self.model, "stream": true}))
+            .send()
+            .await
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut line_buf: Vec<u8> = Vec::new();
+        // Reports at most once per 2s -- pull progress lines arrive fast
+        // enough to otherwise spam the display.
+        let mut last_reported = std::time::Instant::now() - Duration::from_secs(2);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| describe_transport_error(e, &self.base_url))?;
+            line_buf.extend_from_slice(&chunk);
+            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let progress: OlPullProgress =
+                    serde_json::from_str(line).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+                if let Some(err) = progress.error {
+                    return Err(ProviderError::Api { status: 0, body: err });
+                }
+                if progress.status == "success" {
+                    reporter.on_notice(&format!("model '{}' pulled.", self.model)).await;
+                } else if let (Some(completed), Some(total)) = (progress.completed, progress.total)
+                    && total > 0
+                    && last_reported.elapsed() > Duration::from_secs(2)
+                {
+                    reporter
+                        .on_notice(&format!("  {} ({}%)", progress.status, completed * 100 / total))
+                        .await;
+                    last_reported = std::time::Instant::now();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -232,6 +344,34 @@ struct OlRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OlTool>,
     stream: bool,
+    options: OlOptions,
+}
+
+#[derive(Serialize)]
+struct OlOptions {
+    num_ctx: u32,
+}
+
+#[derive(Deserialize)]
+struct OlTagsResponse {
+    models: Vec<OlTagEntry>,
+}
+
+#[derive(Deserialize)]
+struct OlTagEntry {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct OlPullProgress {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    completed: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -499,12 +639,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingReporter {
         deltas: std::sync::Mutex<Vec<String>>,
+        notices: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl Reporter for RecordingReporter {
         async fn on_assistant_text_delta(&self, delta: &str) {
             self.deltas.lock().unwrap().push(delta.to_string());
+        }
+        async fn on_notice(&self, text: &str) {
+            self.notices.lock().unwrap().push(text.to_string());
         }
     }
 
@@ -586,6 +730,152 @@ mod tests {
 
         assert_eq!(*reporter.deltas.lock().unwrap(), vec!["hi"]);
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn complete_sends_num_ctx_defaulting_to_8192() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"options": {"num_ctx": 8192}}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"role": "assistant", "content": "hi"},
+                "done": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("llama3.2").with_base_url(server.uri());
+        provider.complete(&[Message::user_text("hi")], &[], None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_num_ctx_overrides_the_default() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"options": {"num_ctx": 32768}}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"role": "assistant", "content": "hi"},
+                "done": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("llama3.2")
+            .with_base_url(server.uri())
+            .with_num_ctx(32768);
+        provider.complete(&[Message::user_text("hi")], &[], None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_the_pulled_model_names() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "qwen2.5-coder:14b"}, {"name": "llama3.2"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("llama3.2").with_base_url(server.uri());
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models, vec!["qwen2.5-coder:14b".to_string(), "llama3.2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ensure_model_available_is_a_noop_when_already_pulled() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "llama3.2"}],
+            })))
+            .mount(&server)
+            .await;
+        // No /api/pull mock -- if ensure_model_available tried to pull anyway,
+        // wiremock's default 404-on-unmatched-request would surface as an error.
+
+        let provider = OllamaProvider::new("llama3.2").with_base_url(server.uri());
+        let reporter = RecordingReporter::default();
+        provider.ensure_model_available(&reporter).await.unwrap();
+        assert!(reporter.notices.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_model_available_pulls_a_missing_model_and_reports_progress() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
+            .mount(&server)
+            .await;
+        let pull_body = concat!(
+            "{\"status\": \"pulling manifest\"}\n",
+            "{\"status\": \"success\"}\n",
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/pull"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(pull_body, "application/x-ndjson"))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("qwen2.5-coder:14b").with_base_url(server.uri());
+        let reporter = RecordingReporter::default();
+        provider.ensure_model_available(&reporter).await.unwrap();
+
+        let notices = reporter.notices.lock().unwrap();
+        assert!(notices.iter().any(|n| n.contains("downloading")), "{notices:?}");
+        assert!(notices.iter().any(|n| n.contains("pulled")), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn ensure_model_available_surfaces_a_pull_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/pull"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                "{\"error\": \"model 'nonexistent' not found\"}\n",
+                "application/x-ndjson",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("nonexistent").with_base_url(server.uri());
+        let reporter = RecordingReporter::default();
+        let err = provider.ensure_model_available(&reporter).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_hints_at_starting_ollama() {
+        // Bind a std listener then drop it synchronously -- unlike wiremock's
+        // async shutdown, this guarantees nothing answers on the port after.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let provider = OllamaProvider::new("llama3.2").with_base_url(base_url.clone());
+        let err = provider
+            .complete(&[Message::user_text("hi")], &[], None)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("ollama serve"), "expected an `ollama serve` hint, got: {msg}");
+        assert!(msg.contains(&base_url), "expected the base url in the message, got: {msg}");
     }
 
     #[tokio::test]

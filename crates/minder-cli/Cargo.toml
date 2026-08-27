@@ -1,15 +1,15 @@
 [package]
-name = "minder-cli"
-description = "Multi-provider (Anthropic, OpenAI, Gemini, Ollama) coding-agent harness CLI with mq-based policy/observability hooks"
-categories = ["command-line-utilities", "development-tools"]
-keywords = ["agent", "llm", "cli", "coding-agent"]
-edition.workspace = true
-version.workspace = true
-license.workspace = true
 authors.workspace = true
-repository.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+description = "Local-LLM coding-agent harness CLI with mq-based policy/observability hooks"
+edition.workspace = true
 homepage.workspace = true
+keywords = ["agent", "llm", "cli", "coding-agent"]
+license.workspace = true
+name = "minder-cli"
 readme.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "minder"
@@ -20,32 +20,33 @@ mcp = ["dep:minder-tools-mcp"]
 wasm = ["dep:minder-tools-wasm"]
 
 [dependencies]
-minder-core.workspace = true
-minder-providers.workspace = true
-minder-tools.workspace = true
-minder-tools-wasm = { workspace = true, optional = true }
-minder-tools-mcp = { workspace = true, optional = true }
-minder-hooks.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 clap_complete = "4"
-toml = "1"
-mq-lang = { version = "0.7", default-features = false, features = ["std", "sync", "file-io"] }
-mq-markdown.workspace = true
-two-face.workspace = true
-rustyline.workspace = true
-ignore.workspace = true
-terminal_size.workspace = true
 crossterm.workspace = true
-ratatui.workspace = true
-unicode-width.workspace = true
 futures-util.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-serde_json.workspace = true
+ignore.workspace = true
+minder-core.workspace = true
+minder-hooks.workspace = true
+minder-providers.workspace = true
+minder-tools-mcp = {workspace = true, optional = true}
+minder-tools-wasm = {workspace = true, optional = true}
+minder-tools.workspace = true
+mq-lang = {version = "0.8.4", default-features = false, features = ["std", "sync", "file-io"]}
+mq-markdown.workspace = true
+ratatui.workspace = true
+rustyline.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+terminal_size.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+toml = "1"
+two-face.workspace = true
+unicode-width.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = {workspace = true, features = ["test-util"]}
+wiremock = "0.6"

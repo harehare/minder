@@ -47,6 +47,10 @@ pub struct AgentSession {
     /// turn to end. `None` means steering isn't wired up, the common case
     /// (subagents, tests, non-interactive runs).
     steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// Structured facts salvaged from messages before `truncate_to` drops
+    /// them -- survives compaction unlike the raw transcript. See
+    /// `DecisionLedger`.
+    decision_ledger: DecisionLedger,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +85,7 @@ impl AgentSession {
             started: false,
             last_input_tokens: None,
             steering_rx: None,
+            decision_ledger: DecisionLedger::default(),
         }
     }
 
@@ -242,11 +247,15 @@ impl AgentSession {
         messages: &[Message],
         tool_specs: &[ToolSpec],
     ) -> Result<ProviderResponse, ProviderError> {
+        let system_prompt = match self.decision_ledger.render() {
+            Some(ledger) => format!("{}\n\n{ledger}", self.system_prompt),
+            None => self.system_prompt.clone(),
+        };
         let mut attempt = 0usize;
         loop {
             let result = self
                 .provider
-                .complete_streaming(messages, tool_specs, Some(&self.system_prompt), self.reporter.as_ref())
+                .complete_streaming(messages, tool_specs, Some(&system_prompt), self.reporter.as_ref())
                 .await;
             match &result {
                 Err(err) if is_transient_error(err) && attempt < MAX_TRANSIENT_RETRIES => {
@@ -283,20 +292,81 @@ impl AgentSession {
     }
 
     async fn maybe_compact(&mut self) -> Result<(), AgentError> {
+        // Tier 1: free, runs every turn regardless of pressure.
+        self.dedup_stale_reads();
+
         let over_message_count = self.messages.len() > COMPACT_THRESHOLD;
-        let over_token_budget = self.last_input_tokens.is_some_and(|t| t > TOKEN_COMPACT_THRESHOLD);
+        let over_token_budget = self.last_input_tokens.is_some_and(|t| t > self.token_compact_threshold());
         if !over_message_count && !over_token_budget {
             return Ok(());
         }
         self.run_before_compact_hook().await?;
-        self.truncate_to(KEEP_RECENT);
+        self.truncate_to(KEEP_RECENT).await;
         Ok(())
+    }
+
+    /// 75% of the provider's context window if known, else the fallback constant.
+    fn token_compact_threshold(&self) -> u32 {
+        match self.provider.context_window() {
+            Some(window) => (window as f64 * 0.75) as u32,
+            None => TOKEN_COMPACT_THRESHOLD,
+        }
+    }
+
+    /// Marks a collapsed result, so a later pass can skip it.
+    const STALE_READ_MARKER: &str = "(superseded by a later read_file of ";
+
+    /// Collapses every `read_file` result but the most recent one per path
+    /// into a short pointer -- the model already has the newer copy.
+    fn dedup_stale_reads(&mut self) {
+        let mut read_paths: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for msg in &self.messages {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse(call) = block
+                    && call.name == "read_file"
+                    && let Some(path) = call.arguments.get("path").and_then(|v| v.as_str())
+                {
+                    read_paths.insert(call.id.clone(), path.to_string());
+                }
+            }
+        }
+        if read_paths.is_empty() {
+            return;
+        }
+
+        // Last (message index, block index) touching each path.
+        let mut last_seen: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+        for (mi, msg) in self.messages.iter().enumerate() {
+            for (bi, block) in msg.content.iter().enumerate() {
+                if let ContentBlock::ToolResult(result) = block
+                    && !result.is_error
+                    && let Some(path) = read_paths.get(&result.tool_call_id)
+                {
+                    last_seen.insert(path.as_str(), (mi, bi));
+                }
+            }
+        }
+
+        for (mi, msg) in self.messages.iter_mut().enumerate() {
+            for (bi, block) in msg.content.iter_mut().enumerate() {
+                if let ContentBlock::ToolResult(result) = block
+                    && !result.is_error
+                    && let Some(path) = read_paths.get(&result.tool_call_id)
+                    && last_seen.get(path.as_str()) != Some(&(mi, bi))
+                    && let ToolResultContent::Text(text) = &result.content
+                    && !text.starts_with(Self::STALE_READ_MARKER)
+                {
+                    result.content =
+                        ToolResultContent::Text(format!("{}{path})", Self::STALE_READ_MARKER));
+                }
+            }
+        }
     }
 
     /// Emergency compaction after the provider itself rejects a request as too large.
     async fn force_compact(&mut self) -> Result<(), AgentError> {
         self.run_before_compact_hook().await?;
-        self.truncate_to(EMERGENCY_KEEP_RECENT);
+        self.truncate_to(EMERGENCY_KEEP_RECENT).await;
         Ok(())
     }
 
@@ -310,15 +380,34 @@ impl AgentSession {
         }
     }
 
-    // Truncation-based compaction: keep only the most recent `keep` messages.
-    // Real summarization is a v2 concern (see plan's Compaction hook
-    // semantics open question).
-    fn truncate_to(&mut self, keep: usize) {
+    // Keeps only the most recent `keep` messages, salvaging what the dropped
+    // ones are worth into `decision_ledger` first. Real free-text
+    // summarization (Tier 3) is still a v2 concern.
+    async fn truncate_to(&mut self, keep: usize) {
         if self.messages.len() <= keep {
             return;
         }
         let drop_count = self.messages.len() - keep;
-        self.messages.drain(0..drop_count);
+        let dropped: Vec<Message> = self.messages.drain(0..drop_count).collect();
+        self.decision_ledger.record(&dropped);
+        // Tier 3, best-effort: a flaky/weak summarizer just means the ledger
+        // (Tiers 1-2) is all that survives -- never fail compaction over it.
+        if let Some(summary) = self.summarize_dropped(&dropped).await {
+            self.decision_ledger.push_summary(summary);
+        }
+    }
+
+    /// Asks the session's own provider to recap `dropped` in a few bullet
+    /// points, via a standalone call that never touches `self.messages`.
+    async fn summarize_dropped(&self, dropped: &[Message]) -> Option<String> {
+        let transcript = plain_text_transcript(dropped);
+        if transcript.trim().is_empty() {
+            return None;
+        }
+        let prompt = format!("{SUMMARIZE_PROMPT_PREFIX}{transcript}");
+        let resp = self.provider.complete(&[Message::user_text(prompt)], &[], None).await.ok()?;
+        let text = resp.message.text();
+        (!text.trim().is_empty()).then_some(text)
     }
 
     async fn execute_with_hooks(&self, call: ToolCall, ctx: &ToolContext) -> Result<ToolExecOutcome, AgentError> {
@@ -390,13 +479,13 @@ impl AgentSession {
         &self.system_prompt
     }
 
-    /// The active provider's id (e.g. `"anthropic"`), for display purposes
+    /// The active provider's id (e.g. `"ollama"`), for display purposes
     /// (banner, status lines) -- not used for any routing decision.
     pub fn provider_id(&self) -> &'static str {
         self.provider.id()
     }
 
-    /// The active provider's model name (e.g. `"claude-sonnet-5"`), for
+    /// The active provider's model name (e.g. `"llama3.2"`), for
     /// display purposes only -- not used for any routing decision.
     pub fn model(&self) -> &str {
         self.provider.model()
@@ -415,6 +504,7 @@ impl AgentSession {
         self.system_prompt = system_prompt;
         self.messages = messages;
         self.started = true;
+        self.decision_ledger = DecisionLedger::default();
     }
 
     /// Swaps in a fresh, un-cancelled `CancellationToken` for this turn and
@@ -440,11 +530,8 @@ impl AgentSession {
 
     /// Appends any steering text queued since the last drain onto
     /// `self.messages[at]` as extra content blocks, rather than pushing a
-    /// new message -- providers that project `Role::Tool` onto their own
-    /// "user" role (see `minder-providers`' Anthropic mapping) would see two
-    /// consecutive user turns if this were a separate `Message::user_text`,
-    /// which several reject outright. Appending onto the message already at
-    /// that slot keeps the transcript's role alternation exactly as it was.
+    /// new message, to keep role alternation intact for providers that
+    /// reject consecutive same-role turns.
     async fn drain_steering(&mut self, at: usize) {
         let Some(rx) = &mut self.steering_rx else { return };
         let mut drained = Vec::new();
@@ -524,6 +611,132 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[b.len()]
+}
+
+const DECISION_LEDGER_COMMIT_CAP: usize = 12;
+const DECISION_LEDGER_FILE_CAP: usize = 30;
+const DECISION_LEDGER_SUMMARY_CAP: usize = 5;
+
+/// Prompt for Tier 3's summarization call -- kept short and demanding
+/// brevity, since the summarizer may itself be a small local model.
+const SUMMARIZE_PROMPT_PREFIX: &str = "Summarize the key facts, decisions, and open threads from this part of a coding session in 3-5 short bullet points. Be concise.\n\n";
+
+/// Structured facts mechanically extracted from tool calls about to be
+/// dropped by truncation, so a compacted session doesn't lose track of what
+/// it already did. Deliberately not an LLM-written summary -- see
+/// `AgentSession::complete_with_retries`, which folds `render()`'s output
+/// into the system prompt.
+#[derive(Default)]
+struct DecisionLedger {
+    touched_files: Vec<String>,
+    latest_todo: Option<String>,
+    commits: Vec<String>,
+    /// Tier 3: short LLM-written recaps of prose (non-tool) content that Tiers
+    /// 1-2 can't capture, oldest first, capped at `DECISION_LEDGER_SUMMARY_CAP`.
+    summaries: Vec<String>,
+}
+
+impl DecisionLedger {
+    fn push_summary(&mut self, summary: String) {
+        self.summaries.push(summary);
+        if self.summaries.len() > DECISION_LEDGER_SUMMARY_CAP {
+            self.summaries.remove(0);
+        }
+    }
+
+    fn record(&mut self, dropped: &[Message]) {
+        for msg in dropped {
+            for block in &msg.content {
+                let ContentBlock::ToolUse(call) = block else { continue };
+                match call.name.as_str() {
+                    "git_commit" => {
+                        if let Some(m) = call.arguments.get("message").and_then(|v| v.as_str()) {
+                            self.commits.push(m.to_string());
+                            if self.commits.len() > DECISION_LEDGER_COMMIT_CAP {
+                                self.commits.remove(0);
+                            }
+                        }
+                    }
+                    "todo_write" => self.latest_todo = summarize_todo_write(&call.arguments),
+                    "write_file" | "edit_file" | "delete_file" => {
+                        if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str())
+                            && !self.touched_files.iter().any(|p| p == path)
+                        {
+                            self.touched_files.push(path.to_string());
+                            if self.touched_files.len() > DECISION_LEDGER_FILE_CAP {
+                                self.touched_files.remove(0);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn render(&self) -> Option<String> {
+        if self.touched_files.is_empty()
+            && self.latest_todo.is_none()
+            && self.commits.is_empty()
+            && self.summaries.is_empty()
+        {
+            return None;
+        }
+        let mut out = String::from("Earlier context was compacted; these facts from it still apply:\n");
+        if let Some(todo) = &self.latest_todo {
+            out.push_str(&format!("Current todo list:\n{todo}\n"));
+        }
+        if !self.touched_files.is_empty() {
+            out.push_str(&format!("Files touched so far: {}\n", self.touched_files.join(", ")));
+        }
+        if !self.commits.is_empty() {
+            out.push_str("Commits made:\n");
+            for c in &self.commits {
+                out.push_str(&format!("  - {c}\n"));
+            }
+        }
+        if !self.summaries.is_empty() {
+            out.push_str("Summary of earlier discussion:\n");
+            for s in &self.summaries {
+                out.push_str(&format!("  - {s}\n"));
+            }
+        }
+        Some(out)
+    }
+}
+
+/// A `todo_write` call's `todos` array as one checkmark-per-line string, or
+/// `None` if the arguments don't parse (malformed calls just aren't logged).
+fn summarize_todo_write(args: &serde_json::Value) -> Option<String> {
+    let todos = args.get("todos")?.as_array()?;
+    let lines: Vec<String> = todos
+        .iter()
+        .filter_map(|t| {
+            let content = t.get("content")?.as_str()?;
+            let mark = match t.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => "x",
+                Some("in_progress") => "~",
+                _ => " ",
+            };
+            Some(format!("  [{mark}] {content}"))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// User/Assistant text content, one line per message, for Tier 3's
+/// summarization prompt -- tool calls/results are structured data already
+/// captured by Tiers 1-2, so they're left out here.
+fn plain_text_transcript(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .filter_map(|m| {
+            let text = m.text();
+            (!text.trim().is_empty()).then(|| format!("{:?}: {text}", m.role))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// True if a provider error looks like "request too large for context window".
@@ -1413,6 +1626,7 @@ mod tests {
     async fn high_token_usage_triggers_proactive_compaction_under_message_threshold() {
         let provider = ScriptedProvider::new(vec![
             text_response_with_usage("first", TOKEN_COMPACT_THRESHOLD + 1),
+            text_response("summary"), // consumed by Tier 3's summarization call during compaction
             text_response("second"),
         ]);
         let mut session = AgentSession::new(Arc::new(provider), vec![], None, "test", test_ctx());
@@ -1425,6 +1639,298 @@ mod tests {
         // 44 seeded + 1 user = 45, under COMPACT_THRESHOLD (60), but the primed
         // usage was over TOKEN_COMPACT_THRESHOLD so it compacts anyway.
         assert_eq!(session.messages().len(), KEEP_RECENT + 1);
+    }
+
+    struct FakeReadFileTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for FakeReadFileTool {
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "reads a file"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        async fn execute(&self, _arguments: serde_json::Value, _ctx: &ToolContext) -> ToolExecOutcome {
+            ToolExecOutcome {
+                content: self.0.to_string(),
+                is_error: false,
+                metadata: serde_json::Value::Null,
+            }
+        }
+    }
+
+    fn tool_result_content<'a>(messages: &'a [Message], call_id: &str) -> &'a ToolResultContent {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult(r) if r.tool_call_id == call_id => Some(&r.content),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {call_id}"))
+    }
+
+    #[tokio::test]
+    async fn a_stale_read_file_result_is_collapsed_once_the_file_is_read_again() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_response("call1", "read_file", serde_json::json!({"path": "a.txt"})),
+            text_response("ok"),
+            tool_use_response("call2", "read_file", serde_json::json!({"path": "a.txt"})),
+            text_response("ok again"),
+        ]);
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(FakeReadFileTool("the real file content"))],
+            None,
+            "test",
+            test_ctx(),
+        );
+
+        session.run_turn("read it").await.unwrap();
+        session.run_turn("read it again").await.unwrap();
+
+        let ToolResultContent::Text(first) = tool_result_content(session.messages(), "call1") else {
+            panic!("expected Text")
+        };
+        assert!(first.contains("superseded") && first.contains("a.txt"), "got: {first}");
+
+        let ToolResultContent::Text(second) = tool_result_content(session.messages(), "call2") else {
+            panic!("expected Text")
+        };
+        assert_eq!(second, "the real file content");
+    }
+
+    #[tokio::test]
+    async fn reads_of_different_paths_are_left_alone() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_response("call1", "read_file", serde_json::json!({"path": "a.txt"})),
+            text_response("ok"),
+            tool_use_response("call2", "read_file", serde_json::json!({"path": "b.txt"})),
+            text_response("ok again"),
+        ]);
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![Arc::new(FakeReadFileTool("content"))],
+            None,
+            "test",
+            test_ctx(),
+        );
+
+        session.run_turn("read a").await.unwrap();
+        session.run_turn("read b").await.unwrap();
+
+        for id in ["call1", "call2"] {
+            let ToolResultContent::Text(text) = tool_result_content(session.messages(), id) else {
+                panic!("expected Text")
+            };
+            assert_eq!(text, "content", "{id} should not have been collapsed");
+        }
+    }
+
+    struct SmallContextProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SmallContextProvider {
+        fn id(&self) -> &'static str {
+            "small"
+        }
+        fn model(&self) -> &str {
+            "small-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            unreachable!("not exercised by this test")
+        }
+        fn context_window(&self) -> Option<u32> {
+            Some(8192)
+        }
+    }
+
+    #[test]
+    fn token_compact_threshold_scales_with_the_providers_context_window() {
+        let session = AgentSession::new(Arc::new(SmallContextProvider), vec![], None, "test", test_ctx());
+        assert_eq!(session.token_compact_threshold(), 6144); // 75% of 8192
+    }
+
+    #[test]
+    fn token_compact_threshold_falls_back_to_the_constant_when_unknown() {
+        let session = AgentSession::new(
+            Arc::new(ScriptedProvider::new(vec![])),
+            vec![],
+            None,
+            "test",
+            test_ctx(),
+        );
+        assert_eq!(session.token_compact_threshold(), TOKEN_COMPACT_THRESHOLD);
+    }
+
+    fn tool_use_message(id: &str, tool: &str, args: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse(ToolCall {
+                id: id.to_string(),
+                name: tool.to_string(),
+                arguments: args,
+            })],
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn decision_ledger_captures_touched_files_commits_and_the_todo_list() {
+        let mut ledger = DecisionLedger::default();
+        ledger.record(&[
+            tool_use_message("1", "write_file", serde_json::json!({"path": "src/a.rs"})),
+            tool_use_message("2", "git_commit", serde_json::json!({"message": "add a.rs"})),
+            tool_use_message(
+                "3",
+                "todo_write",
+                serde_json::json!({"todos": [
+                    {"content": "write a.rs", "status": "completed"},
+                    {"content": "write tests", "status": "in_progress"},
+                ]}),
+            ),
+        ]);
+
+        let rendered = ledger.render().unwrap();
+        assert!(rendered.contains("src/a.rs"), "{rendered}");
+        assert!(rendered.contains("add a.rs"), "{rendered}");
+        assert!(rendered.contains("[x] write a.rs"), "{rendered}");
+        assert!(rendered.contains("[~] write tests"), "{rendered}");
+    }
+
+    #[test]
+    fn decision_ledger_renders_nothing_when_empty() {
+        assert!(DecisionLedger::default().render().is_none());
+    }
+
+    #[test]
+    fn decision_ledger_keeps_only_the_latest_todo_write() {
+        let mut ledger = DecisionLedger::default();
+        ledger.record(&[tool_use_message(
+            "1",
+            "todo_write",
+            serde_json::json!({"todos": [{"content": "first plan", "status": "pending"}]}),
+        )]);
+        ledger.record(&[tool_use_message(
+            "2",
+            "todo_write",
+            serde_json::json!({"todos": [{"content": "revised plan", "status": "pending"}]}),
+        )]);
+
+        let rendered = ledger.render().unwrap();
+        assert!(rendered.contains("revised plan"));
+        assert!(!rendered.contains("first plan"));
+    }
+
+    struct CapturingProvider {
+        responses: StdMutex<std::collections::VecDeque<ProviderResponse>>,
+        captured_system_prompts: StdMutex<Vec<Option<String>>>,
+    }
+
+    impl CapturingProvider {
+        fn new(responses: Vec<ProviderResponse>) -> Self {
+            Self {
+                responses: StdMutex::new(responses.into()),
+                captured_system_prompts: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn id(&self) -> &'static str {
+            "capturing"
+        }
+        fn model(&self) -> &str {
+            "capturing-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.captured_system_prompts.lock().unwrap().push(system_prompt.map(String::from));
+            Ok(self.responses.lock().unwrap().pop_front().expect("script exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn compacted_facts_reach_the_system_prompt_on_the_next_call() {
+        let provider = Arc::new(CapturingProvider::new(vec![
+            text_response("summary"), // consumed by Tier 3's summarization call during compaction
+            text_response("done"),
+        ]));
+        let mut session = AgentSession::new(provider.clone(), vec![], None, "base prompt", test_ctx());
+
+        let mut seed = vec![tool_use_message(
+            "1",
+            "write_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        )];
+        seed.extend((0..COMPACT_THRESHOLD).map(|i| Message::user_text(format!("msg {i}"))));
+        session.restore("base prompt".to_string(), seed);
+
+        session.run_turn("go").await.unwrap();
+
+        let captured = provider.captured_system_prompts.lock().unwrap();
+        let last = captured.last().expect("one call").as_ref().expect("system prompt was set");
+        assert!(last.contains("src/a.rs"), "got: {last}");
+        assert!(last.starts_with("base prompt"), "got: {last}");
+    }
+
+    #[test]
+    fn decision_ledger_caps_summaries_dropping_the_oldest() {
+        let mut ledger = DecisionLedger::default();
+        for i in 0..DECISION_LEDGER_SUMMARY_CAP + 2 {
+            ledger.push_summary(format!("summary {i}"));
+        }
+        let rendered = ledger.render().unwrap();
+        assert!(!rendered.contains("summary 0"), "oldest summary should have been dropped");
+        assert!(rendered.contains(&format!("summary {}", DECISION_LEDGER_SUMMARY_CAP + 1)));
+    }
+
+    struct PanicIfCalledProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PanicIfCalledProvider {
+        fn id(&self) -> &'static str {
+            "panic-if-called"
+        }
+        fn model(&self) -> &str {
+            "panic-if-called-model"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _system_prompt: Option<&str>,
+        ) -> Result<ProviderResponse, ProviderError> {
+            panic!("should never be called -- nothing in the transcript to summarize");
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_dropped_skips_the_call_when_theres_no_prose() {
+        let session = AgentSession::new(Arc::new(PanicIfCalledProvider), vec![], None, "test", test_ctx());
+        let dropped = vec![tool_use_message("1", "write_file", serde_json::json!({"path": "a.rs"}))];
+        assert_eq!(session.summarize_dropped(&dropped).await, None);
+    }
+
+    #[tokio::test]
+    async fn summarize_dropped_is_best_effort_on_a_flaky_provider() {
+        let session = AgentSession::new(Arc::new(AlwaysFailingProvider), vec![], None, "test", test_ctx());
+        let dropped = vec![Message::user_text("please remember this")];
+        assert_eq!(session.summarize_dropped(&dropped).await, None);
     }
 
     /// Counts real invocations so a test can assert an `Override`d call

@@ -1109,10 +1109,10 @@ mod tests {
         write_agent(
             &agent_dir,
             "quick",
-            "---\nname: quick\ndescription: Fast searches\nmodel: claude-haiku-4-5\nprovider: anthropic\n---\nbody\n",
+            "---\nname: quick\ndescription: Fast searches\nmodel: llama3.2\nprovider: ollama\n---\nbody\n",
         );
         let subagents = discover_subagents(&agent_dir).unwrap();
-        assert_eq!(subagents[0].model, Some("claude-haiku-4-5".to_string()));
-        assert_eq!(subagents[0].provider, Some("anthropic".to_string()));
+        assert_eq!(subagents[0].model, Some("llama3.2".to_string()));
+        assert_eq!(subagents[0].provider, Some("ollama".to_string()));
     }
 }

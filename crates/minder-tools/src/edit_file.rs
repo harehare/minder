@@ -50,7 +50,8 @@ impl Tool for EditFileTool {
             Err(e) => return error(format!("failed to read {}: {e}", path.display())),
         };
 
-        let occurrences = content.matches(args.old_string.as_str()).count();
+        let (ranges, fuzzy) = find_occurrences(&content, &args.old_string);
+        let occurrences = ranges.len();
         if occurrences == 0 {
             return error(format!("old_string not found in {}", path.display()));
         }
@@ -61,17 +62,22 @@ impl Tool for EditFileTool {
             ));
         }
 
-        let new_content = if args.replace_all {
-            content.replace(&args.old_string, &args.new_string)
-        } else {
-            content.replacen(&args.old_string, &args.new_string, 1)
-        };
+        let to_replace = if args.replace_all { &ranges[..] } else { &ranges[..1] };
+        let mut new_content = String::with_capacity(content.len());
+        let mut last_end = 0;
+        for range in to_replace {
+            new_content.push_str(&content[last_end..range.start]);
+            new_content.push_str(&args.new_string);
+            last_end = range.end;
+        }
+        new_content.push_str(&content[last_end..]);
 
         match tokio::fs::write(&path, &new_content).await {
             Ok(()) => {
                 let diff = diff_files(&args.path, &content, &new_content);
+                let suffix = if fuzzy { " (matched ignoring trailing whitespace)" } else { "" };
                 ToolExecOutcome {
-                    content: format!("replaced {occurrences} occurrence(s) in {}", path.display()),
+                    content: format!("replaced {occurrences} occurrence(s) in {}{suffix}", path.display()),
                     is_error: false,
                     metadata: serde_json::json!({
                         "occurrences": occurrences,
@@ -84,6 +90,48 @@ impl Tool for EditFileTool {
             Err(e) => error(format!("failed to write {}: {e}", path.display())),
         }
     }
+}
+
+/// Byte ranges of every occurrence of `needle`, preferring an exact match;
+/// if none exist, falls back to matching line-by-line while ignoring each
+/// line's trailing whitespace/newline style -- the most common near-miss
+/// from a smaller model reproducing a block with slightly different
+/// trailing spaces. Never touches leading whitespace (indentation).
+/// Returns `(ranges, used_fallback)`.
+fn find_occurrences(haystack: &str, needle: &str) -> (Vec<std::ops::Range<usize>>, bool) {
+    let exact: Vec<_> = haystack.match_indices(needle).map(|(i, m)| i..i + m.len()).collect();
+    if !exact.is_empty() {
+        return (exact, false);
+    }
+    (find_occurrences_trailing_ws_tolerant(haystack, needle), true)
+}
+
+fn find_occurrences_trailing_ws_tolerant(haystack: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let h_lines: Vec<&str> = haystack.split_inclusive('\n').collect();
+    let n_lines: Vec<&str> = needle.split_inclusive('\n').collect();
+    if n_lines.is_empty() || h_lines.len() < n_lines.len() {
+        return Vec::new();
+    }
+
+    // `starts[i]` is line `i`'s byte offset; the sentinel at the end lets
+    // `starts[i + n_lines.len()]` address "one past the window" uniformly.
+    let mut starts = Vec::with_capacity(h_lines.len() + 1);
+    let mut offset = 0;
+    for line in &h_lines {
+        starts.push(offset);
+        offset += line.len();
+    }
+    starts.push(offset);
+
+    (0..=h_lines.len() - n_lines.len())
+        .filter(|&i| {
+            h_lines[i..i + n_lines.len()]
+                .iter()
+                .zip(&n_lines)
+                .all(|(h, n)| h.trim_end() == n.trim_end())
+        })
+        .map(|i| starts[i]..starts[i + n_lines.len()])
+        .collect()
 }
 
 fn error(message: String) -> ToolExecOutcome {
@@ -161,6 +209,43 @@ mod tests {
         let outcome = EditFileTool
             .execute(
                 serde_json::json!({"path": "a.txt", "old_string": "xyz", "new_string": "abc"}),
+                &ctx,
+            )
+            .await;
+        assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_whitespace_mismatch_still_matches_via_fallback() {
+        let ctx = ctx_with_file("fn foo() {\n    let x = 1;  \n    let y = 2;\n}\n").await;
+        let outcome = EditFileTool
+            .execute(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_string": "    let x = 1;\n    let y = 2;\n",
+                    "new_string": "    let x = 1;\n    let z = 3;\n",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(outcome.content.contains("ignoring trailing whitespace"));
+        assert_eq!(
+            tokio::fs::read_to_string(ctx.working_dir.join("a.txt")).await.unwrap(),
+            "fn foo() {\n    let x = 1;\n    let z = 3;\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leading_whitespace_mismatch_is_not_tolerated() {
+        // 2-space indent in the file, 4-space indent in `old_string` -- not a
+        // literal substring either way, so this must fail even with the
+        // trailing-whitespace-tolerant fallback (which never touches leading
+        // whitespace).
+        let ctx = ctx_with_file("  let x = 1;\n").await;
+        let outcome = EditFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt", "old_string": "    let x = 1;\n", "new_string": "    let y = 2;\n"}),
                 &ctx,
             )
             .await;

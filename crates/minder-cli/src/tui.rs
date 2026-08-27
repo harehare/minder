@@ -86,7 +86,8 @@ pub(crate) async fn run_tui_repl(
     let color = crate::color_enabled(std::io::stdout().is_terminal());
     let history_path = crate::session_store::history_path(dir).ok();
     let initial_history = history_path.as_deref().map(load_history).unwrap_or_default();
-    let mut box_state = InputBoxState::new(initial_history);
+    let known_models = built.provider.list_models().await.unwrap_or_default();
+    let mut box_state = InputBoxState::new(initial_history).with_known_models(known_models);
     let mut events = EventStream::new();
     // What `spawn_side_question` needs to build its own ephemeral sessions
     // for text submitted while a turn is running -- same provider/tools/hooks
