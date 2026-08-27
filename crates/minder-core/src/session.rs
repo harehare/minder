@@ -296,7 +296,9 @@ impl AgentSession {
         self.dedup_stale_reads();
 
         let over_message_count = self.messages.len() > COMPACT_THRESHOLD;
-        let over_token_budget = self.last_input_tokens.is_some_and(|t| t > self.token_compact_threshold());
+        let over_token_budget = self
+            .last_input_tokens
+            .is_some_and(|t| t > self.token_compact_threshold());
         if !over_message_count && !over_token_budget {
             return Ok(());
         }
@@ -356,8 +358,7 @@ impl AgentSession {
                     && let ToolResultContent::Text(text) = &result.content
                     && !text.starts_with(Self::STALE_READ_MARKER)
                 {
-                    result.content =
-                        ToolResultContent::Text(format!("{}{path})", Self::STALE_READ_MARKER));
+                    result.content = ToolResultContent::Text(format!("{}{path})", Self::STALE_READ_MARKER));
                 }
             }
         }
@@ -405,7 +406,11 @@ impl AgentSession {
             return None;
         }
         let prompt = format!("{SUMMARIZE_PROMPT_PREFIX}{transcript}");
-        let resp = self.provider.complete(&[Message::user_text(prompt)], &[], None).await.ok()?;
+        let resp = self
+            .provider
+            .complete(&[Message::user_text(prompt)], &[], None)
+            .await
+            .ok()?;
         let text = resp.message.text();
         (!text.trim().is_empty()).then_some(text)
     }
@@ -1859,7 +1864,10 @@ mod tests {
             _tools: &[ToolSpec],
             system_prompt: Option<&str>,
         ) -> Result<ProviderResponse, ProviderError> {
-            self.captured_system_prompts.lock().unwrap().push(system_prompt.map(String::from));
+            self.captured_system_prompts
+                .lock()
+                .unwrap()
+                .push(system_prompt.map(String::from));
             Ok(self.responses.lock().unwrap().pop_front().expect("script exhausted"))
         }
     }
@@ -1883,7 +1891,11 @@ mod tests {
         session.run_turn("go").await.unwrap();
 
         let captured = provider.captured_system_prompts.lock().unwrap();
-        let last = captured.last().expect("one call").as_ref().expect("system prompt was set");
+        let last = captured
+            .last()
+            .expect("one call")
+            .as_ref()
+            .expect("system prompt was set");
         assert!(last.contains("src/a.rs"), "got: {last}");
         assert!(last.starts_with("base prompt"), "got: {last}");
     }
@@ -1895,7 +1907,10 @@ mod tests {
             ledger.push_summary(format!("summary {i}"));
         }
         let rendered = ledger.render().unwrap();
-        assert!(!rendered.contains("summary 0"), "oldest summary should have been dropped");
+        assert!(
+            !rendered.contains("summary 0"),
+            "oldest summary should have been dropped"
+        );
         assert!(rendered.contains(&format!("summary {}", DECISION_LEDGER_SUMMARY_CAP + 1)));
     }
 

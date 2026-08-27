@@ -49,8 +49,8 @@ pub fn build_provider(
                      http://localhost:1234/v1 for LM Studio)"
                         .to_string()
                 })?;
-            let model =
-                model_override.ok_or_else(|| "set MINDER_MODEL -- openai-compat has no built-in default".to_string())?;
+            let model = model_override
+                .ok_or_else(|| "set MINDER_MODEL -- openai-compat has no built-in default".to_string())?;
             let mut provider = OpenAiCompatProvider::new(base_url, model);
             if let Ok(key) = std::env::var("MINDER_OPENAI_COMPAT_API_KEY") {
                 provider = provider.with_api_key(key);
@@ -86,9 +86,13 @@ mod tests {
 
     #[test]
     fn openai_compat_without_a_base_url_is_a_clear_error() {
-        let err = build_provider("openai-compat", Some("some-model".to_string()), &ProjectConfig::default())
-            .map(|_| ())
-            .unwrap_err();
+        let err = build_provider(
+            "openai-compat",
+            Some("some-model".to_string()),
+            &ProjectConfig::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
         assert!(err.contains("MINDER_OPENAI_COMPAT_BASE_URL"), "{err}");
     }
 

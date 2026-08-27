@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use minder_core::{
-    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall,
-    ToolResultContent, ToolSpec, Usage,
+    ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolCall, ToolResultContent,
+    ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +84,10 @@ impl LlmProvider for OpenAiCompatProvider {
             stream: false,
         };
 
-        let mut req = self.client.post(format!("{}/chat/completions", self.base_url)).json(&body);
+        let mut req = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
@@ -208,7 +211,13 @@ fn to_oc_messages(messages: &[Message]) -> Vec<OcMessage> {
                 let text = m
                     .content
                     .iter()
-                    .filter_map(|b| if let ContentBlock::Text(t) = b { Some(t.as_str()) } else { None })
+                    .filter_map(|b| {
+                        if let ContentBlock::Text(t) = b {
+                            Some(t.as_str())
+                        } else {
+                            None
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 let tool_calls: Vec<OcToolCall> = m
@@ -232,7 +241,13 @@ fn to_oc_messages(messages: &[Message]) -> Vec<OcMessage> {
             Role::Tool => m
                 .content
                 .iter()
-                .filter_map(|b| if let ContentBlock::ToolResult(r) = b { Some(r) } else { None })
+                .filter_map(|b| {
+                    if let ContentBlock::ToolResult(r) = b {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                })
                 .map(|r| OcMessage {
                     role: "tool".to_string(),
                     content: Some(match &r.content {
@@ -349,7 +364,10 @@ mod tests {
             description: "runs a command".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        let resp = provider.complete(&[Message::user_text("list files")], &tools, None).await.unwrap();
+        let resp = provider
+            .complete(&[Message::user_text("list files")], &tools, None)
+            .await
+            .unwrap();
 
         assert_eq!(resp.stop_reason, StopReason::ToolUse);
         assert_eq!(resp.usage.input_tokens, 10);
@@ -375,7 +393,10 @@ mod tests {
             .await;
 
         let provider = OpenAiCompatProvider::new(server.uri(), "test-model");
-        let resp = provider.complete(&[Message::user_text("what's 6*7")], &[], None).await.unwrap();
+        let resp = provider
+            .complete(&[Message::user_text("what's 6*7")], &[], None)
+            .await
+            .unwrap();
 
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert_eq!(resp.message.text(), "42");
@@ -407,7 +428,10 @@ mod tests {
             .await;
 
         let provider = OpenAiCompatProvider::new(server.uri(), "test-model");
-        let err = provider.complete(&[Message::user_text("hi")], &[], None).await.unwrap_err();
+        let err = provider
+            .complete(&[Message::user_text("hi")], &[], None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProviderError::Api { status: 404, .. }), "{err}");
     }
 }

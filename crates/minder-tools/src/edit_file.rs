@@ -75,7 +75,11 @@ impl Tool for EditFileTool {
         match tokio::fs::write(&path, &new_content).await {
             Ok(()) => {
                 let diff = diff_files(&args.path, &content, &new_content);
-                let suffix = if fuzzy { " (matched ignoring trailing whitespace)" } else { "" };
+                let suffix = if fuzzy {
+                    " (matched ignoring trailing whitespace)"
+                } else {
+                    ""
+                };
                 ToolExecOutcome {
                     content: format!("replaced {occurrences} occurrence(s) in {}{suffix}", path.display()),
                     is_error: false,

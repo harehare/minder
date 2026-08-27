@@ -422,7 +422,11 @@ pub(crate) fn render_pinned(
     } else {
         Style::default()
     };
-    let border_style = if color { panel_style.fg(accent) } else { Style::default() };
+    let border_style = if color {
+        panel_style.fg(accent)
+    } else {
+        Style::default()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .style(panel_style)
@@ -473,14 +477,21 @@ fn render_pending(frame: &mut ratatui::Frame, area: Rect, pending: &[String], co
         return;
     }
     let overflow = pending.len() > visible;
-    let shown = if overflow { visible.saturating_sub(1) } else { pending.len().min(visible) };
+    let shown = if overflow {
+        visible.saturating_sub(1)
+    } else {
+        pending.len().min(visible)
+    };
     let mut lines: Vec<Line> = pending
         .iter()
         .take(shown)
         .map(|q| Line::styled(format!("⏳ {}", first_line(q)), style))
         .collect();
     if overflow {
-        lines.push(Line::styled(format!("… +{} more waiting", pending.len() - shown), style));
+        lines.push(Line::styled(
+            format!("… +{} more waiting", pending.len() - shown),
+            style,
+        ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -501,11 +512,7 @@ pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize
 
     let raw_lines: Vec<&str> = buffer.split('\n').collect();
     let line_text = raw_lines.get(line).copied().unwrap_or("");
-    let col_width: u16 = line_text
-        .chars()
-        .take(col)
-        .map(|c| c.width().unwrap_or(0) as u16)
-        .sum();
+    let col_width: u16 = line_text.chars().take(col).map(|c| c.width().unwrap_or(0) as u16).sum();
     let prefix_width = 2u16; // glyph/indent + one space, both single-column
     (interior.x + prefix_width + col_width, row)
 }
@@ -761,8 +768,14 @@ mod tests {
         let area = Rect::new(0, 0, 20, 4);
         // "あ" is one char but two display columns -- the column after it
         // should advance by 2, not 1.
-        assert_eq!(cursor_screen_position_for(area, "あ", 1, &[]), (area.x + 1 + 2 + 2, area.y + 2));
-        assert_eq!(cursor_screen_position_for(area, "あい", 2, &[]), (area.x + 1 + 2 + 4, area.y + 2));
+        assert_eq!(
+            cursor_screen_position_for(area, "あ", 1, &[]),
+            (area.x + 1 + 2 + 2, area.y + 2)
+        );
+        assert_eq!(
+            cursor_screen_position_for(area, "あい", 2, &[]),
+            (area.x + 1 + 2 + 4, area.y + 2)
+        );
     }
 
     #[test]
@@ -794,7 +807,10 @@ mod tests {
         let one = vec!["question one".to_string()];
         assert_eq!(bottom_area(area, "", &one).height, 5); // status + 1 pending + 2 borders + 1 input line
         let many: Vec<String> = (0..5).map(|i| format!("q{i}")).collect();
-        assert_eq!(bottom_area(area, "", &many).height, (1 + MAX_PENDING_LINES + 2 + 1) as u16);
+        assert_eq!(
+            bottom_area(area, "", &many).height,
+            (1 + MAX_PENDING_LINES + 2 + 1) as u16
+        );
     }
 
     #[test]
@@ -824,7 +840,11 @@ mod tests {
     fn plain_enter_still_submits_a_multi_line_buffer() {
         let mut box_state = InputBoxState::new(Vec::new());
         box_state.handle_key(key(KeyCode::Char('a')), InputMode::Idle, &dir());
-        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        box_state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            InputMode::Idle,
+            &dir(),
+        );
         box_state.handle_key(key(KeyCode::Char('b')), InputMode::Idle, &dir());
         match box_state.handle_key(key(KeyCode::Enter), InputMode::Idle, &dir()) {
             InputOutcome::Submit(line) => assert_eq!(line, "a\nb"),
@@ -836,12 +856,19 @@ mod tests {
     fn up_and_down_move_between_lines_instead_of_history_once_the_buffer_has_a_newline() {
         let mut box_state = InputBoxState::new(vec!["old history entry".to_string()]);
         box_state.handle_key(key(KeyCode::Char('a')), InputMode::Idle, &dir());
-        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        box_state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            InputMode::Idle,
+            &dir(),
+        );
         box_state.handle_key(key(KeyCode::Char('b')), InputMode::Idle, &dir());
         assert_eq!(box_state.cursor, 3); // after "a\nb"
 
         box_state.handle_key(key(KeyCode::Up), InputMode::Idle, &dir());
-        assert_eq!(box_state.buffer, "a\nb", "Up should move the cursor, not recall history");
+        assert_eq!(
+            box_state.buffer, "a\nb",
+            "Up should move the cursor, not recall history"
+        );
         // Column is preserved where possible, clamped to line 0's length ("a" -> col 1).
         assert_eq!(box_state.cursor, 1);
 
@@ -855,7 +882,11 @@ mod tests {
         for c in "ab".chars() {
             box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
         }
-        box_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), InputMode::Idle, &dir());
+        box_state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            InputMode::Idle,
+            &dir(),
+        );
         for c in "cd".chars() {
             box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
         }
@@ -878,8 +909,7 @@ mod tests {
 
     #[test]
     fn tab_completes_the_provider_then_a_pulled_model_name() {
-        let mut box_state =
-            InputBoxState::new(Vec::new()).with_known_models(vec!["qwen2.5-coder:14b".to_string()]);
+        let mut box_state = InputBoxState::new(Vec::new()).with_known_models(vec!["qwen2.5-coder:14b".to_string()]);
         for c in "/model oll".chars() {
             box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
         }

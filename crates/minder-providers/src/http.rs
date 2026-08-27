@@ -21,9 +21,7 @@ pub(crate) fn client_builder(request_timeout_secs: Option<u64>) -> reqwest::Clie
 /// -- surface that guess instead of reqwest's raw "connection refused" text.
 pub(crate) fn describe_transport_error(e: reqwest::Error, base_url: &str) -> ProviderError {
     if e.is_connect() {
-        ProviderError::Transport(format!(
-            "could not connect to {base_url} -- is the server running?"
-        ))
+        ProviderError::Transport(format!("could not connect to {base_url} -- is the server running?"))
     } else {
         ProviderError::Transport(e.to_string())
     }

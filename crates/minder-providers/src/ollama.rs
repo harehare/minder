@@ -114,7 +114,10 @@ impl LlmProvider for OllamaProvider {
             .map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         if !status.is_success() {
             return Err(ProviderError::Api {
@@ -162,7 +165,10 @@ impl LlmProvider for OllamaProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| describe_transport_error(e, &self.base_url))?;
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 body: text,
@@ -203,7 +209,10 @@ impl LlmProvider for OllamaProvider {
             .map_err(|e| describe_transport_error(e, &self.base_url))?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| describe_transport_error(e, &self.base_url))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| describe_transport_error(e, &self.base_url))?;
         if !status.is_success() {
             return Err(ProviderError::Api {
                 status: status.as_u16(),
@@ -211,7 +220,8 @@ impl LlmProvider for OllamaProvider {
             });
         }
 
-        let parsed: OlTagsResponse = serde_json::from_str(&text).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        let parsed: OlTagsResponse =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
         Ok(parsed.models.into_iter().map(|m| m.name).collect())
     }
 
@@ -815,10 +825,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
             .mount(&server)
             .await;
-        let pull_body = concat!(
-            "{\"status\": \"pulling manifest\"}\n",
-            "{\"status\": \"success\"}\n",
-        );
+        let pull_body = concat!("{\"status\": \"pulling manifest\"}\n", "{\"status\": \"success\"}\n",);
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/pull"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(pull_body, "application/x-ndjson"))
@@ -874,8 +881,14 @@ mod tests {
             .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("ollama serve"), "expected an `ollama serve` hint, got: {msg}");
-        assert!(msg.contains(&base_url), "expected the base url in the message, got: {msg}");
+        assert!(
+            msg.contains("ollama serve"),
+            "expected an `ollama serve` hint, got: {msg}"
+        );
+        assert!(
+            msg.contains(&base_url),
+            "expected the base url in the message, got: {msg}"
+        );
     }
 
     #[tokio::test]

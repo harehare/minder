@@ -1571,7 +1571,9 @@ mod tests {
     fn hint_at_cursor_with(helper: &SlashCommandHelper, line: &str) -> Option<String> {
         let history = rustyline::history::MemHistory::new();
         let ctx = Context::new(&history);
-        helper.hint(line, line.len(), &ctx).map(|h| rustyline::hint::Hint::display(&h).to_string())
+        helper
+            .hint(line, line.len(), &ctx)
+            .map(|h| rustyline::hint::Hint::display(&h).to_string())
     }
 
     fn hint_at_cursor(line: &str) -> Option<String> {
