@@ -172,10 +172,16 @@ fn load_project_config(agent_dir: &Path) -> config::ProjectConfig {
 }
 
 async fn build_session(output: OutputFormat) -> BuiltSession {
-    build_session_with_sink(output, Arc::new(tui::DirectPrintSink)).await
+    match build_session_with_sink(output, Arc::new(tui::DirectPrintSink)).await {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 }
 
-async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::OutputSink>) -> BuiltSession {
+async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::OutputSink>) -> Result<BuiltSession, String> {
     let working_dir = std::env::current_dir().expect("cwd");
     let agent_dir = working_dir.join(".agent");
     let cfg = load_project_config(&agent_dir);
@@ -199,10 +205,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
             }
             plugins
         }
-        Err(e) => {
-            eprintln!("failed to load plugins: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load plugins: {e}")),
     };
 
     let has_project_hooks = agent_dir.join("hooks").is_dir() || agent_dir.join("hooks.mq").is_file();
@@ -214,10 +217,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
             let boxed: Box<dyn HookPort> = Box::new(engine);
             Some(Arc::new(tokio::sync::Mutex::new(boxed)))
         }
-        Err(e) => {
-            eprintln!("failed to load hooks: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load hooks: {e}")),
     };
     let checkpoint = Arc::new(Checkpoint::new());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
@@ -249,10 +249,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
                 tools.push(Arc::new(SkillTool::new(skills)));
             }
         }
-        Err(e) => {
-            eprintln!("failed to load skills: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load skills: {e}")),
     }
 
     #[cfg(feature = "wasm")]
@@ -263,10 +260,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
             }
             tools.extend(plugins.into_iter().map(Arc::from));
         }
-        Err(e) => {
-            eprintln!("failed to load wasm plugins: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load wasm plugins: {e}")),
     }
 
     #[cfg(feature = "mcp")]
@@ -277,10 +271,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
             }
             tools.extend(mcp_tools.into_iter().map(Arc::from));
         }
-        Err(e) => {
-            eprintln!("failed to load mcp servers: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load mcp servers: {e}")),
     }
 
     #[cfg(feature = "mcp")]
@@ -297,8 +288,10 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
                 tools.extend(mcp_tools.into_iter().map(Arc::from));
             }
             Err(e) => {
-                eprintln!("failed to load mcp servers for plugin '{}': {e}", plugin.manifest.name);
-                std::process::exit(1);
+                return Err(format!(
+                    "failed to load mcp servers for plugin '{}': {e}",
+                    plugin.manifest.name
+                ));
             }
         }
     }
@@ -351,10 +344,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
                 }
             }
         }
-        Err(e) => {
-            eprintln!("failed to load subagents: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to load subagents: {e}")),
     }
     let provider_factory: Arc<ProviderFactory> = {
         let cfg = cfg.clone();
@@ -390,11 +380,10 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
 
     reporter.on_provider_changed(provider.id(), provider.model()).await;
     if let Err(e) = provider.ensure_model_available(reporter.as_ref()).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        return Err(format!("error: {e}"));
     }
 
-    BuiltSession {
+    Ok(BuiltSession {
         session,
         provider,
         cfg,
@@ -406,7 +395,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         show_status,
         todo,
         checkpoint,
-    }
+    })
 }
 
 enum Command {
@@ -666,7 +655,17 @@ async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend)
     {
         let color = color_enabled(std::io::stdout().is_terminal());
         let sink: Arc<dyn tui::OutputSink> = Arc::new(tui::FullscreenSink::new(handles.clone(), color));
-        let built = build_session_with_sink(output, sink).await;
+        // No event loop reads keystrokes until `run_tui_repl` starts -- show
+        // the box as disabled rather than blank until then.
+        handles.input.lock().unwrap().disabled_message = Some("please wait, setting up the session…".to_string());
+        let built = match build_session_with_sink(output, sink).await {
+            Ok(built) => built,
+            Err(e) => {
+                tui::restore_terminal();
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
         return (built, ReplBackend::Tui(handles));
     }
     (build_session(output).await, ReplBackend::Fallback)

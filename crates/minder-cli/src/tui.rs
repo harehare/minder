@@ -59,7 +59,7 @@ pub(crate) fn init() -> std::io::Result<PinnedHandles> {
 }
 
 /// Undoes `init`'s terminal setup -- shared by the panic hook and `run_tui_repl`'s own cleanup.
-fn restore_terminal() {
+pub(crate) fn restore_terminal() {
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     let _ = ratatui::try_restore();
 }
@@ -88,6 +88,14 @@ pub(crate) async fn run_tui_repl(
     let initial_history = history_path.as_deref().map(load_history).unwrap_or_default();
     let known_models = built.provider.list_models().await.unwrap_or_default();
     let mut box_state = InputBoxState::new(initial_history).with_known_models(known_models);
+    // Discards keystrokes buffered before any event loop existed to read
+    // them (e.g. during a first-run model pull) -- else they'd replay as a
+    // surprise burst, possibly auto-submitting a stray Enter.
+    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
+        }
+    }
     let mut events = EventStream::new();
     // What `spawn_side_question` needs to build its own ephemeral sessions
     // for text submitted while a turn is running -- same provider/tools/hooks
