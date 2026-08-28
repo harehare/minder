@@ -449,6 +449,8 @@ def on_tool_call(call):
   ]);
 ```
 
+`default_policy.mq` also defines a baseline `before_agent_start` and `on_tool_result` aimed at prompt injection: local models don't reliably enforce an instruction hierarchy the way hosted frontier models do, so tool output (file contents, command output, fetched web pages) needs to be labeled untrusted explicitly rather than left implicit. `before_agent_start` appends a fixed paragraph to the system prompt telling the model to treat tool output as data, never as instructions; `on_tool_result` scans each result against `default_injection_patterns()` (another plain data array, e.g. `"ignore previous instructions"`) and, on a hit, prepends a warning line rather than blocking — matched text isn't proof of an attack, and an agent working with untrusted data still needs to see it. Both compose the same way: `default_before_agent_start(prompt)` / `default_on_tool_result_with(result, extra_patterns)` from your own override.
+
 ### Overriding a tool's result
 
 `on_tool_call` can also `override`: `{"action": "override", "value": {"content": "...", "is_error": false, "metadata": null}}` supplies the tool's result directly. The real tool never runs, but the result still flows through `on_tool_result` afterward like any other — useful for mocking a tool in tests, or short-circuiting it once some condition is met:
