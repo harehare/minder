@@ -53,13 +53,36 @@ async fn fetch_inner(
 
     let truncated = bytes.len() > max_bytes;
     let slice = &bytes[..bytes.len().min(max_bytes)];
-    let body = String::from_utf8_lossy(slice).into_owned();
+    let body = strip_invisible_unicode(&String::from_utf8_lossy(slice));
 
     Ok(FetchResult {
         status,
         body,
         truncated,
     })
+}
+
+/// Drops characters invisible to a human reading the rendered page but fully
+/// legible to a model reading raw text -- zero-width joiners/spaces, the
+/// Unicode Tag block (U+E0000-U+E007F, the "ASCII smuggling" range seen
+/// abusing several AI tools in 2024: it can encode arbitrary hidden ASCII
+/// instructions inside otherwise-innocuous-looking text), and bidi
+/// direction-override controls (Trojan Source-style visual reordering).
+/// Applied to every fetched page -- this is character-level hygiene, not a
+/// project-configurable policy, so it lives here rather than in a hook.
+fn strip_invisible_unicode(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            !matches!(c,
+                '\u{200B}'..='\u{200D}' // zero-width space/non-joiner/joiner
+                | '\u{2060}'            // word joiner
+                | '\u{FEFF}'            // zero-width no-break space / BOM
+                | '\u{202A}'..='\u{202E}' // bidi embedding/override controls
+                | '\u{2066}'..='\u{2069}' // bidi isolate controls
+                | '\u{E0000}'..='\u{E007F}' // Unicode tag block
+            )
+        })
+        .collect()
 }
 
 pub struct WebFetchTool {
@@ -288,6 +311,22 @@ mod tests {
             .execute(serde_json::json!({"url": "file:///etc/passwd"}), &ctx())
             .await;
         assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn strips_hidden_unicode_tag_characters_used_for_ascii_smuggling() {
+        let server = wiremock::MockServer::start().await;
+        // U+E0048 U+E0069 = tag-encoded "hi", invisible in any renderer.
+        let body = format!("Visible text{}{} more visible text", '\u{E0048}', '\u{E0069}');
+        wiremock::Mock::given(wiremock::matchers::path("/hidden"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let outcome = WebFetchTool::new_allowing_loopback()
+            .execute(serde_json::json!({"url": format!("{}/hidden", server.uri())}), &ctx())
+            .await;
+        assert_eq!(outcome.content, "Visible text more visible text");
     }
 
     #[tokio::test]

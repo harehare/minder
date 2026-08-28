@@ -299,7 +299,7 @@ Always registered:
 | `git_log` | Shows commit history |
 | `git_status` | Shows `git status` |
 | `git_commit` | Creates a commit |
-| `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees) |
+| `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees). Also strips zero-width/bidi-override/Unicode-tag characters from the response — the hidden-text tricks behind "ASCII smuggling" prompt injection — before it ever reaches the model |
 | `agent` | Delegates a task to a named subagent — always available via a built-in `general-purpose` subagent, no project config required; see [Subagents](#subagents) |
 | `todo_write` | Replaces the current todo list with a full updated one, so the model can plan and track progress on a multi-step task |
 
