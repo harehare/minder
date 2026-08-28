@@ -69,6 +69,62 @@ impl OllamaProvider {
             .build()
             .expect("reqwest client config is static and valid")
     }
+
+    /// Drains `resp`'s NDJSON pull-progress stream, redrawing `reporter`'s
+    /// `progress_key` spinner label in place -- see `ensure_model_available`.
+    /// Previously this printed a new permanent line every ~2s (dozens of
+    /// scrollback lines for a large model), which is what the throttle
+    /// comment below used to guard against; now it only throttles how often
+    /// the spinner label itself is rewritten.
+    async fn pull_progress_loop(
+        &self,
+        resp: reqwest::Response,
+        reporter: &dyn Reporter,
+        progress_key: &str,
+    ) -> Result<(), ProviderError> {
+        let mut stream = resp.bytes_stream();
+        let mut line_buf: Vec<u8> = Vec::new();
+        // Redraws at most once per 2s -- pull progress lines arrive fast
+        // enough to otherwise thrash the spinner label.
+        let mut last_reported = std::time::Instant::now() - Duration::from_secs(2);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| describe_transport_error(e, &self.base_url))?;
+            line_buf.extend_from_slice(&chunk);
+            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let progress: OlPullProgress =
+                    serde_json::from_str(line).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+                if let Some(err) = progress.error {
+                    return Err(ProviderError::Api { status: 0, body: err });
+                }
+                if progress.status == "success" {
+                    reporter.on_notice(&format!("model '{}' pulled.", self.model)).await;
+                } else if let (Some(completed), Some(total)) = (progress.completed, progress.total)
+                    && total > 0
+                    && last_reported.elapsed() > Duration::from_secs(2)
+                {
+                    reporter
+                        .on_progress(
+                            progress_key,
+                            &format!(
+                                "Downloading {} -- {} ({}%)",
+                                self.model,
+                                progress.status,
+                                completed * 100 / total
+                            ),
+                        )
+                        .await;
+                    last_reported = std::time::Instant::now();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -230,6 +286,8 @@ impl LlmProvider for OllamaProvider {
     }
 
     async fn ensure_model_available(&self, reporter: &dyn Reporter) -> Result<(), ProviderError> {
+        const PROGRESS_KEY: &str = "model_pull";
+
         if self.list_models().await?.iter().any(|m| m == &self.model) {
             return Ok(());
         }
@@ -254,40 +312,9 @@ impl LlmProvider for OllamaProvider {
             });
         }
 
-        let mut stream = resp.bytes_stream();
-        let mut line_buf: Vec<u8> = Vec::new();
-        // Reports at most once per 2s -- pull progress lines arrive fast
-        // enough to otherwise spam the display.
-        let mut last_reported = std::time::Instant::now() - Duration::from_secs(2);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| describe_transport_error(e, &self.base_url))?;
-            line_buf.extend_from_slice(&chunk);
-            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = line_buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line);
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let progress: OlPullProgress =
-                    serde_json::from_str(line).map_err(|e| ProviderError::Deserialize(e.to_string()))?;
-                if let Some(err) = progress.error {
-                    return Err(ProviderError::Api { status: 0, body: err });
-                }
-                if progress.status == "success" {
-                    reporter.on_notice(&format!("model '{}' pulled.", self.model)).await;
-                } else if let (Some(completed), Some(total)) = (progress.completed, progress.total)
-                    && total > 0
-                    && last_reported.elapsed() > Duration::from_secs(2)
-                {
-                    reporter
-                        .on_notice(&format!("  {} ({}%)", progress.status, completed * 100 / total))
-                        .await;
-                    last_reported = std::time::Instant::now();
-                }
-            }
-        }
-        Ok(())
+        let result = self.pull_progress_loop(resp, reporter, PROGRESS_KEY).await;
+        reporter.on_progress_end(PROGRESS_KEY).await;
+        result
     }
 }
 
@@ -650,6 +677,8 @@ mod tests {
     struct RecordingReporter {
         deltas: std::sync::Mutex<Vec<String>>,
         notices: std::sync::Mutex<Vec<String>>,
+        progress: std::sync::Mutex<Vec<(String, String)>>,
+        progress_ended: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -659,6 +688,12 @@ mod tests {
         }
         async fn on_notice(&self, text: &str) {
             self.notices.lock().unwrap().push(text.to_string());
+        }
+        async fn on_progress(&self, key: &str, label: &str) {
+            self.progress.lock().unwrap().push((key.to_string(), label.to_string()));
+        }
+        async fn on_progress_end(&self, key: &str) {
+            self.progress_ended.lock().unwrap().push(key.to_string());
         }
     }
 
@@ -839,6 +874,43 @@ mod tests {
         let notices = reporter.notices.lock().unwrap();
         assert!(notices.iter().any(|n| n.contains("downloading")), "{notices:?}");
         assert!(notices.iter().any(|n| n.contains("pulled")), "{notices:?}");
+        assert_eq!(*reporter.progress_ended.lock().unwrap(), vec!["model_pull".to_string()]);
+    }
+
+    /// Regression: percentage updates used to go through `on_notice`, which
+    /// leaves a new permanent scrollback line per update (dozens for a large
+    /// model) instead of redrawing one spinner label in place.
+    #[tokio::test]
+    async fn ensure_model_available_reports_percentage_progress_via_on_progress_not_on_notice() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
+            .mount(&server)
+            .await;
+        let pull_body = concat!(
+            "{\"status\": \"downloading\", \"completed\": 50, \"total\": 100}\n",
+            "{\"status\": \"success\"}\n",
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/pull"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(pull_body, "application/x-ndjson"))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new("qwen3-coder:30b-a3b").with_base_url(server.uri());
+        let reporter = RecordingReporter::default();
+        provider.ensure_model_available(&reporter).await.unwrap();
+
+        let progress = reporter.progress.lock().unwrap();
+        assert!(
+            progress
+                .iter()
+                .any(|(key, label)| key == "model_pull" && label.contains("50%")),
+            "{progress:?}"
+        );
+        let notices = reporter.notices.lock().unwrap();
+        assert!(!notices.iter().any(|n| n.contains('%')), "{notices:?}");
     }
 
     #[tokio::test]
@@ -862,6 +934,8 @@ mod tests {
         let reporter = RecordingReporter::default();
         let err = provider.ensure_model_available(&reporter).await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+        // The spinner label must still be cleared on failure, not left stuck.
+        assert_eq!(*reporter.progress_ended.lock().unwrap(), vec!["model_pull".to_string()]);
     }
 
     #[tokio::test]

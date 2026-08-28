@@ -294,6 +294,7 @@ impl InputBoxState {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
             mode,
+            disabled_message: None,
         }
     }
 }

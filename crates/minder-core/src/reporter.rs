@@ -51,6 +51,16 @@ pub trait Reporter: Send + Sync {
     /// live display renders it the same way as everything else instead of
     /// a caller writing straight to stdout underneath it.
     async fn on_notice(&self, _text: &str) {}
+    /// Fired repeatedly during a long-running background step identified by
+    /// `key` (currently just an Ollama model pull) with a fresh `label` --
+    /// an interactive reporter redraws this in place (like the turn/tool
+    /// spinner) instead of printing a new line per update; a non-interactive
+    /// one may log occasional plain lines. The caller still emits its own
+    /// `on_notice`/error for the final outcome.
+    async fn on_progress(&self, _key: &str, _label: &str) {}
+    /// Clears whatever `on_progress(key, ...)` was displaying, on either
+    /// success or failure of the operation it tracked.
+    async fn on_progress_end(&self, _key: &str) {}
 }
 
 /// Default reporter: observes nothing, prints nothing.

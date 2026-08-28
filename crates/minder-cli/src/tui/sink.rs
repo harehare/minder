@@ -50,6 +50,9 @@ pub(crate) struct PinnedInputSnapshot {
     pub(crate) buffer: String,
     pub(crate) cursor: usize,
     pub(crate) mode: InputMode,
+    /// Shown instead of `buffer` (no cursor) before a real `InputBoxState`
+    /// exists, e.g. during the first-run model pull.
+    pub(crate) disabled_message: Option<String>,
 }
 
 /// The full conversation transcript, redrawn as part of every frame --
@@ -175,16 +178,24 @@ impl OutputSink for FullscreenSink {
         );
     }
 
+    /// Repaints the whole frame, not just the status string -- a spinner
+    /// driven only by `redraw_status` (e.g. the model pull's progress)
+    /// otherwise never appears on screen.
     fn redraw_status(&self, text: &str) {
         *self.handles.status.lock().unwrap() = strip_ansi(text);
+        redraw_frame(
+            &self.handles.terminal,
+            &self.handles.transcript,
+            &self.handles.input,
+            &self.handles.status,
+            &self.handles.pending,
+            self.color,
+        );
     }
 }
 
 /// Splits `text` into ANSI-styled `Line`s, appends them to the shared
-/// transcript, and redraws the full frame. No-op on empty text.
-///
-/// Locks `terminal` before `transcript`, same order as `tui::redraw` -- keep
-/// it consistent across both call sites or it deadlocks.
+/// transcript, then redraws -- see `redraw_frame`. No-op on empty text.
 #[allow(clippy::too_many_arguments)]
 fn append_text(
     terminal: &Mutex<AppTerminal>,
@@ -208,40 +219,64 @@ fn append_text(
     if rendered.is_empty() {
         return;
     }
+    transcript.lock().unwrap().push(rendered);
+    redraw_frame(terminal, transcript, input, status, pending, color);
+}
 
+/// Repaints the whole frame from current shared state.
+///
+/// Locks `terminal` before `transcript`, same order as `tui::redraw` -- keep
+/// it consistent or it deadlocks.
+#[allow(clippy::too_many_arguments)]
+fn redraw_frame(
+    terminal: &Mutex<AppTerminal>,
+    transcript: &Mutex<Transcript>,
+    input: &Mutex<PinnedInputSnapshot>,
+    status: &Mutex<String>,
+    pending: &Mutex<Vec<String>>,
+    color: bool,
+) {
     let snapshot = input.lock().unwrap().clone();
     let status_text = status.lock().unwrap().clone();
     let pending_snapshot = pending.lock().unwrap().clone();
+    let (display_buffer, display_cursor, show_cursor) = display_state(&snapshot);
 
     let mut term = terminal.lock().unwrap();
     let mut t = transcript.lock().unwrap();
-    t.push(rendered);
     let _ = term.draw(|frame| {
         let area = frame.area();
-        let bottom = super::input_box::bottom_area(area, &snapshot.buffer, &pending_snapshot);
+        let bottom = super::input_box::bottom_area(area, display_buffer, &pending_snapshot);
         t.render(
             frame,
-            super::input_box::transcript_area(area, &snapshot.buffer, &pending_snapshot),
+            super::input_box::transcript_area(area, display_buffer, &pending_snapshot),
         );
         super::input_box::render_pinned(
             frame,
             bottom,
-            &snapshot.buffer,
-            snapshot.cursor,
+            display_buffer,
+            display_cursor,
             snapshot.mode,
             &status_text,
             &pending_snapshot,
             color,
         );
-        if bottom.height > 0 {
+        if show_cursor && bottom.height > 0 {
             frame.set_cursor_position(super::input_box::cursor_screen_position_for(
                 bottom,
-                &snapshot.buffer,
-                snapshot.cursor,
+                display_buffer,
+                display_cursor,
                 &pending_snapshot,
             ));
         }
     });
+}
+
+/// See `PinnedInputSnapshot::disabled_message`.
+fn display_state(snapshot: &PinnedInputSnapshot) -> (&str, usize, bool) {
+    match &snapshot.disabled_message {
+        Some(msg) => (msg.as_str(), 0, false),
+        None => (snapshot.buffer.as_str(), snapshot.cursor, true),
+    }
 }
 
 /// Parses embedded ANSI SGR sequences into a styled `Line` (ratatui renders
@@ -389,6 +424,28 @@ mod tests {
 
     fn line(text: &str) -> Line<'static> {
         Line::from(text.to_string())
+    }
+
+    #[test]
+    fn disabled_message_replaces_the_buffer_and_hides_the_cursor() {
+        let snapshot = PinnedInputSnapshot {
+            buffer: "typed but ignored".to_string(),
+            cursor: 3,
+            mode: InputMode::Idle,
+            disabled_message: Some("please wait…".to_string()),
+        };
+        assert_eq!(display_state(&snapshot), ("please wait…", 0, false));
+    }
+
+    #[test]
+    fn no_disabled_message_shows_the_real_buffer_and_cursor() {
+        let snapshot = PinnedInputSnapshot {
+            buffer: "hello".to_string(),
+            cursor: 3,
+            mode: InputMode::Idle,
+            disabled_message: None,
+        };
+        assert_eq!(display_state(&snapshot), ("hello", 3, true));
     }
 
     #[test]

@@ -555,6 +555,40 @@ impl Reporter for TerminalReporter {
     async fn on_notice(&self, text: &str) {
         self.print_guarded(false, text).await;
     }
+
+    /// Interactive: redraws `key`'s spinner label in place (updating just
+    /// the text, not the start time, so elapsed keeps counting from the
+    /// first call) instead of `on_notice`'s one-new-line-per-update, which
+    /// used to leave a long model pull's progress as dozens of permanent
+    /// scrollback lines. Non-interactive: falls back to occasional plain
+    /// lines (via `on_notice`) so progress still shows up in a log/pipe.
+    async fn on_progress(&self, key: &str, label: &str) {
+        if !self.interactive {
+            self.on_notice(label).await;
+            return;
+        }
+        let mut state = self.spinner.lock().await;
+        match state.labels.get_mut(key) {
+            Some((current, _)) => *current = label.to_string(),
+            None => {
+                state
+                    .labels
+                    .insert(key.to_string(), (label.to_string(), Instant::now()));
+            }
+        }
+    }
+
+    async fn on_progress_end(&self, key: &str) {
+        if !self.interactive {
+            return;
+        }
+        let mut state = self.spinner.lock().await;
+        state.labels.remove(key);
+        if state.labels.is_empty() {
+            drop(state);
+            self.sink.redraw_status("");
+        }
+    }
 }
 
 /// Picks out the argument most useful for a one-line "what is this tool call
