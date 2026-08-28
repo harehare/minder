@@ -314,6 +314,12 @@ const MAX_INPUT_LINES: usize = 6;
 /// Most pinned pending-question lines shown at once above the input box.
 const MAX_PENDING_LINES: usize = 3;
 
+/// Brand row pinned directly above the status line, always visible next to
+/// the input box -- otherwise a fresh session shows only the scroll-away
+/// startup banner at the very top with a large empty gap above the pinned
+/// box.
+const LOGO_TEXT: &str = "minder";
+
 fn pending_line_count(pending: &[String]) -> usize {
     pending.len().min(MAX_PENDING_LINES)
 }
@@ -400,7 +406,16 @@ pub(crate) fn render_pinned(
         Color::Yellow
     };
 
-    let (status_area, pending_area, box_area, interior) = split_bottom(area, pending);
+    let (logo_area, status_area, pending_area, box_area, interior) = split_bottom(area, pending);
+
+    if let Some(logo_area) = logo_area {
+        let style = if color {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::styled(LOGO_TEXT, style)), logo_area);
+    }
 
     if let Some(status_area) = status_area {
         let style = if color {
@@ -502,7 +517,7 @@ fn first_line(text: &str) -> &str {
 
 /// Cursor's on-screen `(x, y)` for `buffer`/`cursor` rendered into `area` by `render_pinned`.
 pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize, pending: &[String]) -> (u16, u16) {
-    let Some(interior) = split_bottom(area, pending).3 else {
+    let Some(interior) = split_bottom(area, pending).4 else {
         return (area.x, area.y);
     };
     let (line, col) = line_col(buffer, cursor);
@@ -517,12 +532,13 @@ pub(crate) fn cursor_screen_position_for(area: Rect, buffer: &str, cursor: usize
     (interior.x + prefix_width + col_width, row)
 }
 
-/// Rows reserved at the bottom of a full frame: status line + pending-question
-/// lines (up to `MAX_PENDING_LINES`) + bordered input box (up to `MAX_INPUT_LINES` lines).
+/// Rows reserved at the bottom of a full frame: brand row + status line +
+/// pending-question lines (up to `MAX_PENDING_LINES`) + bordered input box
+/// (up to `MAX_INPUT_LINES` lines).
 pub(crate) fn bottom_area(frame_area: Rect, buffer: &str, pending: &[String]) -> Rect {
     let content_lines = visible_line_count(buffer) as u16;
     let pending_lines = pending_line_count(pending) as u16;
-    let height = (1 + pending_lines + 2 + content_lines).min(frame_area.height);
+    let height = (2 + pending_lines + 2 + content_lines).min(frame_area.height);
     Rect {
         y: frame_area.y + frame_area.height - height,
         height,
@@ -538,21 +554,34 @@ pub(crate) fn transcript_area(frame_area: Rect, buffer: &str, pending: &[String]
     }
 }
 
-/// Splits a full bottom `area` into (status line, pending-question panel,
-/// bordered box, box interior) -- each `None` once too short to fit.
+/// Splits a full bottom `area` into (brand row, status line, pending-question
+/// panel, bordered box, box interior) -- each `None` once too short to fit.
 #[allow(clippy::type_complexity)]
-fn split_bottom(area: Rect, pending: &[String]) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
+fn split_bottom(
+    area: Rect,
+    pending: &[String],
+) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     if area.height == 0 {
-        return (None, None, None, None);
+        return (None, None, None, None, None);
     }
-    let status = Some(Rect { height: 1, ..area });
+    let logo = Some(Rect { height: 1, ..area });
     if area.height == 1 {
-        return (status, None, None, None);
+        return (logo, None, None, None, None);
     }
     let rest = Rect {
         y: area.y + 1,
         height: area.height - 1,
         ..area
+    };
+
+    let status = Some(Rect { height: 1, ..rest });
+    if rest.height == 1 {
+        return (logo, status, None, None, None);
+    }
+    let rest = Rect {
+        y: rest.y + 1,
+        height: rest.height - 1,
+        ..rest
     };
 
     let wanted_pending = pending_line_count(pending) as u16;
@@ -575,11 +604,11 @@ fn split_bottom(area: Rect, pending: &[String]) -> (Option<Rect>, Option<Rect>, 
     };
 
     if rest.height == 0 {
-        return (status, pending_area, None, None);
+        return (logo, status, pending_area, None, None);
     }
     let box_area = rest;
     let interior = (box_area.height > 2).then(|| box_area.inner(Margin::new(1, 1)));
-    (status, pending_area, Some(box_area), interior)
+    (logo, status, pending_area, Some(box_area), interior)
 }
 
 fn char_boundary(s: &str, char_idx: usize) -> usize {
@@ -764,25 +793,25 @@ mod tests {
 
     #[test]
     fn cursor_screen_position_accounts_for_double_width_chars_before_the_cursor() {
-        // Status row + top border + 1 input line + bottom border.
-        let area = Rect::new(0, 0, 20, 4);
+        // Brand row + status row + top border + 1 input line + bottom border.
+        let area = Rect::new(0, 0, 20, 5);
         // "あ" is one char but two display columns -- the column after it
         // should advance by 2, not 1.
         assert_eq!(
             cursor_screen_position_for(area, "あ", 1, &[]),
-            (area.x + 1 + 2 + 2, area.y + 2)
+            (area.x + 1 + 2 + 2, area.y + 3)
         );
         assert_eq!(
             cursor_screen_position_for(area, "あい", 2, &[]),
-            (area.x + 1 + 2 + 4, area.y + 2)
+            (area.x + 1 + 2 + 4, area.y + 3)
         );
     }
 
     #[test]
-    fn bottom_area_is_the_last_four_rows_of_a_tall_frame_for_a_single_line_buffer() {
+    fn bottom_area_is_the_last_five_rows_of_a_tall_frame_for_a_single_line_buffer() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area, "", &[]), Rect::new(0, 20, 80, 4));
-        assert_eq!(transcript_area(area, "", &[]), Rect::new(0, 0, 80, 20));
+        assert_eq!(bottom_area(area, "", &[]), Rect::new(0, 19, 80, 5));
+        assert_eq!(transcript_area(area, "", &[]), Rect::new(0, 0, 80, 19));
     }
 
     #[test]
@@ -795,21 +824,21 @@ mod tests {
     #[test]
     fn bottom_area_grows_with_extra_buffer_lines_up_to_the_cap() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(bottom_area(area, "one\ntwo", &[]).height, 5); // status + 2 borders + 2 lines
+        assert_eq!(bottom_area(area, "one\ntwo", &[]).height, 6); // brand + status + 2 borders + 2 lines
         // 10 lines is more than MAX_INPUT_LINES -- height caps instead of growing further.
         let many = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
-        assert_eq!(bottom_area(area, many, &[]).height, 3 + MAX_INPUT_LINES as u16);
+        assert_eq!(bottom_area(area, many, &[]).height, 4 + MAX_INPUT_LINES as u16);
     }
 
     #[test]
     fn bottom_area_grows_for_pending_questions_and_caps_at_max_pending_lines() {
         let area = Rect::new(0, 0, 80, 24);
         let one = vec!["question one".to_string()];
-        assert_eq!(bottom_area(area, "", &one).height, 5); // status + 1 pending + 2 borders + 1 input line
+        assert_eq!(bottom_area(area, "", &one).height, 6); // brand + status + 1 pending + 2 borders + 1 input line
         let many: Vec<String> = (0..5).map(|i| format!("q{i}")).collect();
         assert_eq!(
             bottom_area(area, "", &many).height,
-            (1 + MAX_PENDING_LINES + 2 + 1) as u16
+            (2 + MAX_PENDING_LINES + 2 + 1) as u16
         );
     }
 
@@ -818,7 +847,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let many: Vec<String> = (0..5).map(|i| format!("q{i}")).collect();
         let bottom = bottom_area(area, "", &many);
-        let (_, pending_area, box_area, _) = split_bottom(bottom, &many);
+        let (_, _, pending_area, box_area, _) = split_bottom(bottom, &many);
         assert_eq!(pending_area.unwrap().height, MAX_PENDING_LINES as u16);
         assert!(box_area.is_some());
     }
