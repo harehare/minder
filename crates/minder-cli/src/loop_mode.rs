@@ -229,8 +229,8 @@ mod tests {
     }
 
     use minder_core::{
-        ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, Tool, ToolCall,
-        ToolContext, ToolExecOutcome, ToolSpec, Usage,
+        AskChannel, ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, Tool,
+        ToolCall, ToolContext, ToolExecOutcome, ToolSpec, Usage,
     };
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -321,6 +321,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         };
         let mut session = minder_core::AgentSession::new(
             Arc::new(provider),

@@ -303,11 +303,11 @@ impl InputBoxState {
 /// the box reads as a distinct panel (Codex/Claude Code-style) instead of
 /// just a bordered rule -- fixed rather than derived from the terminal's own
 /// palette so it looks the same everywhere. Only used when `color` is on.
-const PANEL_BG: Color = Color::Rgb(30, 32, 38);
+pub(super) const PANEL_BG: Color = Color::Rgb(30, 32, 38);
 /// Foreground for text drawn on `PANEL_BG`, explicit rather than the
 /// terminal's own default -- a dark panel over a light-theme default
 /// foreground would otherwise be unreadable.
-const PANEL_FG: Color = Color::Rgb(220, 220, 225);
+pub(super) const PANEL_FG: Color = Color::Rgb(220, 220, 225);
 
 /// Most input lines shown at once before the box scrolls internally instead of growing further.
 const MAX_INPUT_LINES: usize = 6;

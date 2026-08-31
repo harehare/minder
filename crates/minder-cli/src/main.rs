@@ -21,10 +21,11 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
 use minder_hooks::HookEngine;
 use minder_tools::{
-    AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, BashTool, Checkpoint, CheckpointedTool, DeleteFileTool,
-    EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool, GrepTool, ListAgentsTool, LsTool,
-    ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
-    builtin_subagents, discover_all_skills, discover_plugins, discover_subagents, format_checklist,
+    AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, AskUserQuestionTool, BashTool, Checkpoint,
+    CheckpointedTool, DeleteFileTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool,
+    GrepTool, ListAgentsTool, LsTool, ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WriteFileTool, builtin_subagents, discover_all_skills, discover_plugins, discover_subagents,
+    format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -56,6 +57,11 @@ asked. Use `delete_file` (not `bash rm`) to remove a file -- it's recoverable, `
 Use `todo_write` to plan and track progress on any task with several non-trivial steps -- keep at \
 most one item `in_progress` at a time and mark items `completed` as soon as they're actually done. \
 Skip it for a single quick action.
+
+Use `ask_user_question` for a genuine multiple-choice decision point (which of these approaches, \
+which file, yes/no) so the user can pick from a real list instead of typing a reply -- not a \
+substitute for ordinary text replies, and it may be unavailable outside an interactive session, in \
+which case just ask in your reply text instead.
 
 Keep replies short and grounded in what the tools actually returned.";
 
@@ -173,7 +179,7 @@ fn load_project_config(agent_dir: &Path) -> config::ProjectConfig {
 
 async fn build_session(output: OutputFormat) -> BuiltSession {
     match build_session_with_sink(output, Arc::new(tui::DirectPrintSink)).await {
-        Ok(built) => built,
+        Ok((built, _ask_rx)) => built, // no UI here, so `ask_user_question` fails fast instead of hanging
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
@@ -181,16 +187,21 @@ async fn build_session(output: OutputFormat) -> BuiltSession {
     }
 }
 
-async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::OutputSink>) -> Result<BuiltSession, String> {
+async fn build_session_with_sink(
+    output: OutputFormat,
+    sink: Arc<dyn tui::OutputSink>,
+) -> Result<(BuiltSession, minder_core::AskReceiver), String> {
     let working_dir = std::env::current_dir().expect("cwd");
     let agent_dir = working_dir.join(".agent");
     let cfg = load_project_config(&agent_dir);
     let provider = select_provider(&cfg);
+    let (ask_tx, ask_rx) = minder_core::AskChannel::channel();
     let tool_ctx = ToolContext {
         working_dir: working_dir.clone(),
         session_id: "cli".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         mailbox: None,
+        ask: ask_tx,
     };
 
     let plugins = match discover_plugins(&agent_dir) {
@@ -234,6 +245,7 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         Arc::new(GitStatusTool),
         Arc::new(GitCommitTool),
         Arc::new(WebFetchTool::new()),
+        Arc::new(AskUserQuestionTool),
     ];
     // Omitted entirely (not registered with a doomed-to-fail key) when unset,
     // so the LLM never sees a tool in its list that it can't actually use.
@@ -383,19 +395,22 @@ async fn build_session_with_sink(output: OutputFormat, sink: Arc<dyn tui::Output
         return Err(format!("error: {e}"));
     }
 
-    Ok(BuiltSession {
-        session,
-        provider,
-        cfg,
-        tools,
-        hooks,
-        reporter,
-        tool_ctx,
-        show_thinking,
-        show_status,
-        todo,
-        checkpoint,
-    })
+    Ok((
+        BuiltSession {
+            session,
+            provider,
+            cfg,
+            tools,
+            hooks,
+            reporter,
+            tool_ctx,
+            show_thinking,
+            show_status,
+            todo,
+            checkpoint,
+        },
+        ask_rx,
+    ))
 }
 
 enum Command {
@@ -645,7 +660,7 @@ async fn run_one_shot(task: &str, output: OutputFormat) {
 }
 
 enum ReplBackend {
-    Tui(tui::PinnedHandles),
+    Tui(tui::PinnedHandles, minder_core::AskReceiver),
     Fallback,
 }
 
@@ -658,7 +673,7 @@ async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend)
         // No event loop reads keystrokes until `run_tui_repl` starts -- show
         // the box as disabled rather than blank until then.
         handles.input.lock().unwrap().disabled_message = Some("please wait, setting up the session…".to_string());
-        let built = match build_session_with_sink(output, sink).await {
+        let (built, ask_rx) = match build_session_with_sink(output, sink).await {
             Ok(built) => built,
             Err(e) => {
                 tui::restore_terminal();
@@ -666,7 +681,7 @@ async fn build_repl_session(output: OutputFormat) -> (BuiltSession, ReplBackend)
                 std::process::exit(1);
             }
         };
-        return (built, ReplBackend::Tui(handles));
+        return (built, ReplBackend::Tui(handles, ask_rx));
     }
     (build_session(output).await, ReplBackend::Fallback)
 }
@@ -1129,7 +1144,7 @@ async fn print_banner(session: &AgentSession, record: &SessionRecord, reporter: 
 async fn run_repl(built: &mut BuiltSession, dir: &Path, record: &mut SessionRecord, backend: ReplBackend) {
     print_banner(&built.session, record, &built.reporter).await;
     match backend {
-        ReplBackend::Tui(handles) => tui::run_tui_repl(built, dir, record, handles).await,
+        ReplBackend::Tui(handles, ask_rx) => tui::run_tui_repl(built, dir, record, handles, ask_rx).await,
         ReplBackend::Fallback => run_repl_fallback(built, dir, record).await,
     }
 }
@@ -1340,6 +1355,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: minder_core::AskChannel::unavailable(),
         }
     }
 

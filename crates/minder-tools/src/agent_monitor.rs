@@ -241,6 +241,7 @@ fn error(message: String) -> ToolExecOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::AskChannel;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
@@ -249,6 +250,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         }
     }
 

@@ -1,5 +1,6 @@
 mod agent_monitor;
 mod agent_registry;
+mod ask_user_question;
 mod bash;
 mod checkpoint;
 mod delete_file;
@@ -22,6 +23,7 @@ mod write_file;
 
 pub use agent_monitor::{AgentOutputTool, AgentStopTool, ListAgentsTool};
 pub use agent_registry::{AgentRegistry, AgentRunSnapshot, AgentRunStatus};
+pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use checkpoint::{Checkpoint, CheckpointedTool};
 pub use delete_file::DeleteFileTool;

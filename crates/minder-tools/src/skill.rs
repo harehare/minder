@@ -221,6 +221,7 @@ fn error(message: String) -> ToolExecOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::AskChannel;
 
     fn scratch_dir() -> PathBuf {
         std::env::temp_dir().join(format!("minder-skill-test-{}", uuid::Uuid::new_v4()))
@@ -329,6 +330,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         }
     }
 

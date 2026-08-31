@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Reporter, Tool, ToolContext, ToolExecOutcome};
+use minder_core::{
+    AgentError, AgentSession, AskChannel, HookPort, LlmProvider, Reporter, Tool, ToolContext, ToolExecOutcome,
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -356,6 +358,7 @@ impl Tool for AgentTool {
                 session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
                 cancel: ctx.cancel.clone(),
                 mailbox: None,
+                ask: ctx.ask.clone(),
             };
             return run_subagent_to_completion(
                 subagent.name.clone(),
@@ -381,6 +384,7 @@ impl Tool for AgentTool {
             session_id: format!("{}:agent:{}", ctx.session_id, subagent.name),
             cancel,
             mailbox: None,
+            ask: AskChannel::unavailable(), // detached: nothing would ever poll a real receiver
         };
 
         let registry = self.registry.clone();
@@ -638,6 +642,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         }
     }
 

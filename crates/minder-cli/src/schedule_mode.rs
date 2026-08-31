@@ -40,8 +40,8 @@ pub async fn run(
 mod tests {
     use super::*;
     use minder_core::{
-        ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolContext, ToolSpec,
-        Usage,
+        AskChannel, ContentBlock, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason, ToolContext,
+        ToolSpec, Usage,
     };
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -81,6 +81,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         };
         AgentSession::new(
             Arc::new(FixedReplyProvider),

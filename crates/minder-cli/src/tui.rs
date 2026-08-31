@@ -7,6 +7,7 @@
 //! (`rustyline` idle, `input_watcher::InputWatcher` mid-turn) when the
 //! terminal can't do raw-mode key watching at all.
 
+mod ask_overlay;
 pub(crate) mod input_box;
 pub(crate) mod sink;
 
@@ -20,10 +21,13 @@ use crossterm::event::{
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
-use minder_core::{AgentError, AgentSession, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext};
+use minder_core::{
+    AgentError, AgentSession, AskChannel, AskReceiver, HookPort, LlmProvider, Message, Reporter, Tool, ToolContext,
+};
 
 use crate::reporter::{BOLD, DIM, RED, RESET, YELLOW};
 
+use ask_overlay::{AskOverlayOutcome, AskOverlayState};
 use input_box::{InputBoxState, InputMode, InputOutcome};
 use sink::PinnedInputSnapshot;
 pub(crate) use sink::{DirectPrintSink, FullscreenSink, OutputSink, PinnedHandles};
@@ -82,6 +86,7 @@ pub(crate) async fn run_tui_repl(
     dir: &Path,
     record: &mut crate::session_store::SessionRecord,
     handles: PinnedHandles,
+    mut ask_rx: AskReceiver,
 ) {
     let color = crate::color_enabled(std::io::stdout().is_terminal());
     let history_path = crate::session_store::history_path(dir).ok();
@@ -151,6 +156,7 @@ pub(crate) async fn run_tui_repl(
             &side_tools,
             &side_hooks,
             &built.tool_ctx,
+            &mut ask_rx,
         )
         .await;
         if let Err(e) = &result {
@@ -345,6 +351,7 @@ fn spawn_side_question(
             // with it, and vice versa.
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(), // detached, nothing would poll a real receiver
         };
         let mut session = AgentSession::new(provider, tools, hooks, SIDE_QUESTION_SYSTEM_PROMPT, child_ctx);
         let result = session.run_turn(&question).await;
@@ -388,6 +395,7 @@ async fn run_turn_pinned(
     side_tools: &[Arc<dyn Tool>],
     side_hooks: &Option<Arc<tokio::sync::Mutex<Box<dyn HookPort>>>>,
     tool_ctx: &ToolContext,
+    ask_rx: &mut AskReceiver,
 ) -> Result<Message, AgentError> {
     let pre_turn_len = session.messages().len();
     let cancel = session.reset_cancel_token();
@@ -461,6 +469,12 @@ async fn run_turn_pinned(
                     }
                     redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
                 }
+                Some(request) = ask_rx.recv() => {
+                    // `turn` is parked inside `ctx.ask.ask().await`, so nothing else needs `events` meanwhile.
+                    let answers = run_ask_overlay(handles, events, request.questions, color).await;
+                    let _ = request.reply.send(answers);
+                    redraw(handles, box_state, InputMode::Running, &running_status(handles), color);
+                }
             }
         }
     };
@@ -469,6 +483,36 @@ async fn run_turn_pinned(
         session.discard_interrupted_turn(pre_turn_len);
     }
     result
+}
+
+async fn run_ask_overlay(
+    handles: &PinnedHandles,
+    events: &mut EventStream,
+    questions: Vec<minder_core::AskQuestion>,
+    color: bool,
+) -> Vec<minder_core::AskAnswer> {
+    let mut state = AskOverlayState::new(questions);
+    redraw_ask_overlay(handles, &state, color);
+    loop {
+        let event = match events.next().await {
+            None => return Vec::new(),
+            Some(Err(_)) => continue,
+            Some(Ok(e)) => e,
+        };
+        let Event::Key(key) = event else { continue };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match state.handle_key(key) {
+            AskOverlayOutcome::Continue => redraw_ask_overlay(handles, &state, color),
+            AskOverlayOutcome::Finished(answers) => return answers,
+        }
+    }
+}
+
+fn redraw_ask_overlay(handles: &PinnedHandles, state: &AskOverlayState, color: bool) {
+    let mut term = handles.terminal.lock().unwrap();
+    let _ = term.draw(|frame| state.render(frame, frame.area(), color));
 }
 
 /// Publishes the box's contents into `handles.input` (so `sink::append_text`

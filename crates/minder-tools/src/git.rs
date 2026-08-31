@@ -289,6 +289,7 @@ impl Tool for GitCommitTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::AskChannel;
 
     async fn ctx_with_git_repo() -> ToolContext {
         let dir = std::env::temp_dir().join(format!("minder-git-test-{}", uuid::Uuid::new_v4()));
@@ -298,6 +299,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         };
         run_git(&["init"], &ctx, timeout()).await;
         run_git(&["config", "user.email", "test@example.com"], &ctx, timeout()).await;

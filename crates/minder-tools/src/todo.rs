@@ -156,6 +156,7 @@ pub fn format_checklist(todos: &[TodoItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::AskChannel;
 
     fn ctx() -> ToolContext {
         ToolContext {
@@ -163,6 +164,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         }
     }
 

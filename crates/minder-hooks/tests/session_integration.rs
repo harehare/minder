@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use minder_core::{
-    AgentSession, ContentBlock, HookPort, LlmProvider, Message, ProviderError, ProviderResponse, Role, StopReason,
-    Tool, ToolCall, ToolContext, ToolExecOutcome, ToolSpec, Usage,
+    AgentSession, AskChannel, ContentBlock, HookPort, LlmProvider, Message, ProviderError, ProviderResponse, Role,
+    StopReason, Tool, ToolCall, ToolContext, ToolExecOutcome, ToolSpec, Usage,
 };
 use minder_hooks::HookEngine;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -111,6 +111,7 @@ async fn hook_script_blocks_destructive_command_through_the_real_agent_loop() {
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         mailbox: None,
+        ask: AskChannel::unavailable(),
     };
 
     let mut session = AgentSession::new(
@@ -153,6 +154,7 @@ async fn hook_script_allows_safe_command_through_the_real_agent_loop() {
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         mailbox: None,
+        ask: AskChannel::unavailable(),
     };
 
     let mut session = AgentSession::new(
@@ -193,6 +195,7 @@ async fn default_policy_blocks_destructive_command_with_no_project_hooks_at_all(
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         mailbox: None,
+        ask: AskChannel::unavailable(),
     };
 
     let mut session = AgentSession::new(

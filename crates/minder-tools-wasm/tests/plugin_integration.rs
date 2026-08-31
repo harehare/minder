@@ -3,7 +3,7 @@
 //! for how to rebuild them from source). Mirrors the cross-crate
 //! integration-test precedent in `crates/minder-hooks/tests/session_integration.rs`.
 
-use minder_core::{Tool, ToolContext};
+use minder_core::{AskChannel, Tool, ToolContext};
 use minder_tools_wasm::{FsCapability, Limits, Manifest, WasmTool};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ fn ctx() -> ToolContext {
         session_id: "test".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         mailbox: None,
+        ask: AskChannel::unavailable(),
     }
 }
 

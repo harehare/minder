@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::ask::AskChannel;
 use crate::mailbox::Mailbox;
 
 /// Trait lives here (not in `minder-tools`) so `AgentSession` can hold
@@ -24,6 +25,9 @@ pub struct ToolContext {
     /// `AgentSession::run_turn`), so those subagents can coordinate via
     /// `send_message`/`check_messages`. `None` for every other tool call.
     pub mailbox: Option<Mailbox>,
+    /// How `ask_user_question` reaches an interactive UI, if one is wired
+    /// up -- `AskChannel::unavailable()` in every non-interactive context.
+    pub ask: AskChannel,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

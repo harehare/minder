@@ -81,6 +81,7 @@ fn error(message: String) -> ToolExecOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minder_core::AskChannel;
 
     async fn ctx_with_files(files: &[&str]) -> ToolContext {
         let dir = std::env::temp_dir().join(format!("minder-glob-test-{}", uuid::Uuid::new_v4()));
@@ -94,6 +95,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: AskChannel::unavailable(),
         }
     }
 

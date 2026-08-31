@@ -1025,6 +1025,7 @@ mod tests {
             session_id: "test".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             mailbox: None,
+            ask: crate::ask::AskChannel::unavailable(),
         }
     }
 
