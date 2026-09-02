@@ -1659,7 +1659,7 @@ mod tests {
 
     #[test]
     fn model_completion_suggests_ollama_as_the_provider() {
-        let helper = test_helper_with_models(&["qwen2.5-coder:14b"]);
+        let helper = test_helper_with_models(&["qwen3-coder:30b"]);
         let (start, candidates) = complete_at_cursor_with(&helper, "/model oll");
         assert_eq!(start, "/model ".len());
         assert_eq!(candidates[0].display, "ollama");
@@ -1668,24 +1668,24 @@ mod tests {
 
     #[test]
     fn model_completion_suggests_pulled_model_names() {
-        let helper = test_helper_with_models(&["qwen2.5-coder:14b", "llama3.2"]);
+        let helper = test_helper_with_models(&["qwen3-coder:30b", "llama3.2"]);
         let (start, candidates) = complete_at_cursor_with(&helper, "/model ollama qwen");
         assert_eq!(start, "/model ollama ".len());
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].display, "qwen2.5-coder:14b");
+        assert_eq!(candidates[0].display, "qwen3-coder:30b");
     }
 
     #[test]
     fn model_completion_is_empty_for_an_unknown_provider() {
-        let helper = test_helper_with_models(&["qwen2.5-coder:14b"]);
+        let helper = test_helper_with_models(&["qwen3-coder:30b"]);
         let (_, candidates) = complete_at_cursor_with(&helper, "/model anthropic ");
         assert!(candidates.is_empty());
     }
 
     #[test]
     fn model_hint_completes_the_rest_of_a_single_matching_model() {
-        let helper = test_helper_with_models(&["qwen2.5-coder:14b", "llama3.2"]);
+        let helper = test_helper_with_models(&["qwen3-coder:30b", "llama3.2"]);
         let hint = hint_at_cursor_with(&helper, "/model ollama qwen").unwrap();
-        assert_eq!(hint, "2.5-coder:14b");
+        assert_eq!(hint, "3-coder:30b");
     }
 }

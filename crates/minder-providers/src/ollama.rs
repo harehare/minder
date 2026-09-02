@@ -823,14 +823,14 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/tags"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "qwen2.5-coder:14b"}, {"name": "llama3.2"}],
+                "models": [{"name": "qwen3-coder:30b"}, {"name": "llama3.2"}],
             })))
             .mount(&server)
             .await;
 
         let provider = OllamaProvider::new("llama3.2").with_base_url(server.uri());
         let models = provider.list_models().await.unwrap();
-        assert_eq!(models, vec!["qwen2.5-coder:14b".to_string(), "llama3.2".to_string()]);
+        assert_eq!(models, vec!["qwen3-coder:30b".to_string(), "llama3.2".to_string()]);
     }
 
     #[tokio::test]
@@ -867,7 +867,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OllamaProvider::new("qwen2.5-coder:14b").with_base_url(server.uri());
+        let provider = OllamaProvider::new("qwen3-coder:30b").with_base_url(server.uri());
         let reporter = RecordingReporter::default();
         provider.ensure_model_available(&reporter).await.unwrap();
 
@@ -898,7 +898,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OllamaProvider::new("qwen3-coder:30b-a3b").with_base_url(server.uri());
+        let provider = OllamaProvider::new("qwen3-coder:30b").with_base_url(server.uri());
         let reporter = RecordingReporter::default();
         provider.ensure_model_available(&reporter).await.unwrap();
 

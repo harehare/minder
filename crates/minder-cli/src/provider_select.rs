@@ -24,7 +24,7 @@ pub fn build_provider(
 
     match provider {
         "ollama" => {
-            let model = model_override.unwrap_or_else(|| "qwen3-coder:30b-a3b".to_string());
+            let model = model_override.unwrap_or_else(|| "qwen3-coder:30b".to_string());
             let mut provider = OllamaProvider::new(model);
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .ok()

@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn tab_completes_the_provider_then_a_pulled_model_name() {
-        let mut box_state = InputBoxState::new(Vec::new()).with_known_models(vec!["qwen2.5-coder:14b".to_string()]);
+        let mut box_state = InputBoxState::new(Vec::new()).with_known_models(vec!["qwen3-coder:30b".to_string()]);
         for c in "/model oll".chars() {
             box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
         }
@@ -950,6 +950,6 @@ mod tests {
             box_state.handle_key(key(KeyCode::Char(c)), InputMode::Idle, &dir());
         }
         box_state.handle_key(key(KeyCode::Tab), InputMode::Idle, &dir());
-        assert_eq!(box_state.buffer, "/model ollama qwen2.5-coder:14b ");
+        assert_eq!(box_state.buffer, "/model ollama qwen3-coder:30b ");
     }
 }

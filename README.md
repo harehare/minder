@@ -153,7 +153,7 @@ $ minder "fix the off-by-one in the pagination helper"
 Fixed the off-by-one: `end` was one past the last valid index.
 ```
 
-Colors turn off automatically when stderr isn't a terminal or `NO_COLOR` is set, and every line is overridable per-project from `.agent/hooks/*.mq` — see [Customizing the display](#hooks). A spinner runs while the model is thinking or a tool call is executing (`⠋ Thinking (2.3s) · ollama (qwen3-coder:30b-a3b)`), replaced by the normal `✓`/`✗` line once that step finishes; turn it off with `show_status_bar = false` in `.agent/config.toml` (or `MINDER_SHOW_STATUS_BAR=false`), or toggle it for the rest of the session with `/status`. The first-run model pull uses the same spinner (`⠋ Downloading qwen3-coder:30b-a3b -- pulling manifest (42%)`), redrawn in place instead of printing a new line per update. Once a turn's final answer is in, a trailing `↑1024 ↓256 tokens` line shows that turn's real token cost, summed across every round-trip it took — also written to `MINDER_LOG_FILE` if set.
+Colors turn off automatically when stderr isn't a terminal or `NO_COLOR` is set, and every line is overridable per-project from `.agent/hooks/*.mq` — see [Customizing the display](#hooks). A spinner runs while the model is thinking or a tool call is executing (`⠋ Thinking (2.3s) · ollama (qwen3-coder:30b)`), replaced by the normal `✓`/`✗` line once that step finishes; turn it off with `show_status_bar = false` in `.agent/config.toml` (or `MINDER_SHOW_STATUS_BAR=false`), or toggle it for the rest of the session with `/status`. The first-run model pull uses the same spinner (`⠋ Downloading qwen3-coder:30b -- pulling manifest (42%)`), redrawn in place instead of printing a new line per update. Once a turn's final answer is in, a trailing `↑1024 ↓256 tokens` line shows that turn's real token cost, summed across every round-trip it took — also written to `MINDER_LOG_FILE` if set.
 
 ### Interrupting or steering a turn
 
@@ -223,7 +223,7 @@ Piped stdin is folded into the task as extra input, capped at 200,000 characters
 
 ```sh
 $ minder --output json "does this repo's Cargo.toml set edition 2024?"
-{"provider":"ollama","model":"qwen3-coder:30b-a3b","answer":"Yes, edition = \"2024\".","error":null}
+{"provider":"ollama","model":"qwen3-coder:30b","answer":"Yes, edition = \"2024\".","error":null}
 ```
 
 `--output json` holds back the live text stream and prints exactly one JSON object after the turn completes: `{"provider", "model", "answer", "error"}` (`answer`/`error` mutually exclusive) — useful for calling `minder` as a subprocess.
@@ -233,7 +233,7 @@ $ minder --output json "does this repo's Cargo.toml set edition 2024?"
 minder talks to a local [Ollama](https://ollama.com) server — install it (<https://ollama.com/download>, or `brew install ollama` / `curl -fsSL https://ollama.com/install.sh | sh`) and run `ollama serve` before pointing minder at it:
 
 ```sh
-minder "..."   # pulls the default model (qwen3-coder:30b-a3b, ~19GB) on first run if it isn't already local
+minder "..."   # pulls the default model (qwen3-coder:30b, ~19GB) on first run if it isn't already local
 OLLAMA_BASE_URL=http://your-ollama-host:11434 MINDER_MODEL=gpt-oss:20b minder "..."
 ```
 
@@ -241,7 +241,7 @@ If the requested model isn't pulled yet, minder pulls it automatically before th
 
 | Env var | Default | Notes |
 |---|---|---|
-| `MINDER_MODEL` | `qwen3-coder:30b-a3b` | Any Ollama model name — auto-pulled on first use if not already local |
+| `MINDER_MODEL` | `qwen3-coder:30b` | Any Ollama model name — auto-pulled on first use if not already local |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Point at a remote/non-default Ollama host |
 | `MINDER_NUM_CTX` | `8192` | Context window in tokens — well above Ollama's own 2048-4096 default, which silently truncates and is a common cause of broken tool-calling |
 | `MINDER_REQUEST_TIMEOUT_SECS` | `900` | Fails a stalled request instead of hanging forever |
@@ -270,7 +270,7 @@ Every field is optional and the file itself is optional. Precedence is env var (
 Anything speaking the OpenAI chat-completions API — llama.cpp's `llama-server`, LM Studio, vLLM, LocalAI — works via the `openai-compat` provider instead of Ollama:
 
 ```sh
-MINDER_PROVIDER=openai-compat MINDER_OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 MINDER_MODEL=qwen2.5-coder-14b minder "..."
+MINDER_PROVIDER=openai-compat MINDER_OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 MINDER_MODEL=qwen3-coder-30b minder "..."
 ```
 
 | Env var | Notes |
