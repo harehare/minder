@@ -13,7 +13,7 @@
 
 </div>
 
-Local-LLM coding-agent harness (via [Ollama](https://ollama.com)) with policy/observability hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language — a standard ReAct-style tool-calling loop where hooks only answer narrow policy questions at five fixed interception points and never drive the loop itself.
+Local-LLM coding-agent harness (via [Ollama](https://ollama.com)) with policy/observability hooks written in [`mq`](https://github.com/harehare/mq)'s embeddable query language — a standard ReAct-style tool-calling loop where hooks only answer narrow policy questions at six fixed interception points and never drive the loop itself.
 
 > [!IMPORTANT]
 > This project is under active development and has not been thoroughly tested end to end yet. Providers, tools, and hooks work individually in unit tests, but the full agent loop hasn't seen broad real-world verification — expect rough edges.
@@ -49,6 +49,7 @@ Local-LLM coding-agent harness (via [Ollama](https://ollama.com)) with policy/ob
 - [Providers](#providers)
 - [Tools](#tools)
 - [Skills](#skills)
+- [Memory](#memory)
 - [Subagents](#subagents)
 - [Hooks](#hooks)
 - [Tool plugins (WASM)](#tool-plugins-wasm)
@@ -128,7 +129,7 @@ minder "check git status and stage+commit the pending changes with a sensible me
 A baseline policy is always active, even with no `.agent/hooks/` at all: it blocks `bash rm -rf`, and reading/searching paths under `.env`, `node_modules`, or `.git`. Everything else stays unrestricted by default — see [Hooks](#hooks) to add more policy before pointing minder at real work.
 
 <details>
-<summary>Live execution display, undo, interrupting a turn, Markdown output, @path attachments, REPL commands</summary>
+<summary>Live execution display, undo, interrupting a turn, Markdown output, @path attachments, !shell commands, REPL commands</summary>
 
 ### Live execution display
 
@@ -185,6 +186,18 @@ minder chat
 
 A file's content is inlined in a fenced code block; a directory gets a shallow (one-level) listing. Only a path that actually exists on disk expands — `@here` in "thanks @here for the review" is left untouched. In `chat`, Tab-completes and live-hints like `/`-commands do.
 
+### Running a shell command with `!`
+
+A line starting with `!` inside `chat` runs the rest as a shell command (30s timeout) in the working directory, prints its combined stdout/stderr, then hands that output to the model as the turn's input — no `bash` tool round-trip needed for a quick look before asking a question:
+
+```sh
+❯ !git status
+On branch main
+nothing to commit, working tree clean
+```
+
+The model then sees "I ran `git status`, here's the output: ...\`\`\`" as its input for that turn, the same way an `@path` mention's file content becomes part of the input. Output over 20,000 characters is truncated.
+
 ### REPL commands
 
 A line starting with `/` inside `minder chat` (or any interactive session) is a REPL command instead of a task:
@@ -198,7 +211,6 @@ A line starting with `/` inside `minder chat` (or any interactive session) is a 
 | `/clear` | Clears the conversation history (the session file stays, so `--continue` still works, just with nothing to continue) |
 | `/status` | Toggles showing the active provider/model in the spinner while a turn runs — see above |
 | `/thinking` | Toggles showing the model's extended-thinking output (only fires for a reasoning model, e.g. `deepseek-r1`/`qwq`) |
-| `/todo` | Shows the model's current todo list (from `todo_write`) |
 | `/undo` | Reverts the `write_file`/`edit_file` changes from the most recently completed turn — see above |
 
 `/model <provider> [model]` rebuilds the provider (same env-var/`.agent/config.toml` precedence as startup) and swaps it into the running session, without losing context. It doesn't change the `agent` tool's own default model, so a subagent delegated afterward still uses whichever model the session started with unless its `AGENT.md` (or the call itself) overrides it.
@@ -301,7 +313,7 @@ Always registered:
 | `git_commit` | Creates a commit |
 | `web_fetch` | Fetches an http(s) URL as text; rejects non-http(s) schemes and literal loopback/private-network hosts (partial SSRF guard, not a complete one — use a hook for stronger guarantees). Also strips zero-width/bidi-override/Unicode-tag characters from the response — the hidden-text tricks behind "ASCII smuggling" prompt injection — before it ever reaches the model |
 | `agent` | Delegates a task to a named subagent — always available via a built-in `general-purpose` subagent, no project config required; see [Subagents](#subagents) |
-| `todo_write` | Replaces the current todo list with a full updated one, so the model can plan and track progress on a multi-step task |
+| `memory` | Reads/writes persistent notes under `.agent/memory/*.md` that survive across sessions — `list`/`read`/`write`/`append` actions; see [Memory](#memory) |
 
 Registered only when configured:
 
@@ -310,9 +322,9 @@ Registered only when configured:
 | `web_search` | `TAVILY_API_KEY` set — omitted entirely otherwise, so the model never sees a tool it can't use |
 | `skill` | one or more `.agent/skills/*/SKILL.md` files present — see [Skills](#skills) |
 
-`todo_write` always replaces the *whole* list, never a partial patch. It's not offered to subagents. Run `/todo` any time to see the current list.
-
 Additional tools can be supplied per-project as [WASM plugins](#tool-plugins-wasm) or from [MCP servers](#mcp-servers-optional) (opt-in feature).
+
+There's no built-in todo-list tool — that's deliberately left to the two extension points above instead of core, since it's pure project convention with no harness-level behavior riding on it: copy `skills/todo-md/` to `.agent/skills/` for a `TODO.md`-based checklist (no build step, works with any provider), or copy `tools/todo.wasm`/`tools/todo.toml` to `.agent/tools/` for a structured `todo_write` tool with the same schema minder's old built-in had — see `tools/todo-plugin/src/main.rs` for its source (`tools/todo-plugin/regenerate.sh` rebuilds it). The wasm version persists its list to a file, so it survives across sessions too, not just within one.
 
 ## Skills
 
@@ -332,7 +344,23 @@ Use Conventional Commits: `<type>(<scope>): <summary>`, imperative mood...
 
 Each skill is a directory with a `SKILL.md`: `---`-delimited frontmatter (`name`, `description`) followed by instructions as the body. minder discovers every `.agent/skills/*/SKILL.md` at startup and registers a single `skill` tool listing each skill's name/description — cheap to keep in context every turn. The model calls `skill` with a `name` to pull that skill's full body into the conversation only when it's actually relevant.
 
-Skill names must be unique, and startup fails if a `SKILL.md` is missing frontmatter or the `name`/`description` fields. See `skills/commit-messages/SKILL.md` for a runnable example (copy `skills/` to `.agent/skills/` in a project to try it).
+Skill names must be unique, and startup fails if a `SKILL.md` is missing frontmatter or the `name`/`description` fields. See `skills/commit-messages/SKILL.md` and `skills/todo-md/SKILL.md` for runnable examples (copy `skills/` to `.agent/skills/` in a project to try them).
+
+## Memory
+
+Skills are curated by the user; memory is the model's own space to write to. Unlike `--continue`/`--resume` (the same conversation, resumed), `.agent/memory/*.md` persists facts *across* different tasks and sessions — user preferences, project decisions, anything worth not re-discovering next time.
+
+The `memory` tool takes an `action` (`list`, `read`, `write`, `append`) and a `name`, which maps to `.agent/memory/<name>.md`. Always registered, and the directory is created on first write. Its description carries a snapshot of existing entries (name + first line) taken at startup, cheap to keep in context the same way `skill`'s listing is — call `list` for the current, possibly-changed-since-startup index.
+
+```
+.agent/memory/user-preferences.md
+```
+
+```markdown
+Prefers tabs over spaces in this repo. Wants commit messages under 60 chars.
+```
+
+Nothing writes here automatically — it's up to the model (or a project skill nudging it) to decide what's worth remembering.
 
 ## Subagents
 
@@ -371,7 +399,7 @@ Pass `background: true` in an `agent` call to start it and get an id back immedi
 | `agent_output` | Fetches a run's result by id; pass `wait_secs` to block until it finishes |
 | `agent_stop` | Cancels a run by id (best-effort — stops it before its next step, not mid-flight) |
 
-These three are only ever offered to the top-level conversation, not to a subagent's own tool list (same as `todo_write`), so delegation still can't recurse.
+These three are only ever offered to the top-level conversation, not to a subagent's own tool list, so delegation still can't recurse.
 
 ## Hooks
 
@@ -396,8 +424,9 @@ Every hook returns `{"action": "allow", "value": ...}` or `{"action": "block", "
 | `on_tool_call` | `on_tool_call(call)` | Before a tool executes (fails closed) |
 | `on_tool_result` | `on_tool_result(result)` | Before a tool's result re-enters history |
 | `before_compact` | `before_compact(messages)` | Before history is truncated under context pressure |
+| `on_budget` | `on_budget(info)` | After every provider round-trip, with `{"turn": Usage, "session": Usage, "turn_count": n}` (`Usage` is `{"input_tokens", "output_tokens"}`) |
 
-See `hooks/security.mq` for a runnable example (copy it to `.agent/hooks/` to try it).
+`on_budget` is the one exception to "fails open": it's default-off (an undefined `on_budget` always allows), but once you define one it's how you cap spend on an unattended `loop`/`schedule` run — see `hooks/budget.mq` for a runnable example (copy it to `.agent/hooks/` to try it, alongside `hooks/security.mq`).
 
 <details>
 <summary>The <code>agent</code> module, default policy, overriding results, customizing the display</summary>
@@ -524,7 +553,7 @@ max_memory_pages = 256
 fuel = 5_000_000
 ```
 
-Plugins are plain `wasm32-wasip1` modules (no component model) exporting `minder_tool_name`, `minder_tool_description`, `minder_tool_parameters_schema`, `minder_tool_execute`, plus `minder_alloc`/`minder_dealloc` for passing JSON across linear memory — see `crates/minder-tools-wasm/tests/fixtures/echo_plugin` for a minimal example (`regenerate.sh` alongside it has the build command). Filesystem access is granted per-plugin via WASI preopens (none by default); network isn't a raw socket — `network = true` grants a single `host_web_fetch` import reusing the built-in `web_fetch`'s SSRF guard. Execution is metered with wasmtime fuel, so a runaway plugin traps instead of hanging.
+Plugins are plain `wasm32-wasip1` modules (no component model) exporting `minder_tool_name`, `minder_tool_description`, `minder_tool_parameters_schema`, `minder_tool_execute`, plus `minder_alloc`/`minder_dealloc` for passing JSON across linear memory — see `crates/minder-tools-wasm/tests/fixtures/echo_plugin` for a minimal example (`regenerate.sh` alongside it has the build command), or `tools/todo-plugin/src/main.rs` for a complete one that persists state through a granted `[[fs]]` dir (a `todo_write` tool, copy `tools/todo.wasm`/`tools/todo.toml` to `.agent/tools/` to try it — see [Tools](#tools)). Filesystem access is granted per-plugin via WASI preopens (none by default); network isn't a raw socket — `network = true` grants a single `host_web_fetch` import reusing the built-in `web_fetch`'s SSRF guard. Execution is metered with wasmtime fuel, so a runaway plugin traps instead of hanging.
 
 ## MCP servers (optional)
 

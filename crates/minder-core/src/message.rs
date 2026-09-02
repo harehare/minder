@@ -111,7 +111,7 @@ pub enum StopReason {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,

@@ -1,3 +1,4 @@
+mod bang;
 mod config;
 mod file_reporter;
 mod input_watcher;
@@ -23,9 +24,8 @@ use minder_hooks::HookEngine;
 use minder_tools::{
     AgentOutputTool, AgentRegistry, AgentStopTool, AgentTool, AskUserQuestionTool, BashTool, Checkpoint,
     CheckpointedTool, DeleteFileTool, EditFileTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool, GlobTool,
-    GrepTool, ListAgentsTool, LsTool, ProviderFactory, ReadFileTool, SkillTool, TodoWriteTool, WebFetchTool,
+    GrepTool, ListAgentsTool, LsTool, MemoryTool, ProviderFactory, ReadFileTool, SkillTool, WebFetchTool,
     WebSearchTool, WriteFileTool, builtin_subagents, discover_all_skills, discover_plugins, discover_subagents,
-    format_checklist,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -53,10 +53,6 @@ improvising. Pass `background: true` to `agent` for a long-running or paralleliz
 work you don't need to wait on -- check on it later with `list_agents`/`agent_output`, or cancel \
 it with `agent_stop`. Only commit, push, or run other state-changing git/bash commands when \
 asked. Use `delete_file` (not `bash rm`) to remove a file -- it's recoverable, `rm` isn't.
-
-Use `todo_write` to plan and track progress on any task with several non-trivial steps -- keep at \
-most one item `in_progress` at a time and mark items `completed` as soon as they're actually done. \
-Skip it for a single quick action.
 
 Use `ask_user_question` for a genuine multiple-choice decision point (which of these approaches, \
 which file, yes/no) so the user can pick from a real list instead of typing a reply -- not a \
@@ -163,7 +159,6 @@ struct BuiltSession {
     tool_ctx: ToolContext,
     show_thinking: Arc<AtomicBool>,
     show_status: Arc<AtomicBool>,
-    todo: Arc<TodoWriteTool>,
     checkpoint: Arc<Checkpoint>,
 }
 
@@ -263,6 +258,7 @@ async fn build_session_with_sink(
         }
         Err(e) => return Err(format!("failed to load skills: {e}")),
     }
+    tools.push(Arc::new(MemoryTool::new(&agent_dir)));
 
     #[cfg(feature = "wasm")]
     match minder_tools_wasm::load_plugins(&working_dir.join(".agent")).await {
@@ -375,8 +371,6 @@ async fn build_session_with_sink(
         agent_registry.clone(),
     )));
 
-    let todo = Arc::new(TodoWriteTool::new());
-    tools.push(todo.clone() as Arc<dyn Tool>);
     tools.push(Arc::new(ListAgentsTool::new(agent_registry.clone())));
     tools.push(Arc::new(AgentOutputTool::new(agent_registry.clone())));
     tools.push(Arc::new(AgentStopTool::new(agent_registry)));
@@ -406,7 +400,6 @@ async fn build_session_with_sink(
             tool_ctx,
             show_thinking,
             show_status,
-            todo,
             checkpoint,
         },
         ask_rx,
@@ -815,7 +808,6 @@ Available commands:
   /clear                     Clear the conversation history (keeps the session file, starts fresh)
   /status                    Toggle showing the active provider/model in the spinner while a turn runs
   /thinking                  Toggle showing the model's extended-thinking output
-  /todo                      Show the model's current todo list
   /undo                      Revert the file changes from the most recently completed turn
   exit, quit                 Leave (Ctrl-D also works)
 
@@ -823,7 +815,7 @@ Type @path (Tab to complete) to attach a file or directory's contents, e.g. @src
 
 /// Names accepted by `handle_slash_command`, kept in sync with `SLASH_HELP`
 /// above; also drives completion/hinting in `SlashCommandHelper`.
-const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "status", "thinking", "todo", "undo"];
+const SLASH_COMMANDS: &[&str] = &["help", "model", "clear", "status", "thinking", "undo"];
 
 /// Commands still matching what's typed after `/`, or `None` if `line`/`pos`
 /// isn't in "typing a command name" position at all (no leading `/`, cursor
@@ -1032,7 +1024,6 @@ async fn handle_slash_command(input: &str, built: &mut BuiltSession, dir: &Path,
             let shown = !built.show_thinking.fetch_xor(true, Ordering::Relaxed);
             println!("Extended-thinking display is now {}.", if shown { "on" } else { "off" });
         }
-        "todo" => println!("{}", format_checklist(&built.todo.items())),
         "undo" => run_undo_command(built, dir).await,
         "models" => run_models_command(built).await,
         other => println!("Unknown command '/{other}'. Type /help for a list."),
@@ -1219,7 +1210,17 @@ async fn run_repl_fallback(built: &mut BuiltSession, dir: &Path, record: &mut Se
             continue;
         }
 
-        let expanded = mentions::expand_mentions(line, dir);
+        let expanded = if let Some(command) = line.strip_prefix('!') {
+            let command = command.trim();
+            if command.is_empty() {
+                continue;
+            }
+            let result = bang::run(command, dir).await;
+            println!("{}", result.output);
+            bang::format_for_agent(command, &result)
+        } else {
+            mentions::expand_mentions(line, dir)
+        };
         built.checkpoint.start_turn();
         mark_turn_started(dir, record);
         if let Err(e) = run_turn_interruptible(&mut built.session, &expanded).await {
@@ -1373,7 +1374,6 @@ mod tests {
             tool_ctx: test_tool_ctx(),
             show_thinking: Arc::new(AtomicBool::new(false)),
             show_status: Arc::new(AtomicBool::new(true)),
-            todo: Arc::new(TodoWriteTool::new()),
             checkpoint: Arc::new(Checkpoint::new()),
         }
     }

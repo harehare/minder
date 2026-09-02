@@ -1,4 +1,4 @@
-use crate::message::{Message, ToolCall};
+use crate::message::{Message, ToolCall, Usage};
 use crate::tool::ToolExecOutcome;
 use serde::Serialize;
 
@@ -13,6 +13,10 @@ pub trait HookPort: Send + Sync {
     async fn on_tool_call(&mut self, call: &ToolCall) -> ToolCallDecision;
     async fn on_tool_result(&mut self, result: &ToolResultInfo) -> HookDecision<String>;
     async fn before_compact(&mut self, messages: &[Message]) -> HookDecision<()>;
+
+    async fn on_budget(&mut self, _info: &BudgetInfo) -> HookDecision<()> {
+        HookDecision::Allow(())
+    }
 
     /// Display-only hooks: how a tool call/result should be *printed*, not
     /// whether it runs. Default-bodied so only `HookEngine` needs to
@@ -72,4 +76,11 @@ pub struct ToolResultInfo {
     pub tool_name: String,
     pub content: String,
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetInfo {
+    pub turn: Usage,
+    pub session: Usage,
+    pub turn_count: usize,
 }

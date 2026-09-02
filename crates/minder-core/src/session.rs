@@ -41,6 +41,10 @@ pub struct AgentSession {
     started: bool,
     /// Input tokens from the last response; drives proactive compaction.
     last_input_tokens: Option<u32>,
+    /// Usage summed across every provider round-trip this session, fed to
+    /// `on_budget`.
+    total_usage: Usage,
+    turn_count: usize,
     /// Set by `enable_steering` -- lets a caller (e.g. the REPL, while a
     /// user types over a running turn) queue text that gets spliced into
     /// the transcript at the next safe point instead of waiting for this
@@ -84,6 +88,8 @@ impl AgentSession {
             tool_ctx,
             started: false,
             last_input_tokens: None,
+            total_usage: Usage::default(),
+            turn_count: 0,
             steering_rx: None,
             decision_ledger: DecisionLedger::default(),
         }
@@ -130,6 +136,7 @@ impl AgentSession {
         self.messages.push(Message::user_text(user_input));
         let injected_at = self.messages.len() - 1;
         self.drain_steering(injected_at).await;
+        self.turn_count += 1;
 
         let mut turn_usage = Usage::default();
         loop {
@@ -154,6 +161,9 @@ impl AgentSession {
             self.last_input_tokens = Some(response.usage.input_tokens);
             turn_usage.input_tokens += response.usage.input_tokens;
             turn_usage.output_tokens += response.usage.output_tokens;
+            self.total_usage.input_tokens += response.usage.input_tokens;
+            self.total_usage.output_tokens += response.usage.output_tokens;
+            self.run_budget_hook(turn_usage).await?;
             self.messages.push(response.message.clone());
 
             for block in &response.message.content {
@@ -376,6 +386,21 @@ impl AgentSession {
             return Ok(());
         };
         match hooks.lock().await.before_compact(&self.messages).await {
+            HookDecision::Block(reason) => Err(AgentError::HookBlocked(reason)),
+            HookDecision::Allow(()) => Ok(()),
+        }
+    }
+
+    async fn run_budget_hook(&self, turn: Usage) -> Result<(), AgentError> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(());
+        };
+        let info = crate::hooks::BudgetInfo {
+            turn,
+            session: self.total_usage,
+            turn_count: self.turn_count,
+        };
+        match hooks.lock().await.on_budget(&info).await {
             HookDecision::Block(reason) => Err(AgentError::HookBlocked(reason)),
             HookDecision::Allow(()) => Ok(()),
         }
@@ -2038,5 +2063,45 @@ mod tests {
             },
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    struct BudgetBlockingHooks;
+
+    #[async_trait::async_trait]
+    impl HookPort for BudgetBlockingHooks {
+        async fn before_agent_start(&mut self, system_prompt: &str) -> HookDecision<String> {
+            HookDecision::Allow(system_prompt.to_string())
+        }
+        async fn on_context(&mut self, messages: &[Message]) -> HookDecision<Vec<Message>> {
+            HookDecision::Allow(messages.to_vec())
+        }
+        async fn on_tool_call(&mut self, call: &ToolCall) -> ToolCallDecision {
+            ToolCallDecision::Allow(call.clone())
+        }
+        async fn on_tool_result(&mut self, result: &ToolResultInfo) -> HookDecision<String> {
+            HookDecision::Allow(result.content.clone())
+        }
+        async fn before_compact(&mut self, _messages: &[Message]) -> HookDecision<()> {
+            HookDecision::Allow(())
+        }
+        async fn on_budget(&mut self, _info: &crate::hooks::BudgetInfo) -> HookDecision<()> {
+            HookDecision::Block("budget exceeded".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn on_budget_block_stops_the_turn() {
+        let provider = ScriptedProvider::new(vec![text_response("should never be returned")]);
+        let hooks: Box<dyn HookPort> = Box::new(BudgetBlockingHooks);
+        let mut session = AgentSession::new(
+            Arc::new(provider),
+            vec![],
+            Some(Arc::new(tokio::sync::Mutex::new(hooks))),
+            "test",
+            test_ctx(),
+        );
+
+        let err = session.run_turn("do something").await.unwrap_err();
+        assert!(matches!(err, AgentError::HookBlocked(reason) if reason == "budget exceeded"));
     }
 }

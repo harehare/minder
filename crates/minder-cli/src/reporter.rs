@@ -352,9 +352,10 @@ impl TerminalReporter {
         }
     }
 
-    /// One line per todo item (`TodoWriteTool`'s `metadata.todos`), colored
-    /// by status -- reached via `outcome.metadata` rather than the tool
-    /// name, the same data-driven pattern `render_diff` uses for edits.
+    /// One line per todo item (a `metadata.todos` array, e.g. from the
+    /// `todo_write` wasm plugin under `tools/`), colored by status --
+    /// reached via `outcome.metadata` rather than the tool name, the same
+    /// data-driven pattern `render_diff` uses for edits.
     fn render_todos(&self, todos: &[serde_json::Value]) -> String {
         todos
             .iter()

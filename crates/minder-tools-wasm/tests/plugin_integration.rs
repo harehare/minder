@@ -196,3 +196,60 @@ async fn load_plugins_discovers_and_loads_a_valid_plugin() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name(), "echo");
 }
+
+fn repo_root_tools_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools")
+}
+
+#[tokio::test]
+async fn todo_plugin_persists_the_list_across_separate_tool_instances() {
+    let project_dir = std::env::temp_dir().join(format!("minder-wasm-todo-{}", uuid::Uuid::new_v4()));
+    let tools_dir = project_dir.join(".agent").join("tools");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+    std::fs::copy(repo_root_tools_dir().join("todo.wasm"), tools_dir.join("todo.wasm")).unwrap();
+    std::fs::write(
+        tools_dir.join("todo.toml"),
+        format!(
+            "network = false\n\n[[fs]]\nhost_dir = \"{}\"\nguest_dir = \"/data\"\nread_only = false\n",
+            tools_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let tools = minder_tools_wasm::load_plugins(&project_dir.join(".agent"))
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name(), "todo_write");
+
+    let write_ctx = ToolContext {
+        working_dir: project_dir.clone(),
+        ..ctx()
+    };
+    let outcome = tools[0]
+        .execute(
+            serde_json::json!({"todos": [
+                {"content": "write tests", "status": "completed"},
+                {"content": "ship it", "status": "in_progress"},
+            ]}),
+            &write_ctx,
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.content);
+    assert_eq!(outcome.metadata["completed"], 1);
+    assert_eq!(outcome.metadata["in_progress"], 1);
+    assert!(outcome.content.contains("write tests"));
+
+    let state_raw = std::fs::read_to_string(tools_dir.join("todo-state.json")).unwrap();
+    assert!(state_raw.contains("write tests"));
+    assert!(state_raw.contains("ship it"));
+
+    let reloaded = minder_tools_wasm::load_plugins(&project_dir.join(".agent"))
+        .await
+        .unwrap();
+    let outcome = reloaded[0].execute(serde_json::json!({"todos": []}), &write_ctx).await;
+    assert!(!outcome.is_error, "{}", outcome.content);
+    assert_eq!(outcome.content, "(empty)");
+    let state_raw = std::fs::read_to_string(tools_dir.join("todo-state.json")).unwrap();
+    assert_eq!(state_raw, "[]");
+}

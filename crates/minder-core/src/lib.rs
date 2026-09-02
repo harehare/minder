@@ -8,7 +8,7 @@ pub mod session;
 pub mod tool;
 
 pub use ask::{AskAnswer, AskChannel, AskOption, AskQuestion, AskReceiver, AskRequest};
-pub use hooks::{HookDecision, HookPort, RenderDecision, ToolCallDecision, ToolResultInfo};
+pub use hooks::{BudgetInfo, HookDecision, HookPort, RenderDecision, ToolCallDecision, ToolResultInfo};
 pub use mailbox::{Mailbox, MailboxMessage};
 pub use message::{
     ContentBlock, Message, ProviderResponse, Role, StopReason, ToolCall, ToolResult, ToolResultContent, ToolSpec, Usage,

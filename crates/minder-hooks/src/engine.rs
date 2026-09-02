@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use minder_core::{
-    HookDecision, HookPort, Message, RenderDecision, ToolCall, ToolCallDecision, ToolExecOutcome, ToolResultInfo,
+    BudgetInfo, HookDecision, HookPort, Message, RenderDecision, ToolCall, ToolCallDecision, ToolExecOutcome,
+    ToolResultInfo,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
@@ -420,6 +421,11 @@ impl HookPort for HookEngine {
             .await
     }
 
+    async fn on_budget(&mut self, info: &BudgetInfo) -> HookDecision<()> {
+        self.invoke_gate("on_budget", info, HookDecision::Allow(()), FailMode::Open)
+            .await
+    }
+
     async fn render_tool_call(&mut self, call: &ToolCall) -> RenderDecision {
         self.invoke_render("render_tool_call", call).await
     }
@@ -744,6 +750,56 @@ def on_tool_call(call):
         let messages = vec![Message::user_text("hi")];
         match engine.before_compact(&messages).await {
             HookDecision::Block(reason) => assert_eq!(reason, "not now"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_budget_allows_by_default() {
+        let agent_dir = temp_agent_dir();
+        write_hook(&agent_dir, "security.mq", SECURITY_HOOK); // doesn't define on_budget
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
+
+        let info = BudgetInfo {
+            turn: minder_core::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+            },
+            session: minder_core::Usage {
+                input_tokens: 999_999,
+                output_tokens: 999_999,
+            },
+            turn_count: 5,
+        };
+        assert!(matches!(engine.on_budget(&info).await, HookDecision::Allow(())));
+    }
+
+    #[tokio::test]
+    async fn on_budget_can_block_once_the_session_total_is_over() {
+        let agent_dir = temp_agent_dir();
+        write_hook(&agent_dir, "budget.mq", include_str!("../../../hooks/budget.mq"));
+        let mut engine = HookEngine::load(&agent_dir).unwrap();
+
+        let under = BudgetInfo {
+            turn: minder_core::Usage::default(),
+            session: minder_core::Usage {
+                input_tokens: 100,
+                output_tokens: 100,
+            },
+            turn_count: 1,
+        };
+        assert!(matches!(engine.on_budget(&under).await, HookDecision::Allow(())));
+
+        let over = BudgetInfo {
+            turn: minder_core::Usage::default(),
+            session: minder_core::Usage {
+                input_tokens: 400_000,
+                output_tokens: 200_000,
+            },
+            turn_count: 10,
+        };
+        match engine.on_budget(&over).await {
+            HookDecision::Block(reason) => assert!(reason.contains("budget")),
             other => panic!("expected Block, got {other:?}"),
         }
     }

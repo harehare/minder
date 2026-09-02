@@ -403,6 +403,8 @@ pub(crate) fn render_pinned(
 
     let accent = if mode == InputMode::Running {
         Color::LightYellow
+    } else if buffer.trim_start().starts_with('!') {
+        Color::LightRed
     } else {
         Color::Yellow
     };
@@ -951,5 +953,37 @@ mod tests {
         }
         box_state.handle_key(key(KeyCode::Tab), InputMode::Idle, &dir());
         assert_eq!(box_state.buffer, "/model ollama qwen3-coder:30b ");
+    }
+
+    fn border_fg(buffer: &str) -> Color {
+        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_pinned(
+                    frame,
+                    Rect::new(0, 0, 40, 5),
+                    buffer,
+                    buffer.chars().count(),
+                    InputMode::Idle,
+                    "status",
+                    &[],
+                    true,
+                );
+            })
+            .unwrap();
+        // row 0 is the brand line, row 1 the status line, row 2 the box's top border.
+        terminal.backend().buffer().cell((0, 2)).unwrap().fg
+    }
+
+    #[test]
+    fn a_bang_prefixed_buffer_turns_the_border_red() {
+        assert_eq!(border_fg("!git status"), Color::LightRed);
+    }
+
+    #[test]
+    fn a_plain_buffer_keeps_the_default_border_color() {
+        assert_eq!(border_fg("summarize this"), Color::Yellow);
+        assert_eq!(border_fg(""), Color::Yellow);
     }
 }

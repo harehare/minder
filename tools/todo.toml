@@ -1,0 +1,11 @@
+network = false
+
+[[fs]]
+host_dir = "./.agent/tools"
+guest_dir = "/data"
+read_only = false
+
+[limits]
+timeout_secs = 30
+max_memory_pages = 256
+fuel = 5_000_000

@@ -140,7 +140,17 @@ pub(crate) async fn run_tui_repl(
             continue;
         }
 
-        let expanded = crate::mentions::expand_mentions(&line, dir);
+        let expanded = if let Some(command) = line.strip_prefix('!') {
+            let command = command.trim();
+            if command.is_empty() {
+                continue;
+            }
+            let result = crate::bang::run(command, dir).await;
+            built.reporter.on_notice(&result.output).await;
+            crate::bang::format_for_agent(command, &result)
+        } else {
+            crate::mentions::expand_mentions(&line, dir)
+        };
         built.checkpoint.start_turn();
         crate::mark_turn_started(dir, record);
         let result = run_turn_pinned(

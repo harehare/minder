@@ -1,0 +1,10 @@
+# Example hook script for minder (.agent/hooks/budget.mq).
+# Stops the run once the session has spent more than 500k tokens total --
+# useful for unattended `minder loop`/`minder schedule` runs.
+
+def on_budget(info):
+  let total = info["session"]["input_tokens"] + info["session"]["output_tokens"]
+  | if (total > 500000):
+      {"action": "block", "reason": "session token budget (500k) exceeded"}
+    else:
+      {"action": "allow"};
